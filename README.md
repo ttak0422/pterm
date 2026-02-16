@@ -34,6 +34,9 @@ The daemon binary from workspace builds is at `target/release/pterm`.
 # Attach bridge mode (for terminal clients)
 ./target/release/pterm attach mysession
 
+# Attach if exists, otherwise create and attach
+./target/release/pterm open mysession
+
 # List active sessions
 ./target/release/pterm list
 

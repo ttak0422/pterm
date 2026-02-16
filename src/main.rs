@@ -8,7 +8,8 @@ use server::Server;
 use session::Session;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("PTERM_SOCKET_DIR") {
@@ -43,6 +44,8 @@ fn print_usage() {
 Usage:
   pterm new    <session-name> [--cols N] [--rows N] [--] <command> [args...]
   pterm attach <session-name>   # attach to session (bridge mode)
+  pterm open   <session-name> [--cols N] [--rows N] [--] <command> [args...]
+               # attach if exists, otherwise create and attach
   pterm list   [prefix]
   pterm kill   <session-name>
   pterm socket <session-name>   # print socket path
@@ -272,6 +275,42 @@ fn cmd_kill(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// Extract session name from args following the same parsing rule as `cmd_new`:
+/// first non-option argument, where `--cols/--rows` consume their next value.
+fn parse_session_name(args: &[String]) -> Option<&str> {
+    let mut parsing_opts = true;
+    let mut i = 0;
+    while i < args.len() {
+        if parsing_opts && args[i] == "--" {
+            parsing_opts = false;
+            i += 1;
+            continue;
+        }
+        if parsing_opts && (args[i] == "--cols" || args[i] == "--rows") {
+            i += 2;
+            continue;
+        }
+        return Some(args[i].as_str());
+    }
+    None
+}
+
+fn wait_for_socket(sock: &Path, timeout: Duration, poll: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if sock.exists() {
+            let meta = std::fs::metadata(sock)?;
+            if meta.file_type().is_socket() {
+                return Ok(true);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 fn cmd_attach(args: &[String]) -> io::Result<()> {
     let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
         eprintln!("Error: session name required");
@@ -282,6 +321,29 @@ fn cmd_attach(args: &[String]) -> io::Result<()> {
     if !sock.exists() {
         eprintln!("Error: session '{}' not found", name);
         std::process::exit(1);
+    }
+
+    let exit_code = bridge::run(&sock)?;
+    std::process::exit(exit_code);
+}
+
+fn cmd_open(args: &[String]) -> io::Result<()> {
+    let name = parse_session_name(args).unwrap_or_else(|| {
+        eprintln!("Error: session name required");
+        std::process::exit(1);
+    });
+
+    let sock = session_socket_path(name);
+    if !sock.exists() {
+        cmd_new(args)?;
+        let ok = wait_for_socket(&sock, Duration::from_millis(3000), Duration::from_millis(50))?;
+        if !ok {
+            eprintln!(
+                "Error: session '{}' was created but socket did not appear in time",
+                name
+            );
+            std::process::exit(1);
+        }
     }
 
     let exit_code = bridge::run(&sock)?;
@@ -310,6 +372,7 @@ fn main() {
     let result = match args[1].as_str() {
         "new" => cmd_new(&args[2..]),
         "attach" => cmd_attach(&args[2..]),
+        "open" => cmd_open(&args[2..]),
         "list" | "ls" => cmd_list(&args[2..]),
         "kill" => cmd_kill(&args[2..]),
         "socket" => cmd_socket(&args[2..]),
