@@ -1,0 +1,14 @@
+# Build
+/target/
+
+# Editor
+*.swp
+*.swo
+
+# Nix
+/result
+.direnv/
+.pre-commit-config.yaml
+
+# Claude Code
+.claude/
