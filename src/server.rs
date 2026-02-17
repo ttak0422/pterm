@@ -17,6 +17,49 @@ struct Client {
     send_buf: Vec<u8>,
 }
 
+/// Remove terminal query escape sequences from scrollback replay.
+///
+/// Replaying queries like `CSI 6n` can make terminal responses appear as stray
+/// input (for example `09;5R`). We only sanitize scrollback replay; live PTY
+/// output is forwarded unchanged.
+fn sanitize_scrollback_for_replay(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < data.len() {
+                let b = data[j];
+                // CSI final byte range
+                if (0x40..=0x7e).contains(&b) {
+                    let final_byte = b;
+                    let params = &data[i + 2..j];
+                    let is_status_query = final_byte == b'n';
+                    let is_device_attr_query = final_byte == b'c'
+                        && (params.is_empty() || params[0] == b'>' || params[0] == b'?');
+                    if !(is_status_query || is_device_attr_query) {
+                        out.extend_from_slice(&data[i..=j]);
+                    }
+                    i = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if j >= data.len() {
+                out.extend_from_slice(&data[i..]);
+                break;
+            }
+            continue;
+        }
+
+        out.push(data[i]);
+        i += 1;
+    }
+
+    out
+}
+
 pub struct Server {
     socket_path: PathBuf,
     session: Session,
@@ -147,7 +190,8 @@ impl Server {
 
                     log::info!("Client {} connected to '{}'", id, self.session.name);
 
-                    let scrollback = self.session.scrollback.get_contents();
+                    let scrollback =
+                        sanitize_scrollback_for_replay(&self.session.scrollback.get_contents());
 
                     self.clients.insert(
                         id,
