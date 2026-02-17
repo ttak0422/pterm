@@ -125,21 +125,6 @@ Session names may contain `/` for hierarchy, for example:
 }
 ```
 
-## CI Binary Cache (Cachix)
-
-GitHub Actions is prepared to use Cachix for binary cache uploads.
-
-1. Set repository variable `CACHIX_CACHE_NAME` (your Cachix cache name)
-2. Set repository variable `CACHIX_PUSH_ENABLED=true` when you want CI to push binaries
-3. Set repository secret `CACHIX_AUTH_TOKEN` (Cachix auth token with push permission)
-
-Behavior:
-
-- Pull requests: cache configured in read-only mode (`skipPush: true`)
-- Push to `main`: binaries are pushed when `CACHIX_PUSH_ENABLED=true` and `CACHIX_AUTH_TOKEN` is set
-
-When you share the cache publicly, add the provided public key to consumers (for example in `nixConfig`).
-
 ## License
 
 MIT
