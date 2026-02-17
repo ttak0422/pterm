@@ -117,7 +117,7 @@ Session names may contain `/` for hierarchy, for example:
 ```lua
 -- lazy.nvim
 {
-  "you/pterm",
+  "ttak0422/pterm",
   build = "nix build",
   config = function()
     require("pterm").setup()
