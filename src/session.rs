@@ -36,8 +36,25 @@ impl Session {
     }
 
     /// Write input data to pty (forward user keystrokes).
-    pub fn write_pty(&self, data: &[u8]) -> io::Result<usize> {
-        nix::unistd::write(&self.pty.master, data).map_err(io::Error::other)
+    pub fn write_pty(&self, data: &[u8]) -> io::Result<()> {
+        let mut written = 0;
+        while written < data.len() {
+            match nix::unistd::write(&self.pty.master, &data[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "pty write returned 0",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(e) if e == nix::errno::Errno::EINTR => continue,
+                Err(e) if e == nix::errno::Errno::EAGAIN => {
+                    std::thread::yield_now();
+                }
+                Err(e) => return Err(io::Error::other(e)),
+            }
+        }
+        Ok(())
     }
 
     /// Resize the pty.
