@@ -1,6 +1,11 @@
 {
   description = "pterm - persistent terminal multiplexer";
 
+  nixConfig = {
+    extra-substituters = [ "https://ttak0422-pterm.cachix.org" ];
+    extra-trusted-public-keys = [ "ttak0422-pterm.cachix.org-1:s0zSh4J7l8NrisVESCYNxcSw7rz2vLsGa5fh+E42NDY=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
