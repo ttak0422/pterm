@@ -207,8 +207,24 @@ impl Server {
                         if let Some(client) = self.clients.get_mut(&id) {
                             client.send_buf.extend_from_slice(&msg);
                         }
-                        self.flush_client_send_buf(id)?;
                     }
+
+                    // Reset terminal state after scrollback replay so that
+                    // stale SGR attributes (colors/styles) and cursor
+                    // visibility from the scrollback don't leak into the
+                    // live session.
+                    //
+                    //   \x1b[0m   — SGR reset (clear colors and attributes)
+                    //   \x1b[?25h — DECCM: show cursor
+                    {
+                        let reset = b"\x1b[0m\x1b[?25h";
+                        let msg = proto::encode(proto::server::SCROLLBACK, reset);
+                        if let Some(client) = self.clients.get_mut(&id) {
+                            client.send_buf.extend_from_slice(&msg);
+                        }
+                    }
+
+                    self.flush_client_send_buf(id)?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
