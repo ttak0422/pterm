@@ -1,15 +1,11 @@
-use crate::buffer::ScrollbackBuffer;
 use crate::pty::Pty;
 use std::io;
 use std::os::fd::AsRawFd;
 
-/// Default scrollback buffer size: 1MB
-const DEFAULT_SCROLLBACK_SIZE: usize = 1024 * 1024;
-
 pub struct Session {
     pub name: String,
     pub pty: Pty,
-    pub scrollback: ScrollbackBuffer,
+    parser: vt100::Parser,
     pub exited: Option<i32>,
 }
 
@@ -20,17 +16,17 @@ impl Session {
         Ok(Self {
             name,
             pty,
-            scrollback: ScrollbackBuffer::new(DEFAULT_SCROLLBACK_SIZE),
+            parser: vt100::Parser::new(rows, cols, 0),
             exited: None,
         })
     }
 
-    /// Read available data from pty, store in scrollback, return what was read.
+    /// Read available data from pty, feed to VT parser, return what was read.
     pub fn read_pty(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let fd = self.pty.master.as_raw_fd();
         let n = nix::unistd::read(fd, buf).map_err(io::Error::other)?;
         if n > 0 {
-            self.scrollback.append(&buf[..n]);
+            self.parser.process(&buf[..n]);
         }
         Ok(n)
     }
@@ -57,9 +53,16 @@ impl Session {
         Ok(())
     }
 
-    /// Resize the pty.
-    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
-        self.pty.resize(cols, rows)
+    /// Resize the pty and VT parser.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.pty.resize(cols, rows)?;
+        self.parser.set_size(rows, cols);
+        Ok(())
+    }
+
+    /// Generate escape sequences that reproduce the current terminal state.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.parser.screen().state_formatted()
     }
 
     /// Get the master fd for polling.

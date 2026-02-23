@@ -1,5 +1,4 @@
 mod bridge;
-mod buffer;
 mod pty;
 mod server;
 mod session;
