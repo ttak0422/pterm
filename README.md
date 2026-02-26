@@ -22,6 +22,9 @@ pterm list
 # Get socket path for a session
 pterm socket mysession
 
+# Redraw terminal (resend snapshot to all clients)
+pterm redraw mysession
+
 # Kill a session
 pterm kill mysession
 ```
@@ -32,6 +35,7 @@ pterm kill mysession
 :Pterm              " opens/creates default session
 :Pterm dev          " opens/creates named session
 :PtermList          " list sessions
+:PtermRedraw dev    " redraw a session
 :PtermKill dev      " kill a session
 ```
 
