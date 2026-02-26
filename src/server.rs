@@ -310,6 +310,15 @@ impl Server {
                     }
                 }
                 proto::client::DETACH => {}
+                proto::client::REDRAW => {
+                    log::info!("Redraw requested by client {}", client_id);
+                    let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
+                    redraw_data.extend_from_slice(&self.session.snapshot());
+                    let msg = proto::encode(proto::server::SCROLLBACK, &redraw_data);
+                    for (_, client) in self.clients.iter_mut() {
+                        client.send_buf.extend_from_slice(&msg);
+                    }
+                }
                 _ => log::warn!("Unknown message type: 0x{:02x}", msg_type),
             }
         }
