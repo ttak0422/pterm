@@ -26,7 +26,7 @@ This architecture keeps process/session persistence in Rust while letting libvte
 ┌────────────────────────────────────────────────────┐
 │ pterm daemon                                       │
 │ ├─ owns session PTY                                │
-│ ├─ tracks terminal state via vt100 parser           │
+│ ├─ tracks terminal state via vt100 parser          │
 │ ├─ multiplexes multiple clients                    │
 │ └─ exits when session socket is removed            │
 └───────────────────┬────────────────────────────────┘
