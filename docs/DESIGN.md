@@ -26,7 +26,7 @@ This architecture keeps process/session persistence in Rust while letting libvte
 ┌────────────────────────────────────────────────────┐
 │ pterm daemon                                       │
 │ ├─ owns session PTY                                │
-│ ├─ stores raw byte scrollback ring                 │
+│ ├─ tracks terminal state via vt100 parser           │
 │ ├─ multiplexes multiple clients                    │
 │ └─ exits when session socket is removed            │
 └───────────────────┬────────────────────────────────┘
@@ -70,7 +70,7 @@ Responsibilities:
 
 - create and own PTY/child process
 - keep process alive independently from Neovim
-- store raw output scrollback ring
+- track terminal state via vt100 parser and provide state snapshots on attach
 - serve multiple attach clients over Unix socket
 
 Notable behavior:
@@ -112,7 +112,7 @@ Daemon -> client:
 
 - `OUTPUT` (`0x01`): raw PTY output bytes
 - `EXIT` (`0x02`): `exit_code:i32`
-- `SCROLLBACK` (`0x80`): full stored scrollback on attach
+- `SCROLLBACK` (`0x80`): terminal state snapshot on attach (via `vt100::Screen::state_formatted`)
 
 ## Socket and Session Layout
 

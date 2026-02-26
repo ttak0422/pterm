@@ -1,7 +1,6 @@
 //! Wire protocol for pterm daemon <-> client communication.
 //!
 //! All messages are framed as: [type: u8] [length: u32 LE] [payload: &[u8]]
-//! Exception: messages with no payload omit the length field.
 
 /// Client → Daemon message types
 pub mod client {
@@ -27,8 +26,8 @@ pub mod server {
     /// Payload: [exit_code: i32 LE]
     pub const EXIT: u8 = 0x02;
 
-    /// Scrollback dump (sent on initial attach)
-    /// Payload: full accumulated scrollback bytes
+    /// Terminal state snapshot (sent on initial attach)
+    /// Payload: escape sequences reproducing current terminal state
     pub const SCROLLBACK: u8 = 0x80;
 }
 
