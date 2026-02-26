@@ -1,58 +1,30 @@
-# pterm
+# pterm [![built with nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
 
 Persistent terminal sessions for Neovim.
 
 Processes survive Neovim restarts. Terminal rendering is delegated to Neovim's native terminal (`jobstart(..., { term = true })`) while pterm keeps PTY processes alive.
 
-## Local Development
-
-### Prerequisites
-
-- [Nix](https://nixos.org/) (with flakes enabled)
-- or Rust toolchain + `libiconv` (macOS)
-
-### Build
-
-```sh
-# Nix (recommended)
-nix build                 # builds Neovim plugin (includes daemon)
-nix build .#pterm-daemon  # builds daemon only
-
-# Development shell (provides Rust toolchain)
-nix develop
-cargo build --release
-```
-
-The daemon binary from workspace builds is at `target/release/pterm`.
-
-### Run the daemon CLI
+## CLI
 
 ```sh
 # Create a new persistent session (forks into background)
-./target/release/pterm new mysession
+pterm new mysession
 
 # Attach bridge mode (for terminal clients)
-./target/release/pterm attach mysession
+pterm attach mysession
 
 # Attach if exists, otherwise create and attach
-./target/release/pterm open mysession
+pterm open mysession
 
 # List active sessions
-./target/release/pterm list
+pterm list
 
 # Get socket path for a session
-./target/release/pterm socket mysession
+pterm socket mysession
 
 # Kill a session
-./target/release/pterm kill mysession
+pterm kill mysession
 ```
-
-### Environment variables
-
-| Variable | Description |
-|---|---|
-| `PTERM_SOCKET_DIR` | Override socket directory |
-| `SHELL` | Default command if none specified |
 
 ## Neovim Usage
 
@@ -65,64 +37,50 @@ The daemon binary from workspace builds is at `target/release/pterm`.
 
 `pterm` opens a terminal buffer backed by `jobstart({ "pterm", "attach", <name> }, { term = true })`.
 
-## How It Works
-
-- Rust daemon (`pterm new`) owns the child process PTY and stores raw scrollback bytes.
-- Neovim opens an attach bridge process (`pterm attach <name>`) as a terminal job.
-- The bridge forwards stdin/stdout to the daemon over a framed Unix-socket protocol.
-- Neovim/libvterm renders terminal output natively.
-
-This avoids Lua-side terminal byte parsing and improves compatibility with high-refresh TUI apps.
-
-## Session Lifecycle
-
-- Closing/deleting a Neovim buffer only detaches the client; the session continues running.
-- A session is deleted by `:PtermKill` / `pterm kill`, or when its socket file is removed externally.
-- If the session socket file disappears, the daemon treats the session as deleted and exits.
-
-## Socket Location
-
-Socket root directory is resolved in this order:
-
-1. `$PTERM_SOCKET_DIR`
-2. `$XDG_RUNTIME_DIR/pterm`
-3. `/tmp/pterm-$UID`
-
-Current session layout is:
-
-```text
-<socket_root>/<session_name>/socket
-```
-
-Session names may contain `/` for hierarchy, for example:
-
-```text
-/tmp/pterm-1000/
-├── main/
-│   └── socket
-└── project/
-    ├── socket
-    └── build/
-        └── socket
-```
-
 ## Requirements
 
 - Neovim 0.10+
-- [Nix](https://nixos.org/) (with flakes enabled), or Rust toolchain
+- [Nix](https://nixos.org/) (with flakes enabled)
 - Linux / macOS
 
 ## Install
 
-```lua
--- lazy.nvim
+This plugin is designed to be installed via Nix flakes. Add `pterm` as a flake input and include it in your Neovim plugin list.
+
+### Flake input
+
+```nix
 {
-  "ttak0422/pterm",
-  build = "nix build",
-  config = function()
-    require("pterm").setup()
-  end,
+  inputs = {
+    pterm.url = "github:ttak0422/pterm";
+  };
 }
+```
+
+### Neovim plugin
+
+Add `inputs.pterm.packages.${system}.pterm` to your Neovim plugin list and call `setup()`.
+
+```lua
+require("pterm").setup()
+
+
+-- Default configuration:
+require("pterm").setup({
+  -- Path to pterm binary (auto-detected if nil)
+  binary = nil,
+  -- Default shell command
+  shell = vim.env.SHELL or "/bin/sh",
+  -- Default terminal size
+  cols = 80,
+  rows = 24,
+  -- Socket directory (nil = let daemon decide)
+  socket_dir = nil,
+  -- Max wait time for daemon socket creation after `pterm new`
+  attach_wait_ms = 3000,
+  -- Poll interval while waiting for socket
+  attach_poll_ms = 50,
+})
 ```
 
 ## License
