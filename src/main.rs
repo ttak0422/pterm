@@ -47,6 +47,7 @@ Usage:
                # attach if exists, otherwise create and attach
   pterm list   [prefix]
   pterm kill   <session-name>
+  pterm redraw <session-name>   # redraw terminal (resend snapshot)
   pterm socket <session-name>   # print socket path
 
 Session names may contain '/' for hierarchical sessions:
@@ -349,6 +350,24 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
     std::process::exit(exit_code);
 }
 
+fn cmd_redraw(args: &[String]) -> io::Result<()> {
+    let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
+        eprintln!("Error: session name required");
+        std::process::exit(1);
+    });
+
+    let sock = session_socket_path(name);
+    if !sock.exists() {
+        eprintln!("Error: session '{}' not found", name);
+        std::process::exit(1);
+    }
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+    let msg = pterm_proto::encode(pterm_proto::client::REDRAW, &[]);
+    std::io::Write::write_all(&mut stream, &msg)?;
+    Ok(())
+}
+
 fn cmd_socket(args: &[String]) -> io::Result<()> {
     let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
         eprintln!("Error: session name required");
@@ -374,6 +393,7 @@ fn main() {
         "open" => cmd_open(&args[2..]),
         "list" | "ls" => cmd_list(&args[2..]),
         "kill" => cmd_kill(&args[2..]),
+        "redraw" => cmd_redraw(&args[2..]),
         "socket" => cmd_socket(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
