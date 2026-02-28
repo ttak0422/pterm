@@ -289,7 +289,9 @@ function M.detach(session_name)
 	end
 end
 
---- Redraw a session (resend terminal snapshot to all clients).
+--- Redraw a session (resend terminal snapshot via the daemon).
+--- Stateless: no buffer or window changes. The daemon sends a SCROLLBACK
+--- message through the existing bridge, which writes it to Neovim's terminal.
 function M.redraw(session_name)
 	if not session_name then
 		vim.notify("Session name required", vim.log.levels.ERROR)
