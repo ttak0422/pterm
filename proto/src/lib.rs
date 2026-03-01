@@ -14,6 +14,9 @@ pub mod client {
 
     /// Graceful detach request (no payload)
     pub const DETACH: u8 = 0x03;
+
+    /// Request terminal redraw (no payload)
+    pub const REDRAW: u8 = 0x04;
 }
 
 /// Daemon → Client message types

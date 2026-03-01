@@ -107,6 +107,7 @@ Client -> daemon:
 - `INPUT` (`0x01`): raw keyboard bytes
 - `RESIZE` (`0x02`): `cols:u16, rows:u16`
 - `DETACH` (`0x03`): empty payload
+- `REDRAW` (`0x04`): empty payload; requests daemon to resend terminal snapshot to all clients
 
 Daemon -> client:
 

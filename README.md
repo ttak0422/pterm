@@ -9,33 +9,52 @@ Processes survive Neovim restarts. Terminal rendering is delegated to Neovim's n
 ```sh
 # Create a new persistent session (forks into background)
 pterm new mysession
+pterm new mysession --cols 120 --rows 40
+pterm new mysession -- /bin/zsh        # custom command
 
 # Attach bridge mode (for terminal clients)
 pterm attach mysession
 
 # Attach if exists, otherwise create and attach
 pterm open mysession
+pterm open mysession -- /bin/zsh
 
-# List active sessions
+# List active sessions (optionally filter by prefix)
 pterm list
+pterm list myprefix
 
 # Get socket path for a session
 pterm socket mysession
+
+# Redraw terminal (resend snapshot to all clients)
+pterm redraw mysession
 
 # Kill a session
 pterm kill mysession
 ```
 
+Session names may contain `/` for hierarchical sessions. Killing a parent session also kills all children.
+
+```sh
+pterm new parent
+pterm new parent/child
+pterm kill parent          # kills parent and parent/child
+```
+
 ## Neovim Usage
 
 ```vim
-:Pterm              " opens/creates default session
+:Pterm              " opens/creates 'main' session
 :Pterm dev          " opens/creates named session
+:Pterm dev zsh      " opens/creates session with custom command
 :PtermList          " list sessions
+:PtermRedraw dev    " redraw a session
 :PtermKill dev      " kill a session
 ```
 
 `pterm` opens a terminal buffer backed by `jobstart({ "pterm", "attach", <name> }, { term = true })`.
+
+The Lua module also exports functions for programmatic use: `open`, `attach`, `detach`, `list`, `kill`, `redraw`.
 
 ## Requirements
 
@@ -71,7 +90,7 @@ require("pterm").setup({
   binary = nil,
   -- Default shell command
   shell = vim.env.SHELL or "/bin/sh",
-  -- Default terminal size
+  -- Fallback terminal size (Neovim window size takes priority)
   cols = 80,
   rows = 24,
   -- Socket directory (nil = let daemon decide)

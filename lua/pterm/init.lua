@@ -289,6 +289,22 @@ function M.detach(session_name)
 	end
 end
 
+--- Redraw a session (resend terminal snapshot via the daemon).
+--- Stateless: no buffer or window changes. The daemon sends a SCROLLBACK
+--- message through the existing bridge, which writes it to Neovim's terminal.
+function M.redraw(session_name)
+	if not session_name then
+		vim.notify("Session name required", vim.log.levels.ERROR)
+		return
+	end
+
+	local bin = find_binary()
+	vim.fn.system({ bin, "redraw", session_name })
+	if vim.v.shell_error ~= 0 then
+		vim.notify("Failed to redraw session '" .. session_name .. "'", vim.log.levels.ERROR)
+	end
+end
+
 --- Setup function for lazy.nvim / packer etc.
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
@@ -313,6 +329,16 @@ function M.setup(opts)
 			end
 		end
 	end, { desc = "List active pterm sessions" })
+
+	vim.api.nvim_create_user_command("PtermRedraw", function(cmd_opts)
+		M.redraw(cmd_opts.fargs[1])
+	end, {
+		nargs = 1,
+		complete = function()
+			return M.list()
+		end,
+		desc = "Redraw a persistent terminal session",
+	})
 
 	vim.api.nvim_create_user_command("PtermKill", function(cmd_opts)
 		M.kill(cmd_opts.fargs[1])

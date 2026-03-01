@@ -97,14 +97,24 @@ impl Server {
 
             for event in events.iter() {
                 match event.token() {
-                    LISTENER => self.accept_client()?,
+                    LISTENER => {
+                        if let Err(e) = self.accept_client() {
+                            log::warn!("Failed to accept client: {}", e);
+                        }
+                    }
                     token if token.0 >= CLIENT_BASE.0 => {
                         let id = token.0 - CLIENT_BASE.0;
                         if event.is_readable() {
-                            self.handle_client_data(id, &mut client_buf)?;
+                            if let Err(e) = self.handle_client_data(id, &mut client_buf) {
+                                log::warn!("Client {} read error: {}", id, e);
+                                self.clients.remove(&id);
+                            }
                         }
                         if event.is_writable() {
-                            self.flush_client_send_buf(id)?;
+                            if let Err(e) = self.flush_client_send_buf(id) {
+                                log::warn!("Client {} write error: {}", id, e);
+                                self.clients.remove(&id);
+                            }
                         }
                     }
                     PTY_BASE => self.handle_pty_output(&mut pty_buf)?,
@@ -165,7 +175,12 @@ impl Server {
                         }
                     }
 
-                    self.flush_client_send_buf(id)?;
+                    if let Err(e) = self.flush_client_send_buf(id) {
+                        log::warn!(
+                            "Client {} flush error during accept, deferring to event loop: {}",
+                            id, e
+                        );
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -247,6 +262,20 @@ impl Server {
         self.set_client_interest(client_id, writable)
     }
 
+    fn flush_all_clients(&mut self) {
+        let ids: Vec<usize> = self.clients.keys().copied().collect();
+        let mut disconnected = Vec::new();
+        for id in ids {
+            if self.flush_client_send_buf(id).is_err() {
+                disconnected.push(id);
+            }
+        }
+        for id in disconnected {
+            log::info!("Client {} disconnected during flush", id);
+            self.clients.remove(&id);
+        }
+    }
+
     fn handle_client_data(&mut self, client_id: usize, buf: &mut [u8]) -> io::Result<()> {
         let remove = {
             let client = match self.clients.get_mut(&client_id) {
@@ -269,19 +298,23 @@ impl Server {
             self.clients.remove(&client_id);
         } else if let Some(client) = self.clients.get_mut(&client_id) {
             if !client.recv_buf.is_empty() {
-                self.process_client_recv_buf(client_id)?;
+                let needs_flush = self.process_client_recv_buf(client_id)?;
+                if needs_flush {
+                    self.flush_all_clients();
+                }
             }
         }
         Ok(())
     }
 
-    fn process_client_recv_buf(&mut self, client_id: usize) -> io::Result<()> {
+    fn process_client_recv_buf(&mut self, client_id: usize) -> io::Result<bool> {
         // Take the buffer out to avoid borrowing self.clients while using self.session
         let mut recv_buf = match self.clients.get_mut(&client_id) {
             Some(c) => std::mem::take(&mut c.recv_buf),
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
+        let mut flush_all = false;
         let mut offset = 0;
         while offset + proto::HEADER_SIZE <= recv_buf.len() {
             let header: [u8; proto::HEADER_SIZE] = recv_buf[offset..offset + proto::HEADER_SIZE]
@@ -310,6 +343,16 @@ impl Server {
                     }
                 }
                 proto::client::DETACH => {}
+                proto::client::REDRAW => {
+                    log::info!("Redraw requested by client {}", client_id);
+                    let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
+                    redraw_data.extend_from_slice(&self.session.snapshot());
+                    let msg = proto::encode(proto::server::SCROLLBACK, &redraw_data);
+                    for (_, client) in self.clients.iter_mut() {
+                        client.send_buf.extend_from_slice(&msg);
+                    }
+                    flush_all = true;
+                }
                 _ => log::warn!("Unknown message type: 0x{:02x}", msg_type),
             }
         }
@@ -321,7 +364,7 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.recv_buf = recv_buf;
         }
-        Ok(())
+        Ok(flush_all)
     }
 }
 
