@@ -349,6 +349,10 @@ function M.setup(opts)
 		end,
 		desc = "Kill a persistent terminal session",
 	})
+
+	pcall(function()
+		require("telescope").load_extension("pterm")
+	end)
 end
 
 return M
