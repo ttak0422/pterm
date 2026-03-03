@@ -99,7 +99,15 @@ fn write_all_raw(fd: RawFd, data: &[u8]) -> io::Result<()> {
 
 /// Run the bridge, connecting stdin/stdout to the daemon session at `socket_path`.
 /// Returns the child process exit code (from the daemon's EXIT message).
-pub fn run(socket_path: &Path) -> io::Result<i32> {
+///
+/// `initial_cols` / `initial_rows` override the terminal size sent in the
+/// initial RESIZE message.  When `None`, the size is read from `TIOCGWINSZ`
+/// (stdout) with a final fallback to 80×24.
+pub fn run(
+    socket_path: &Path,
+    initial_cols: Option<u16>,
+    initial_rows: Option<u16>,
+) -> io::Result<i32> {
     let stdin_fd = libc::STDIN_FILENO;
     let stdout_fd = libc::STDOUT_FILENO;
 
@@ -148,8 +156,19 @@ pub fn run(socket_path: &Path) -> io::Result<i32> {
     poll.registry()
         .register(&mut wake_source, TOKEN_WAKE, Interest::READABLE)?;
 
-    // Send initial RESIZE to sync terminal size
-    if let Ok((cols, rows)) = get_winsize(stdout_fd) {
+    // Send initial RESIZE to sync terminal size.
+    // CLI-supplied values take priority, then TIOCGWINSZ, then 80×24.
+    let (cols, rows) = {
+        let winsize = get_winsize(stdout_fd).ok();
+        let c = initial_cols
+            .or(winsize.map(|(c, _)| c))
+            .unwrap_or(80);
+        let r = initial_rows
+            .or(winsize.map(|(_, r)| r))
+            .unwrap_or(24);
+        (c, r)
+    };
+    {
         let resize_payload = proto::encode_resize(cols, rows);
         let msg = proto::encode(proto::client::RESIZE, &resize_payload);
         socket.write_all(&msg)?;
