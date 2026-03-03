@@ -213,7 +213,24 @@ function M.attach(session_name)
 	local buf = vim.api.nvim_create_buf(true, false)
 	vim.api.nvim_set_current_buf(buf)
 
-	local job_id = vim.fn.jobstart({ bin, "attach", session_name }, {
+	-- Set window-local options appropriate for a terminal buffer.
+	local win = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_option_value("number", false, { win = win })
+	vim.api.nvim_set_option_value("relativenumber", false, { win = win })
+	vim.api.nvim_set_option_value("signcolumn", "no", { win = win })
+	vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
+	vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
+
+	-- Pass the current window size so the bridge sends an accurate initial
+	-- RESIZE before the daemon generates the snapshot.
+	local win_cols = vim.api.nvim_win_get_width(win)
+	local win_rows = vim.api.nvim_win_get_height(win)
+
+	local job_id = vim.fn.jobstart({
+		bin, "attach", session_name,
+		"--cols", tostring(win_cols),
+		"--rows", tostring(win_rows),
+	}, {
 		term = true,
 		on_exit = function(_, exit_code, _)
 			vim.schedule(function()
@@ -254,6 +271,49 @@ function M.attach(session_name)
 			M.detach(session_name)
 		end,
 	})
+
+	-- Propagate resize events to the bridge process via jobresize().
+	-- VimResized fires on SIGWINCH (whole Neovim frame resized).
+	vim.api.nvim_create_autocmd("VimResized", {
+		group = augroup,
+		callback = function()
+			local conn = M.connections[session_name]
+			if not conn or not conn.job_id then
+				return
+			end
+			-- Find all windows showing this terminal buffer and resize each.
+			for _, w in ipairs(vim.api.nvim_list_wins()) do
+				if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == conn.buf then
+					local cols = vim.api.nvim_win_get_width(w)
+					local rows = vim.api.nvim_win_get_height(w)
+					pcall(vim.fn.jobresize, conn.job_id, cols, rows)
+					break -- one jobresize is enough; the bridge sends RESIZE to daemon
+				end
+			end
+		end,
+	})
+
+	-- WinResized fires when individual windows change size (Neovim ≥ 0.9).
+	if vim.fn.exists("##WinResized") == 1 then
+		vim.api.nvim_create_autocmd("WinResized", {
+			group = augroup,
+			callback = function()
+				local conn = M.connections[session_name]
+				if not conn or not conn.job_id then
+					return
+				end
+				local resized_wins = vim.v.event and vim.v.event.windows or {}
+				for _, w in ipairs(resized_wins) do
+					if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == conn.buf then
+						local cols = vim.api.nvim_win_get_width(w)
+						local rows = vim.api.nvim_win_get_height(w)
+						pcall(vim.fn.jobresize, conn.job_id, cols, rows)
+						break
+					end
+				end
+			end,
+		})
+	end
 
 	vim.cmd("startinsert")
 end
