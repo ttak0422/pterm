@@ -63,7 +63,7 @@ local function socket_dir()
 	if runtime_dir then
 		return (runtime_dir .. "/pterm"):gsub("//+", "/")
 	end
-	local uid = vim.fn.system("id -u"):gsub("%s+", "")
+	local uid = vim.uv.os_get_passwd().uid
 	return "/tmp/pterm-" .. uid
 end
 
@@ -80,11 +80,39 @@ local function wait_for_socket(session_name, timeout_ms, poll_ms)
 	end, poll_ms)
 end
 
+--- Recursively scan the socket directory for active sessions (pure Lua).
+--- Mirrors the Rust `find_sessions()` logic without spawning a subprocess,
+--- which avoids instability when called during command-line completion.
+local function scan_sessions(base, prefix)
+	local sessions = {}
+	local handle = vim.uv.fs_scandir(base)
+	if not handle then
+		return sessions
+	end
+	while true do
+		local name, typ = vim.uv.fs_scandir_next(handle)
+		if not name then
+			break
+		end
+		if name ~= "socket" and typ == "directory" then
+			local full_name = prefix == "" and name or (prefix .. "/" .. name)
+			local child_dir = base .. "/" .. name
+			if vim.uv.fs_stat(child_dir .. "/socket") then
+				table.insert(sessions, full_name)
+			end
+			local children = scan_sessions(child_dir, full_name)
+			vim.list_extend(sessions, children)
+		end
+	end
+	return sessions
+end
+
 --- List active sessions.
 function M.list()
-	local bin = find_binary()
-	local result = vim.fn.systemlist({ bin, "list" })
-	return result or {}
+	local dir = socket_dir()
+	local sessions = scan_sessions(dir, "")
+	table.sort(sessions)
+	return sessions
 end
 
 --- Kill a session.
@@ -369,13 +397,24 @@ end
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
+	local function complete_sessions(arg_lead)
+		local ok, sessions = pcall(M.list)
+		if not ok then
+			return {}
+		end
+		if not arg_lead or arg_lead == "" then
+			return sessions
+		end
+		return vim.tbl_filter(function(s)
+			return s:find(arg_lead, 1, true) == 1
+		end, sessions)
+	end
+
 	vim.api.nvim_create_user_command("Pterm", function(cmd_opts)
 		M.open(cmd_opts.fargs[1], cmd_opts.fargs)
 	end, {
 		nargs = "*",
-		complete = function()
-			return M.list()
-		end,
+		complete = complete_sessions,
 		desc = "Open or attach to a persistent terminal session",
 	})
 
@@ -394,9 +433,7 @@ function M.setup(opts)
 		M.redraw(cmd_opts.fargs[1])
 	end, {
 		nargs = 1,
-		complete = function()
-			return M.list()
-		end,
+		complete = complete_sessions,
 		desc = "Redraw a persistent terminal session",
 	})
 
@@ -404,9 +441,7 @@ function M.setup(opts)
 		M.kill(cmd_opts.fargs[1])
 	end, {
 		nargs = 1,
-		complete = function()
-			return M.list()
-		end,
+		complete = complete_sessions,
 		desc = "Kill a persistent terminal session",
 	})
 end
