@@ -42,7 +42,8 @@ fn print_usage() {
 
 Usage:
   pterm new    <session-name> [--cols N] [--rows N] [--] <command> [args...]
-  pterm attach <session-name>   # attach to session (bridge mode)
+  pterm attach <session-name> [--cols N] [--rows N]
+               # attach to session (bridge mode)
   pterm open   <session-name> [--cols N] [--rows N] [--] <command> [args...]
                # attach if exists, otherwise create and attach
   pterm list   [prefix]
@@ -312,18 +313,36 @@ fn wait_for_socket(sock: &Path, timeout: Duration, poll: Duration) -> io::Result
 }
 
 fn cmd_attach(args: &[String]) -> io::Result<()> {
-    let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
-        eprintln!("Error: session name required");
-        std::process::exit(1);
-    });
+    let mut session_name = String::new();
+    let mut cols: Option<u16> = None;
+    let mut rows: Option<u16> = None;
 
-    let sock = session_socket_path(name);
-    if !sock.exists() {
-        eprintln!("Error: session '{}' not found", name);
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--cols" {
+            i += 1;
+            cols = args.get(i).and_then(|s| s.parse().ok());
+        } else if args[i] == "--rows" {
+            i += 1;
+            rows = args.get(i).and_then(|s| s.parse().ok());
+        } else if session_name.is_empty() {
+            session_name = args[i].clone();
+        }
+        i += 1;
+    }
+
+    if session_name.is_empty() {
+        eprintln!("Error: session name required");
         std::process::exit(1);
     }
 
-    let exit_code = bridge::run(&sock)?;
+    let sock = session_socket_path(&session_name);
+    if !sock.exists() {
+        eprintln!("Error: session '{}' not found", session_name);
+        std::process::exit(1);
+    }
+
+    let exit_code = bridge::run(&sock, cols, rows)?;
     std::process::exit(exit_code);
 }
 
@@ -332,6 +351,23 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         eprintln!("Error: session name required");
         std::process::exit(1);
     });
+
+    // Extract --cols/--rows for bridge
+    let mut cols: Option<u16> = None;
+    let mut rows: Option<u16> = None;
+    {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--cols" {
+                i += 1;
+                cols = args.get(i).and_then(|s| s.parse().ok());
+            } else if args[i] == "--rows" {
+                i += 1;
+                rows = args.get(i).and_then(|s| s.parse().ok());
+            }
+            i += 1;
+        }
+    }
 
     let sock = session_socket_path(name);
     if !sock.exists() {
@@ -346,7 +382,7 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         }
     }
 
-    let exit_code = bridge::run(&sock)?;
+    let exit_code = bridge::run(&sock, cols, rows)?;
     std::process::exit(exit_code);
 }
 

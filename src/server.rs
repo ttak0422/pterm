@@ -6,15 +6,25 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
 
+/// Per-connection timeout before we send the initial snapshot.
+/// This gives the client time to send a RESIZE with its actual window size
+/// so the snapshot is generated at the correct dimensions.
+const SNAPSHOT_DEFER_MS: u64 = 500;
+
 struct Client {
     stream: UnixStream,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    /// `true` until the initial snapshot has been sent.
+    pending_snapshot: bool,
+    /// Deadline after which we send the snapshot even without a RESIZE.
+    pending_snapshot_deadline: Option<Instant>,
 }
 
 pub struct Server {
@@ -122,6 +132,32 @@ impl Server {
                 }
             }
 
+            // Send deferred snapshots for clients whose deadline has expired
+            // without receiving a RESIZE (backwards compatibility with plain
+            // `pterm attach` from a raw terminal).
+            let now = Instant::now();
+            let pending_ids: Vec<usize> = self
+                .clients
+                .iter()
+                .filter_map(|(&id, c)| {
+                    if c.pending_snapshot {
+                        if let Some(deadline) = c.pending_snapshot_deadline {
+                            if now >= deadline {
+                                return Some(id);
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect();
+            for id in pending_ids {
+                log::info!(
+                    "Client {} snapshot deadline expired, sending snapshot",
+                    id
+                );
+                self.send_snapshot_to_client(id);
+            }
+
             if let Some(exit_code) = self.session.check_exit() {
                 log::info!("Child exited with code {}", exit_code);
                 let msg = proto::encode(proto::server::EXIT, &exit_code.to_le_bytes());
@@ -157,7 +193,8 @@ impl Server {
 
                     log::info!("Client {} connected to '{}'", id, self.session.name);
 
-                    let snapshot = self.session.snapshot();
+                    let deadline = Instant::now()
+                        + std::time::Duration::from_millis(SNAPSHOT_DEFER_MS);
 
                     self.clients.insert(
                         id,
@@ -165,28 +202,36 @@ impl Server {
                             stream,
                             recv_buf: Vec::new(),
                             send_buf: Vec::new(),
+                            pending_snapshot: true,
+                            pending_snapshot_deadline: Some(deadline),
                         },
                     );
-
-                    if !snapshot.is_empty() {
-                        let msg = proto::encode(proto::server::SCROLLBACK, &snapshot);
-                        if let Some(client) = self.clients.get_mut(&id) {
-                            client.send_buf.extend_from_slice(&msg);
-                        }
-                    }
-
-                    if let Err(e) = self.flush_client_send_buf(id) {
-                        log::warn!(
-                            "Client {} flush error during accept, deferring to event loop: {}",
-                            id, e
-                        );
-                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
         }
         Ok(())
+    }
+
+    /// Send the current terminal snapshot to a specific client and clear its
+    /// pending-snapshot flag.
+    fn send_snapshot_to_client(&mut self, client_id: usize) {
+        let snapshot = self.session.snapshot();
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.pending_snapshot = false;
+            client.pending_snapshot_deadline = None;
+            if !snapshot.is_empty() {
+                let msg = proto::encode(proto::server::SCROLLBACK, &snapshot);
+                client.send_buf.extend_from_slice(&msg);
+            }
+        }
+        if let Err(e) = self.flush_client_send_buf(client_id) {
+            log::warn!(
+                "Client {} flush error during snapshot send: {}",
+                client_id, e
+            );
+        }
     }
 
     fn handle_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
@@ -340,6 +385,17 @@ impl Server {
                         let r: [u8; 4] = payload[..4].try_into().unwrap();
                         let (cols, rows) = proto::decode_resize(&r);
                         self.session.resize(cols, rows)?;
+
+                        // If this client still has a pending snapshot, the
+                        // session has now been resized to the correct
+                        // dimensions.  Generate and send the snapshot.
+                        let needs_snapshot = self
+                            .clients
+                            .get(&client_id)
+                            .map_or(false, |c| c.pending_snapshot);
+                        if needs_snapshot {
+                            self.send_snapshot_to_client(client_id);
+                        }
                     }
                 }
                 proto::client::DETACH => {}
