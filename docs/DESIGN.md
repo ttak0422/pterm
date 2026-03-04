@@ -78,6 +78,13 @@ Notable behavior:
 - session socket path: `<socket_root>/<session>/socket`
 - if socket file is removed externally, daemon treats session as deleted and exits
 - output delivery uses per-client send queues and writable polling to avoid disconnecting on backpressure (`WouldBlock`)
+- **deferred snapshot**: on connect, waits up to 500ms for the client to send RESIZE before generating the initial snapshot, ensuring correct terminal dimensions
+- **micro-batching**: PTY output is coalesced using bounded micro-batching (similar to tmux) to prevent prompt fragmentation on fast machines:
+  - after a read, holds output for up to 1ms (`BATCH_DELAY_MS`) to coalesce nearby shell writes
+  - maximum burst hold time is 3ms (`BATCH_MAX_MS`)
+  - flushes immediately when the pending buffer reaches 4096 bytes (`BATCH_FLUSH_SIZE`)
+  - poll timeout is dynamically computed as `min(100ms, batch_deadline, snapshot_deadlines)`
+- EXIT message is queued into `send_buf` (not written directly) to preserve OUTPUT→EXIT ordering under backpressure, and is sent exactly once via an `exit_sent` guard
 
 ### Bridge (`src/bridge.rs`)
 
@@ -93,6 +100,7 @@ Implementation notes:
 - raw mode guard for terminal settings restoration
 - framed protocol parsing with buffered partial-frame handling
 - `EINTR` on `poll` is retried
+- **output batching**: accumulates OUTPUT and SCROLLBACK payloads per poll cycle into a single `write_all_raw()` call to prevent incremental rendering on the Neovim side
 
 ## Wire Protocol
 
