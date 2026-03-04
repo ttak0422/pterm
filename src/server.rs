@@ -138,8 +138,7 @@ impl Server {
                 }
             }
 
-            self.poll
-                .poll(&mut events, Some(poll_timeout))?;
+            self.poll.poll(&mut events, Some(poll_timeout))?;
 
             for event in events.iter() {
                 match event.token() {
@@ -198,10 +197,7 @@ impl Server {
                 // the vt state is up-to-date.
                 self.flush_pty_output();
                 for id in pending_ids {
-                    log::info!(
-                        "Client {} snapshot deadline expired, sending snapshot",
-                        id
-                    );
+                    log::info!("Client {} snapshot deadline expired, sending snapshot", id);
                     self.send_snapshot_to_client(id);
                 }
             }
@@ -249,8 +245,8 @@ impl Server {
 
                     log::info!("Client {} connected to '{}'", id, self.session.name);
 
-                    let deadline = Instant::now()
-                        + std::time::Duration::from_millis(SNAPSHOT_DEFER_MS);
+                    let deadline =
+                        Instant::now() + std::time::Duration::from_millis(SNAPSHOT_DEFER_MS);
 
                     self.clients.insert(
                         id,
@@ -285,7 +281,8 @@ impl Server {
         if let Err(e) = self.flush_client_send_buf(client_id) {
             log::warn!(
                 "Client {} flush error during snapshot send: {}",
-                client_id, e
+                client_id,
+                e
             );
         }
     }
@@ -345,6 +342,12 @@ impl Server {
         let mut disconnected = Vec::new();
         let mut flush_ids = Vec::new();
         for (&id, client) in self.clients.iter_mut() {
+            // A newly attached client must receive a coherent snapshot first.
+            // Sending live OUTPUT before that can interleave mid-sequence bytes
+            // with snapshot replay and corrupt rendering.
+            if client.pending_snapshot {
+                continue;
+            }
             client.send_buf.extend_from_slice(&msg);
             flush_ids.push(id);
         }
