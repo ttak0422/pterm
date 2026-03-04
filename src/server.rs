@@ -235,28 +235,42 @@ impl Server {
     }
 
     fn handle_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        match self.session.read_pty(buf) {
-            Ok(0) => {}
-            Ok(n) => {
-                let msg = proto::encode(proto::server::OUTPUT, &buf[..n]);
-                let mut disconnected = Vec::new();
-                let mut flush_ids = Vec::new();
-                for (&id, client) in self.clients.iter_mut() {
-                    client.send_buf.extend_from_slice(&msg);
-                    flush_ids.push(id);
-                }
-                for id in flush_ids {
-                    if self.flush_client_send_buf(id).is_err() {
-                        disconnected.push(id);
+        // Drain all available PTY data into a single buffer so we send one
+        // coalesced OUTPUT message instead of many small fragments.
+        let mut output = Vec::new();
+        loop {
+            match self.session.read_pty(buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    if output.is_empty() {
+                        log::error!("pty read error: {}", e);
                     }
-                }
-                for id in disconnected {
-                    log::info!("Client {} disconnected", id);
-                    self.clients.remove(&id);
+                    break;
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => log::error!("pty read error: {}", e),
+        }
+
+        if output.is_empty() {
+            return Ok(());
+        }
+
+        let msg = proto::encode(proto::server::OUTPUT, &output);
+        let mut disconnected = Vec::new();
+        let mut flush_ids = Vec::new();
+        for (&id, client) in self.clients.iter_mut() {
+            client.send_buf.extend_from_slice(&msg);
+            flush_ids.push(id);
+        }
+        for id in flush_ids {
+            if self.flush_client_send_buf(id).is_err() {
+                disconnected.push(id);
+            }
+        }
+        for id in disconnected {
+            log::info!("Client {} disconnected", id);
+            self.clients.remove(&id);
         }
         Ok(())
     }

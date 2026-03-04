@@ -22,13 +22,21 @@ impl Session {
     }
 
     /// Read available data from pty, feed to VT parser, return what was read.
+    /// Returns `Err(WouldBlock)` when the non-blocking fd has no more data.
     pub fn read_pty(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let fd = self.pty.master.as_raw_fd();
-        let n = nix::unistd::read(fd, buf).map_err(io::Error::other)?;
-        if n > 0 {
-            self.parser.process(&buf[..n]);
+        match nix::unistd::read(fd, buf) {
+            Ok(n) => {
+                if n > 0 {
+                    self.parser.process(&buf[..n]);
+                }
+                Ok(n)
+            }
+            Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(e) => Err(io::Error::other(e)),
         }
-        Ok(n)
     }
 
     /// Write input data to pty (forward user keystrokes).

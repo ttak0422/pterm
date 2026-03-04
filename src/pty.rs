@@ -22,6 +22,13 @@ impl Pty {
         // Set initial window size
         set_winsize(master.as_raw_fd(), cols, rows)?;
 
+        // Set master fd to non-blocking so the daemon can drain all available
+        // data in a loop without blocking on the last read.
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
         // Fork
         match unsafe { fork() }.map_err(io::Error::other)? {
             ForkResult::Parent { child } => {
