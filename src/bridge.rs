@@ -160,12 +160,8 @@ pub fn run(
     // CLI-supplied values take priority, then TIOCGWINSZ, then 80×24.
     let (cols, rows) = {
         let winsize = get_winsize(stdout_fd).ok();
-        let c = initial_cols
-            .or(winsize.map(|(c, _)| c))
-            .unwrap_or(80);
-        let r = initial_rows
-            .or(winsize.map(|(_, r)| r))
-            .unwrap_or(24);
+        let c = initial_cols.or(winsize.map(|(c, _)| c)).unwrap_or(80);
+        let r = initial_rows.or(winsize.map(|(_, r)| r)).unwrap_or(24);
         (c, r)
     };
     {
