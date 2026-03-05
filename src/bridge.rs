@@ -160,12 +160,8 @@ pub fn run(
     // CLI-supplied values take priority, then TIOCGWINSZ, then 80×24.
     let (cols, rows) = {
         let winsize = get_winsize(stdout_fd).ok();
-        let c = initial_cols
-            .or(winsize.map(|(c, _)| c))
-            .unwrap_or(80);
-        let r = initial_rows
-            .or(winsize.map(|(_, r)| r))
-            .unwrap_or(24);
+        let c = initial_cols.or(winsize.map(|(c, _)| c)).unwrap_or(80);
+        let r = initial_rows.or(winsize.map(|(_, r)| r)).unwrap_or(24);
         (c, r)
     };
     {
@@ -237,8 +233,10 @@ pub fn run(
                         }
                     }
 
-                    // Process complete frames
+                    // Process complete frames, batching output payloads into
+                    // a single write to avoid incremental rendering.
                     let mut offset = 0;
+                    let mut output_batch: Vec<u8> = Vec::new();
                     while offset + proto::HEADER_SIZE <= recv_buf.len() {
                         let header: [u8; proto::HEADER_SIZE] = recv_buf
                             [offset..offset + proto::HEADER_SIZE]
@@ -257,19 +255,26 @@ pub fn run(
 
                         match msg_type {
                             proto::server::OUTPUT | proto::server::SCROLLBACK => {
-                                // Write raw bytes to stdout for libvterm
-                                if write_all_raw(stdout_fd, payload).is_err() {
-                                    break 'main;
-                                }
+                                output_batch.extend_from_slice(payload);
                             }
                             proto::server::EXIT => {
                                 if payload.len() >= 4 {
                                     exit_code =
                                         i32::from_le_bytes(payload[..4].try_into().unwrap());
                                 }
+                                // Flush any batched output before exiting
+                                if !output_batch.is_empty() {
+                                    let _ = write_all_raw(stdout_fd, &output_batch);
+                                }
                                 break 'main;
                             }
                             _ => {}
+                        }
+                    }
+
+                    if !output_batch.is_empty() {
+                        if write_all_raw(stdout_fd, &output_batch).is_err() {
+                            break 'main;
                         }
                     }
 

@@ -372,7 +372,11 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
     let sock = session_socket_path(name);
     if !sock.exists() {
         cmd_new(args)?;
-        let ok = wait_for_socket(&sock, Duration::from_millis(3000), Duration::from_millis(50))?;
+        let ok = wait_for_socket(
+            &sock,
+            Duration::from_millis(3000),
+            Duration::from_millis(50),
+        )?;
         if !ok {
             eprintln!(
                 "Error: session '{}' was created but socket did not appear in time",
