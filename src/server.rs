@@ -6,24 +6,11 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
-
-/// Per-connection timeout before we send the initial snapshot.
-/// This gives the client time to send a RESIZE with its actual window size
-/// so the snapshot is generated at the correct dimensions.
-const SNAPSHOT_DEFER_MS: u64 = 500;
-
-/// Micro-batching constants for PTY output coalescing.
-/// After a read, wait this long before flushing to coalesce nearby writes.
-const BATCH_DELAY_MS: u64 = 1;
-/// Maximum time from the first read in a burst before we force a flush.
-const BATCH_MAX_MS: u64 = 3;
-/// If the pending buffer reaches this size, flush immediately.
-const BATCH_FLUSH_SIZE: usize = 4096;
 
 struct Client {
     stream: UnixStream,
@@ -31,8 +18,6 @@ struct Client {
     send_buf: Vec<u8>,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
-    /// Deadline after which we send the snapshot even without a RESIZE.
-    pending_snapshot_deadline: Option<Instant>,
 }
 
 pub struct Server {
@@ -44,10 +29,6 @@ pub struct Server {
     next_client_id: usize,
     /// Accumulated PTY output waiting to be flushed.
     pending_pty_output: Vec<u8>,
-    /// When the first byte of the current batch arrived.
-    batch_start: Option<Instant>,
-    /// Deadline by which the current batch must be flushed.
-    batch_deadline: Option<Instant>,
     /// `true` after the EXIT message has been broadcast to clients.
     exit_sent: bool,
 }
@@ -90,8 +71,6 @@ impl Server {
             clients: HashMap::new(),
             next_client_id: 0,
             pending_pty_output: Vec::new(),
-            batch_start: None,
-            batch_deadline: None,
             exit_sent: false,
         })
     }
@@ -122,23 +101,8 @@ impl Server {
                 }
             }
 
-            // Dynamic poll timeout: use the nearest deadline among the
-            // default 100ms, any pending snapshot deadline, and the batch
-            // flush deadline.
-            let mut poll_timeout = Duration::from_millis(100);
-            if let Some(bd) = self.batch_deadline {
-                let remaining = bd.saturating_duration_since(Instant::now());
-                poll_timeout = poll_timeout.min(remaining);
-            }
-            // Also consider snapshot deadlines.
-            for c in self.clients.values() {
-                if let Some(sd) = c.pending_snapshot_deadline {
-                    let remaining = sd.saturating_duration_since(Instant::now());
-                    poll_timeout = poll_timeout.min(remaining);
-                }
-            }
-
-            self.poll.poll(&mut events, Some(poll_timeout))?;
+            self.poll
+                .poll(&mut events, Some(Duration::from_millis(100)))?;
 
             for event in events.iter() {
                 match event.token() {
@@ -167,40 +131,10 @@ impl Server {
                 }
             }
 
-            // Flush pending PTY output if the batch deadline has expired.
-            if let Some(bd) = self.batch_deadline {
-                if Instant::now() >= bd {
-                    self.flush_pty_output();
-                }
-            }
-
-            // Send deferred snapshots for clients whose deadline has expired
-            // without receiving a RESIZE (backwards compatibility with plain
-            // `pterm attach` from a raw terminal).
-            let now = Instant::now();
-            let pending_ids: Vec<usize> = self
-                .clients
-                .iter()
-                .filter_map(|(&id, c)| {
-                    if c.pending_snapshot {
-                        if let Some(deadline) = c.pending_snapshot_deadline {
-                            if now >= deadline {
-                                return Some(id);
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-            if !pending_ids.is_empty() {
-                // Flush any pending PTY output before sending snapshots so
-                // the vt state is up-to-date.
-                self.flush_pty_output();
-                for id in pending_ids {
-                    log::info!("Client {} snapshot deadline expired, sending snapshot", id);
-                    self.send_snapshot_to_client(id);
-                }
-            }
+            // No timer-based snapshot deferral. Snapshots are sent either:
+            // 1. When the client sends RESIZE (handled in process_client_recv_buf)
+            // 2. When PTY OUTPUT arrives for a client still awaiting snapshot
+            //    (handled in flush_pty_output)
 
             if !self.exit_sent {
                 if let Some(exit_code) = self.session.check_exit() {
@@ -245,9 +179,6 @@ impl Server {
 
                     log::info!("Client {} connected to '{}'", id, self.session.name);
 
-                    let deadline =
-                        Instant::now() + std::time::Duration::from_millis(SNAPSHOT_DEFER_MS);
-
                     self.clients.insert(
                         id,
                         Client {
@@ -255,7 +186,6 @@ impl Server {
                             recv_buf: Vec::new(),
                             send_buf: Vec::new(),
                             pending_snapshot: true,
-                            pending_snapshot_deadline: Some(deadline),
                         },
                     );
                 }
@@ -272,7 +202,6 @@ impl Server {
         let snapshot = self.session.snapshot();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
-            client.pending_snapshot_deadline = None;
             if !snapshot.is_empty() {
                 let msg = proto::encode(proto::server::SCROLLBACK, &snapshot);
                 client.send_buf.extend_from_slice(&msg);
@@ -288,19 +217,14 @@ impl Server {
     }
 
     fn handle_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        // Drain all available PTY data into the pending batch buffer.
-        let mut read_any = false;
+        // Drain all available PTY data (non-blocking) and flush immediately.
+        // No timer-based batching — the drain loop itself coalesces all bytes
+        // that are available at this instant.
         loop {
             match self.session.read_pty(buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    read_any = true;
                     self.pending_pty_output.extend_from_slice(&buf[..n]);
-
-                    // Enforce a hard size cap during draining.
-                    if self.pending_pty_output.len() >= BATCH_FLUSH_SIZE {
-                        self.flush_pty_output();
-                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -312,42 +236,42 @@ impl Server {
             }
         }
 
-        if self.pending_pty_output.is_empty() {
-            return Ok(());
-        }
-
-        // Update deadline only when this call actually read new bytes.
-        if read_any {
-            let now = Instant::now();
-            let batch_start = *self.batch_start.get_or_insert(now);
-            let max_deadline = batch_start + Duration::from_millis(BATCH_MAX_MS);
-            let delay_deadline = now + Duration::from_millis(BATCH_DELAY_MS);
-            self.batch_deadline = Some(delay_deadline.min(max_deadline));
+        if !self.pending_pty_output.is_empty() {
+            self.flush_pty_output();
         }
 
         Ok(())
     }
 
-    /// Flush accumulated PTY output to all connected clients and reset batch state.
+    /// Flush accumulated PTY output to all connected clients.
+    /// Clients still awaiting a snapshot receive the snapshot first (triggered
+    /// by the arrival of OUTPUT rather than a timer).
     fn flush_pty_output(&mut self) {
         if self.pending_pty_output.is_empty() {
             return;
         }
 
+        // Clients awaiting snapshot: the arrival of OUTPUT means the VT state
+        // is populated, so send their snapshot now (no timer needed).
+        let snapshot_ids: Vec<usize> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| if c.pending_snapshot { Some(id) } else { None })
+            .collect();
+        for id in snapshot_ids {
+            log::info!(
+                "Client {} snapshot triggered by PTY output arrival",
+                id
+            );
+            self.send_snapshot_to_client(id);
+        }
+
         let msg = proto::encode(proto::server::OUTPUT, &self.pending_pty_output);
         self.pending_pty_output.clear();
-        self.batch_start = None;
-        self.batch_deadline = None;
 
         let mut disconnected = Vec::new();
         let mut flush_ids = Vec::new();
         for (&id, client) in self.clients.iter_mut() {
-            // A newly attached client must receive a coherent snapshot first.
-            // Sending live OUTPUT before that can interleave mid-sequence bytes
-            // with snapshot replay and corrupt rendering.
-            if client.pending_snapshot {
-                continue;
-            }
             client.send_buf.extend_from_slice(&msg);
             flush_ids.push(id);
         }

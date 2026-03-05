@@ -78,12 +78,8 @@ Notable behavior:
 - session socket path: `<socket_root>/<session>/socket`
 - if socket file is removed externally, daemon treats session as deleted and exits
 - output delivery uses per-client send queues and writable polling to avoid disconnecting on backpressure (`WouldBlock`)
-- **deferred snapshot**: on connect, waits up to 500ms for the client to send RESIZE before generating the initial snapshot, ensuring correct terminal dimensions
-- **micro-batching**: PTY output is coalesced using bounded micro-batching (similar to tmux) to prevent prompt fragmentation on fast machines:
-  - after a read, holds output for up to 1ms (`BATCH_DELAY_MS`) to coalesce nearby shell writes
-  - maximum burst hold time is 3ms (`BATCH_MAX_MS`)
-  - flushes immediately when the pending buffer reaches 4096 bytes (`BATCH_FLUSH_SIZE`)
-  - poll timeout is dynamically computed as `min(100ms, batch_deadline, snapshot_deadlines)`
+- **snapshot delivery**: no timer-based deferral; snapshot is sent either when the client sends RESIZE (correct dimensions) or when the first PTY OUTPUT arrives (current dimensions as fallback)
+- **drain-and-flush**: PTY output uses non-blocking drain (reads until `WouldBlock`) followed by immediate flush — no timer-based micro-batching, minimizing latency while naturally coalescing bytes available at each poll cycle
 - EXIT message is queued into `send_buf` (not written directly) to preserve OUTPUT→EXIT ordering under backpressure, and is sent exactly once via an `exit_sent` guard
 
 ### Bridge (`src/bridge.rs`)
