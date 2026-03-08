@@ -102,6 +102,21 @@ require("pterm").setup({
 })
 ```
 
+## Telescope Extension
+
+pterm provides an optional [Telescope](https://github.com/nvim-telescope/telescope.nvim) extension for fuzzy-finding sessions.
+
+```lua
+-- Call after telescope.setup()
+require("telescope").load_extension("pterm")
+```
+
+```vim
+:Telescope pterm sessions
+```
+
+Connected sessions are shown with a `[connected]` prefix.
+
 ## License
 
 MIT
