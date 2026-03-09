@@ -78,7 +78,7 @@ Notable behavior:
 - session socket path: `<socket_root>/<session>/socket`
 - if socket file is removed externally, daemon treats session as deleted and exits
 - output delivery uses per-client send queues and writable polling to avoid disconnecting on backpressure (`WouldBlock`)
-- **snapshot delivery**: no timer-based deferral; snapshot is sent either when the client sends RESIZE (correct dimensions) or when the first PTY OUTPUT arrives (current dimensions as fallback)
+- **snapshot delivery**: no timer-based deferral; snapshot is sent either when the client sends RESIZE (correct dimensions) or when the first PTY OUTPUT arrives (current dimensions as fallback). Clients that receive a snapshot are excluded from the same flush cycle's OUTPUT broadcast to prevent duplicate rendering (the snapshot already reflects the effect of those bytes)
 - **drain-and-flush**: PTY output uses non-blocking drain (reads until `WouldBlock`) followed by immediate flush — no timer-based micro-batching, minimizing latency while naturally coalescing bytes available at each poll cycle
 - EXIT message is queued into `send_buf` (not written directly) to preserve OUTPUT→EXIT ordering under backpressure, and is sent exactly once via an `exit_sent` guard
 

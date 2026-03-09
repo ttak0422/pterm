@@ -174,17 +174,17 @@ function M.open(session_name, args)
 			end
 		end
 
-		local win_cols = vim.api.nvim_win_get_width(0)
-		local win_rows = vim.api.nvim_win_get_height(0)
-
+		-- Do NOT pass --cols/--rows to `pterm new` here.  The bridge
+		-- (started by M.attach) will send an accurate RESIZE based on
+		-- the actual PTY size after terminal-friendly window options
+		-- (number=false, signcolumn=no, …) have been applied.  Passing
+		-- dimensions at this point would use the pre-option window size,
+		-- which may differ and trigger an unnecessary resize + snapshot
+		-- race on the daemon side.
 		local create_cmd = {
 			bin,
 			"new",
 			session_name,
-			"--cols",
-			tostring(win_cols),
-			"--rows",
-			tostring(win_rows),
 		}
 
 		if #cmd_parts > 0 then
@@ -249,15 +249,13 @@ function M.attach(session_name)
 	vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
 	vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
 
-	-- Pass the current window size so the bridge sends an accurate initial
-	-- RESIZE before the daemon generates the snapshot.
-	local win_cols = vim.api.nvim_win_get_width(win)
-	local win_rows = vim.api.nvim_win_get_height(win)
-
+	-- Let the bridge read the actual PTY size via TIOCGWINSZ instead of
+	-- passing --cols/--rows from Lua.  jobstart({term=true}) creates a PTY
+	-- sized to the current window, and the bridge's get_winsize(stdout)
+	-- will return exactly that size.  This avoids any mismatch between the
+	-- Lua-reported dimensions and the real PTY geometry.
 	local job_id = vim.fn.jobstart({
 		bin, "attach", session_name,
-		"--cols", tostring(win_cols),
-		"--rows", tostring(win_rows),
 	}, {
 		term = true,
 		on_exit = function(_, exit_code, _)

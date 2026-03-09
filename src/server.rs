@@ -253,17 +253,22 @@ impl Server {
 
         // Clients awaiting snapshot: the arrival of OUTPUT means the VT state
         // is populated, so send their snapshot now (no timer needed).
+        // These clients must NOT also receive the raw OUTPUT bytes below,
+        // because the snapshot already reflects the effect of those bytes
+        // (read_pty feeds data to the VT parser before this method runs).
+        // Sending both would cause Neovim's libvterm to process the same
+        // content twice, resulting in duplicated rendering.
         let snapshot_ids: Vec<usize> = self
             .clients
             .iter()
             .filter_map(|(&id, c)| if c.pending_snapshot { Some(id) } else { None })
             .collect();
-        for id in snapshot_ids {
+        for id in &snapshot_ids {
             log::info!(
                 "Client {} snapshot triggered by PTY output arrival",
-                id
+                *id
             );
-            self.send_snapshot_to_client(id);
+            self.send_snapshot_to_client(*id);
         }
 
         let msg = proto::encode(proto::server::OUTPUT, &self.pending_pty_output);
@@ -272,6 +277,11 @@ impl Server {
         let mut disconnected = Vec::new();
         let mut flush_ids = Vec::new();
         for (&id, client) in self.clients.iter_mut() {
+            // Skip clients that just received a snapshot — they already have
+            // the up-to-date screen state and must not get the raw bytes again.
+            if snapshot_ids.contains(&id) {
+                continue;
+            }
             client.send_buf.extend_from_slice(&msg);
             flush_ids.push(id);
         }
