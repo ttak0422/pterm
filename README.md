@@ -90,7 +90,8 @@ require("pterm").setup({
   binary = nil,
   -- Default shell command
   shell = vim.env.SHELL or "/bin/sh",
-  -- Fallback terminal size (Neovim window size takes priority)
+  -- Default terminal size for `pterm new` when created outside Neovim
+  -- (the bridge reads the actual PTY size via TIOCGWINSZ at attach time)
   cols = 80,
   rows = 24,
   -- Socket directory (nil = let daemon decide)
