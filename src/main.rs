@@ -62,7 +62,7 @@ Environment:
     );
 }
 
-fn cmd_new(args: &[String]) -> io::Result<()> {
+fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     let mut session_name = String::new();
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
@@ -131,15 +131,19 @@ fn cmd_new(args: &[String]) -> io::Result<()> {
     // Daemonize: fork into background
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { child }) => {
-            // Parent: print info and exit
-            println!(
-                "{}",
-                serde_json::json!({
-                    "session": session_name,
-                    "pid": child.as_raw(),
-                    "socket": sock_path.to_string_lossy(),
-                })
-            );
+            // Parent: print info and return.
+            // Suppress output when called from cmd_open to avoid JSON
+            // leaking into the Neovim terminal buffer.
+            if !quiet {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "session": session_name,
+                        "pid": child.as_raw(),
+                        "socket": sock_path.to_string_lossy(),
+                    })
+                );
+            }
             return Ok(());
         }
         Ok(nix::unistd::ForkResult::Child) => {
@@ -371,7 +375,7 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
 
     let sock = session_socket_path(name);
     if !sock.exists() {
-        cmd_new(args)?;
+        cmd_new(args, true)?;
         let ok = wait_for_socket(
             &sock,
             Duration::from_millis(3000),
@@ -428,7 +432,7 @@ fn main() {
     }
 
     let result = match args[1].as_str() {
-        "new" => cmd_new(&args[2..]),
+        "new" => cmd_new(&args[2..], false),
         "attach" => cmd_attach(&args[2..]),
         "open" => cmd_open(&args[2..]),
         "list" | "ls" => cmd_list(&args[2..]),
