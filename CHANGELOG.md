@@ -2,7 +2,136 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2026-02-23
+## [0.2.1] - 2026-03-10
+
+### Bug Fixes
+
+- Prevent duplicate rendering when attaching via :Pterm user command
+When a client with pending_snapshot=true received a snapshot triggered
+  by PTY output arrival, the same flush cycle also broadcast the raw
+  OUTPUT bytes to that client.  Since the snapshot already reflects the
+  effect of those bytes (read_pty feeds data to the VT parser before
+  flush), Neovim's libvterm processed the same content twice, causing
+  garbled/duplicated rendering (e.g. "e" → "ee" → "eechooo").
+
+  This was not observed with toggleterm because `pterm open` connects
+  the bridge in the same process immediately after daemon creation,
+  before significant PTY output is produced.  The :Pterm user command
+  creates the daemon separately (`pterm new` via vim.fn.system), so by
+  the time the bridge attaches the shell prompt is already in the VT
+  state, making the race between snapshot and OUTPUT much more likely.
+- Use pterm open to eliminate snapshot timing gap in :Pterm command
+When :Pterm created a session via the two-step flow (vim.fn.system for
+  `pterm new` → wait_for_socket → jobstart for `pterm attach`), the shell
+  had time to produce PTY output during the gap. On bridge connection,
+  server.rs flush_pty_output() triggered snapshot delivery at the old
+  80×24 size BEFORE the client's RESIZE was processed, leaving libvterm
+  with wrong scroll regions and causing progressive display corruption.
+
+  CLI `pterm open` was unaffected because it handles creation and bridge
+  attachment in a single process with minimal delay.
+
+### Miscellaneous Tasks
+
+- Update CHANGELOG.md on release
+Add post-release steps to regenerate CHANGELOG.md using git-cliff
+  and commit it back to the default branch.
+## [0.2.0] - 2026-03-08
+
+### Features
+
+- *(server)* Handle redraw request
+- *(cli)* Add redraw command
+- *(nvim)* Add PtermRedraw command
+- Add Telescope extension for pterm sessions
+Add lua/telescope/_extensions/pterm.lua providing a Telescope picker
+  (:Telescope pterm sessions) to fuzzy-search and jump to pterm sessions.
+  Connected sessions are visually marked as [connected]. Selecting a stale
+  session shows an error notification without crashing. Also auto-loads
+  the extension from M.setup() when Telescope is available.
+
+### Bug Fixes
+
+- *(server)* Improve error handling and flush after redraw broadcast
+Gracefully handle client I/O errors in the event loop instead of
+  propagating them, and ensure all clients are flushed after a redraw
+  broadcast so the snapshot is delivered immediately.
+- *(vim)* Stabilize pterm session completion
+- *(server)* Coalesce PTY output into single message per poll cycle
+Set the PTY master fd to non-blocking after openpty() and add a drain
+  loop in handle_pty_output that reads all available data before sending
+  a single OUTPUT message to clients. This prevents fragmented prompt
+  rendering (e.g. "~/path ma" → "~/path mai" → "~/path main") caused
+  by forwarding each small PTY read as a separate protocol message.
+
+  - pty.rs: set O_NONBLOCK on master fd
+  - session.rs: map EAGAIN/EWOULDBLOCK to io::ErrorKind::WouldBlock
+  - server.rs: drain loop aggregates all reads into one OUTPUT message
+- *(bridge)* Batch OUTPUT writes per poll cycle
+Collect all OUTPUT/SCROLLBACK payloads from protocol frames into a
+  single buffer and write once to stdout, instead of writing each frame
+  individually. This further reduces rendering fragmentation on the
+  client side.
+- *(server)* Add bounded micro-batching for PTY output coalescing
+Introduce tmux-style micro-batching to prevent prompt fragmentation on
+  fast machines where poll→read outruns shell writes. Small PTY outputs
+  are held up to 1ms (max 3ms burst) before flushing, while large outputs
+  (≥4096 bytes) flush immediately.
+
+  Also fixes:
+  - EXIT message ordering: queue into send_buf instead of direct write_all
+    to preserve OUTPUT→EXIT ordering under backpressure
+  - Prevent duplicate EXIT broadcast via exit_sent flag
+  - Enforce size bound during drain loop (mid-loop flush)
+  - Gate deadline refresh on actual new reads
+- *(server)* Avoid OUTPUT before initial snapshot
+- *(server)* Replace timer-based batching with drain-and-flush
+Remove BATCH_DELAY_MS/BATCH_MAX_MS/BATCH_FLUSH_SIZE micro-batching and
+  SNAPSHOT_DEFER_MS (500ms) timer. These caused noticeable UX latency.
+
+  New approach:
+  - Drain PTY non-blocking until WouldBlock, then flush immediately
+  - Snapshot sent on RESIZE or on first PTY OUTPUT (no timer deferral)
+  - Bridge-side per-poll-cycle batching retained (zero-delay)
+
+### Refactor
+
+- Remove auto load_extension from setup
+Follow the standard Telescope extension convention where users
+  explicitly call require("telescope").load_extension("pterm") instead
+  of auto-loading during setup. This aligns with how all major Telescope
+  extensions (fzf-native, file-browser, frecency, undo, ui-select) work
+  and better supports lazy-loading scenarios.
+
+### Documentation
+
+- Rewrite README for Nix users and move detailed config to docs/
+- Replace lazy.nvim install section with Nix flake-based instructions
+  - Remove verbose sections (Build, How It Works, Session Lifecycle, etc.)
+  - Add default configuration example under setup()
+  - Move environment variables and socket location to docs/configuration.md
+- Update DESIGN.md and proto comments to reflect vt100 state tracking
+- Replace "raw byte scrollback ring" with vt100 parser-based terminal
+    state tracking in DESIGN.md architecture diagram and daemon section
+  - Update SCROLLBACK message description to reflect state_formatted snapshots
+  - Remove incorrect proto comment about omitting length field for empty payloads
+  - Add trailing newlines to DESIGN.md and proto/src/lib.rs
+- Update README to reflect current implementation
+Document CLI options (--cols, --rows, -- <command>), hierarchical
+  session names, list prefix filter, default session name, exported
+  Lua API functions, and clarify cols/rows as fallback values.
+- Update DESIGN.md with output coalescing and batching details
+- Add Telescope extension section to README
+
+### Styling
+
+- Format bridge and main
+
+### Miscellaneous Tasks
+
+- Add release workflow for tag-triggered changelog generation
+- *(docs)* Rename configuration.md to CONFIGURATION.md
+## [0.1.0] - 2026-02-26
 
 ### Features
 
@@ -40,4 +169,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Add nix build workflow with major-pinned actions
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
+- Add git-cliff config and generate v0.1.0 changelog
+[0.2.1]: https://github.com/ttak0422/pterm/compare/v0.2.0..v0.2.1
+[0.2.0]: https://github.com/ttak0422/pterm/compare/v0.1.0..v0.2.0
 
