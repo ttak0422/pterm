@@ -11,10 +11,6 @@ M.config = {
 	rows = 24,
 	-- Socket directory (nil = let daemon decide)
 	socket_dir = nil,
-	-- Max wait time for daemon socket creation after `pterm new`
-	attach_wait_ms = 3000,
-	-- Poll interval while waiting for socket
-	attach_poll_ms = 50,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
@@ -73,13 +69,6 @@ local function socket_path(session_name)
 	return socket_dir() .. "/" .. session_name .. "/socket"
 end
 
-local function wait_for_socket(session_name, timeout_ms, poll_ms)
-	local sock = socket_path(session_name)
-	return vim.wait(timeout_ms, function()
-		return vim.uv.fs_stat(sock) ~= nil
-	end, poll_ms)
-end
-
 --- Recursively scan the socket directory for active sessions (pure Lua).
 --- Mirrors the Rust `find_sessions()` logic without spawning a subprocess,
 --- which avoids instability when called during command-line completion.
@@ -133,101 +122,9 @@ function M.kill(session_name)
 	vim.notify("Killed session: " .. session_name, vim.log.levels.INFO)
 end
 
---- Open or attach to a session.
---- If session exists, attach. Otherwise create new.
-function M.open(session_name, args)
-	args = args or {}
-
-	-- Default session name
-	if not session_name or session_name == "" then
-		session_name = "main"
-	end
-
-	-- Already connected?
-	if M.connections[session_name] then
-		-- Switch to existing buffer
-		local conn = M.connections[session_name]
-		if vim.api.nvim_buf_is_valid(conn.buf) then
-			vim.api.nvim_set_current_buf(conn.buf)
-			vim.cmd("startinsert")
-			return
-		else
-			-- Buffer was closed, clean up
-			M.connections[session_name] = nil
-		end
-	end
-
-	local sock = socket_path(session_name)
-	local bin = find_binary()
-
-	-- Check if session exists
-	if vim.uv.fs_stat(sock) == nil then
-		-- Create new session
-		local cmd_parts = {}
-		-- Skip session name from args, collect rest as command
-		local found_name = false
-		for _, arg in ipairs(args) do
-			if not found_name and arg == session_name then
-				found_name = true
-			elseif found_name then
-				table.insert(cmd_parts, arg)
-			end
-		end
-
-		-- Do NOT pass --cols/--rows to `pterm new` here.  The bridge
-		-- (started by M.attach) will send an accurate RESIZE based on
-		-- the actual PTY size after terminal-friendly window options
-		-- (number=false, signcolumn=no, …) have been applied.  Passing
-		-- dimensions at this point would use the pre-option window size,
-		-- which may differ and trigger an unnecessary resize + snapshot
-		-- race on the daemon side.
-		local create_cmd = {
-			bin,
-			"new",
-			session_name,
-		}
-
-		if #cmd_parts > 0 then
-			table.insert(create_cmd, "--")
-			for _, part in ipairs(cmd_parts) do
-				table.insert(create_cmd, part)
-			end
-		end
-
-		vim.fn.system(create_cmd)
-		if vim.v.shell_error ~= 0 then
-			vim.notify(
-				"Failed to create session '" .. session_name .. "' (pterm new exited " .. vim.v.shell_error .. ")",
-				vim.log.levels.ERROR
-			)
-			return
-		end
-
-		-- Wait for daemon socket before attach to avoid new->attach race.
-		local ok = wait_for_socket(session_name, M.config.attach_wait_ms, M.config.attach_poll_ms)
-		if not ok then
-			vim.notify(
-				"Session '" .. session_name .. "' was created but socket did not appear in time",
-				vim.log.levels.ERROR
-			)
-			return
-		end
-	end
-
-	-- Attach to session
-	M.attach(session_name)
-end
-
---- Attach to an existing session.
-function M.attach(session_name)
-	local sock = socket_path(session_name)
-	local bin = find_binary()
-
-	if vim.uv.fs_stat(sock) == nil then
-		vim.notify("Session '" .. session_name .. "' not found", vim.log.levels.ERROR)
-		return
-	end
-
+--- Internal: create a terminal buffer and start a pterm bridge process.
+--- `cmd` is the full argv for jobstart (e.g. {"pterm","open","main"}).
+local function start_terminal(session_name, cmd)
 	-- Clean up any stale buffer with the same name from a previous connection
 	local buf_name = "pterm://" .. session_name
 	local existing = vim.fn.bufnr(buf_name)
@@ -252,11 +149,9 @@ function M.attach(session_name)
 	-- Let the bridge read the actual PTY size via TIOCGWINSZ instead of
 	-- passing --cols/--rows from Lua.  jobstart({term=true}) creates a PTY
 	-- sized to the current window, and the bridge's get_winsize(stdout)
-	-- will return exactly that size.  This avoids any mismatch between the
-	-- Lua-reported dimensions and the real PTY geometry.
-	local job_id = vim.fn.jobstart({
-		bin, "attach", session_name,
-	}, {
+	-- will return exactly that size.
+	local job_id
+	job_id = vim.fn.jobstart(cmd, {
 		term = true,
 		on_exit = function(_, exit_code, _)
 			vim.schedule(function()
@@ -270,7 +165,7 @@ function M.attach(session_name)
 	})
 
 	if job_id <= 0 then
-		vim.notify("Failed to start pterm attach for '" .. session_name .. "'", vim.log.levels.ERROR)
+		vim.notify("Failed to start pterm for '" .. session_name .. "'", vim.log.levels.ERROR)
 		if vim.api.nvim_buf_is_valid(buf) then
 			pcall(vim.api.nvim_buf_delete, buf, { force = true })
 		end
@@ -342,6 +237,71 @@ function M.attach(session_name)
 	end
 
 	vim.cmd("startinsert")
+end
+
+--- Open or attach to a session.
+--- If session exists, attach. Otherwise create new.
+--- Uses `pterm open` which handles both creation and attachment in a single
+--- process, eliminating the timing gap between daemon creation and bridge
+--- connection that caused wrong-size snapshot delivery.
+function M.open(session_name, args)
+	args = args or {}
+
+	-- Default session name
+	if not session_name or session_name == "" then
+		session_name = "main"
+	end
+
+	-- Already connected?
+	if M.connections[session_name] then
+		-- Switch to existing buffer
+		local conn = M.connections[session_name]
+		if vim.api.nvim_buf_is_valid(conn.buf) then
+			vim.api.nvim_set_current_buf(conn.buf)
+			vim.cmd("startinsert")
+			return
+		else
+			-- Buffer was closed, clean up
+			M.connections[session_name] = nil
+		end
+	end
+
+	local bin = find_binary()
+
+	-- Build `pterm open` command with optional child command arguments.
+	local cmd = { bin, "open", session_name }
+
+	local cmd_parts = {}
+	local found_name = false
+	for _, arg in ipairs(args) do
+		if not found_name and arg == session_name then
+			found_name = true
+		elseif found_name then
+			table.insert(cmd_parts, arg)
+		end
+	end
+
+	if #cmd_parts > 0 then
+		table.insert(cmd, "--")
+		for _, part in ipairs(cmd_parts) do
+			table.insert(cmd, part)
+		end
+	end
+
+	start_terminal(session_name, cmd)
+end
+
+--- Attach to an existing session.
+function M.attach(session_name)
+	local sock = socket_path(session_name)
+
+	if vim.uv.fs_stat(sock) == nil then
+		vim.notify("Session '" .. session_name .. "' not found", vim.log.levels.ERROR)
+		return
+	end
+
+	local bin = find_binary()
+	start_terminal(session_name, { bin, "attach", session_name })
 end
 
 --- Detach from a session (does not kill the daemon).
