@@ -184,12 +184,21 @@ local function start_terminal(session_name, cmd)
 	local augroup_name = "pterm_" .. session_name:gsub("/", "_")
 	local augroup = vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
-	-- Clean up on buffer delete
+	-- Clean up on buffer delete.
+	-- BufDelete fires both when a buffer is truly deleted (:bdelete/:bwipeout)
+	-- and when a plugin merely sets buflisted=false (e.g. scope-nvim scopes
+	-- buffers per tab page).  Defer the check so we can distinguish the two:
+	-- a merely-unlisted buffer remains valid and loaded.
 	vim.api.nvim_create_autocmd("BufDelete", {
 		group = augroup,
 		buffer = buf,
 		callback = function()
-			M.detach(session_name)
+			vim.schedule(function()
+				if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
+					return
+				end
+				M.detach(session_name)
+			end)
 		end,
 	})
 
