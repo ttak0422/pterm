@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-03-11
+
+### Bug Fixes
+
+- Defer BufDelete handler to ignore buflisted changes from scope-nvim
+scope-nvim scopes buffers per tab page by toggling buflisted on
+  TabLeave/TabEnter. Setting buflisted=false fires BufDelete, which
+  pterm's handler interpreted as a true buffer deletion—calling
+  M.detach(), killing the bridge (SIGHUP/129), and wiping the buffer.
+
+  Defer the BufDelete callback with vim.schedule and check whether the
+  buffer is still valid and loaded. A merely-unlisted buffer survives
+  the check and the connection is preserved; a truly deleted buffer
+  triggers detach as before.
 ## [0.2.1] - 2026-03-10
 
 ### Bug Fixes
@@ -170,6 +184,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[0.2.2]: https://github.com/ttak0422/pterm/compare/v0.2.1..v0.2.2
 [0.2.1]: https://github.com/ttak0422/pterm/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/ttak0422/pterm/compare/v0.1.0..v0.2.0
 
