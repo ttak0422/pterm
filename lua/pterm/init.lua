@@ -138,6 +138,11 @@ local function start_terminal(session_name, cmd)
 	local buf = vim.api.nvim_create_buf(true, false)
 	vim.api.nvim_set_current_buf(buf)
 
+	-- Prevent the buffer from being unloaded or wiped when it leaves a window
+	-- (e.g. during :tabnew).  Without this, 'bufhidden' defaults to "" which
+	-- follows the global 'hidden' option and may unload the buffer.
+	vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
+
 	-- Set window-local options appropriate for a terminal buffer.
 	local win = vim.api.nvim_get_current_win()
 	vim.api.nvim_set_option_value("number", false, { win = win })
@@ -211,6 +216,38 @@ local function start_terminal(session_name, cmd)
 					break -- one jobresize is enough; the bridge sends RESIZE to daemon
 				end
 			end
+		end,
+	})
+
+	-- Re-apply window-local options and refresh terminal content when the
+	-- buffer re-enters a window (e.g. after :tabnew → :tabprev).
+	-- Skip the very first BufWinEnter (the initial open) to avoid a
+	-- redundant redraw while the first snapshot is still in flight.
+	local first_buf_win_enter = true
+	vim.api.nvim_create_autocmd("BufWinEnter", {
+		group = augroup,
+		buffer = buf,
+		callback = function()
+			if first_buf_win_enter then
+				first_buf_win_enter = false
+				return
+			end
+			local conn = M.connections[session_name]
+			if not conn or not conn.job_id then
+				return
+			end
+			local w = vim.api.nvim_get_current_win()
+			vim.api.nvim_set_option_value("number", false, { win = w })
+			vim.api.nvim_set_option_value("relativenumber", false, { win = w })
+			vim.api.nvim_set_option_value("signcolumn", "no", { win = w })
+			vim.api.nvim_set_option_value("foldcolumn", "0", { win = w })
+			vim.api.nvim_set_option_value("statuscolumn", "", { win = w })
+			-- Sync terminal dimensions and request a full redraw from the
+			-- daemon so the display is restored after a tab switch.
+			local cols = vim.api.nvim_win_get_width(w)
+			local rows = vim.api.nvim_win_get_height(w)
+			pcall(vim.fn.jobresize, conn.job_id, cols, rows)
+			M.redraw(session_name)
 		end,
 	})
 
