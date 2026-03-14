@@ -15,6 +15,10 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+fn esc_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == 0x1b).count()
+}
+
 const TOKEN_STDIN: Token = Token(0);
 const TOKEN_SOCKET: Token = Token(1);
 const TOKEN_WAKE: Token = Token(2);
@@ -103,6 +107,10 @@ fn write_all_raw(fd: RawFd, data: &[u8]) -> io::Result<()> {
 /// `initial_cols` / `initial_rows` override the terminal size sent in the
 /// initial RESIZE message.  When `None`, the size is read from `TIOCGWINSZ`
 /// (stdout) with a final fallback to 80×24.
+///
+/// When the `PTERM_DEBUG_OUTPUT` environment variable is set to a file path,
+/// all bytes written to stdout (i.e. Neovim's terminal) are also appended to
+/// that file for offline analysis.
 pub fn run(
     socket_path: &Path,
     initial_cols: Option<u16>,
@@ -110,6 +118,28 @@ pub fn run(
 ) -> io::Result<i32> {
     let stdin_fd = libc::STDIN_FILENO;
     let stdout_fd = libc::STDOUT_FILENO;
+
+    // Optional debug log for output bytes.
+    let mut debug_output: Option<std::fs::File> = std::env::var("PTERM_DEBUG_OUTPUT")
+        .ok()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("failed to open PTERM_DEBUG_OUTPUT file")
+        });
+
+    // Optional debug log for protocol frame events (type, size, esc count).
+    let mut debug_frames: Option<std::fs::File> = std::env::var("PTERM_DEBUG_FRAMES")
+        .ok()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("failed to open PTERM_DEBUG_FRAMES file")
+        });
 
     // Enter raw mode on stdin (if it's a terminal)
     let _raw_guard = if unsafe { libc::isatty(stdin_fd) } == 1 {
@@ -253,6 +283,20 @@ pub fn run(
                         let payload = &recv_buf[offset..offset + payload_len];
                         offset += payload_len;
 
+                        if let Some(ref mut f) = debug_frames {
+                            let kind = match msg_type {
+                                proto::server::OUTPUT => "OUTPUT",
+                                proto::server::SCROLLBACK => "SCROLLBACK",
+                                proto::server::EXIT => "EXIT",
+                                _ => "OTHER",
+                            };
+                            let _ = writeln!(
+                                f,
+                                "[frame] type={kind} len={payload_len} esc={}",
+                                esc_count(payload)
+                            );
+                        }
+
                         match msg_type {
                             proto::server::OUTPUT | proto::server::SCROLLBACK => {
                                 output_batch.extend_from_slice(payload);
@@ -264,6 +308,17 @@ pub fn run(
                                 }
                                 // Flush any batched output before exiting
                                 if !output_batch.is_empty() {
+                                    if let Some(ref mut f) = debug_frames {
+                                        let _ = writeln!(
+                                            f,
+                                            "[stdout_write] len={} esc={}",
+                                            output_batch.len(),
+                                            esc_count(&output_batch)
+                                        );
+                                    }
+                                    if let Some(ref mut f) = debug_output {
+                                        let _ = f.write_all(&output_batch);
+                                    }
                                     let _ = write_all_raw(stdout_fd, &output_batch);
                                 }
                                 break 'main;
@@ -273,6 +328,17 @@ pub fn run(
                     }
 
                     if !output_batch.is_empty() {
+                        if let Some(ref mut f) = debug_frames {
+                            let _ = writeln!(
+                                f,
+                                "[stdout_write] len={} esc={}",
+                                output_batch.len(),
+                                esc_count(&output_batch)
+                            );
+                        }
+                        if let Some(ref mut f) = debug_output {
+                            let _ = f.write_all(&output_batch);
+                        }
                         if write_all_raw(stdout_fd, &output_batch).is_err() {
                             break 'main;
                         }

@@ -1,6 +1,23 @@
 use crate::pty::Pty;
 use std::io;
+use std::io::Write as _;
 use std::os::fd::AsRawFd;
+
+fn esc_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == 0x1b).count()
+}
+
+fn dbg_daemon(msg: &str) {
+    if let Ok(path) = std::env::var("PTERM_DEBUG_DAEMON") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
 
 pub struct Session {
     pub name: String,
@@ -29,6 +46,14 @@ impl Session {
             Ok(n) => {
                 if n > 0 {
                     self.parser.process(&buf[..n]);
+                    let s = self.parser.screen();
+                    let (rows, cols) = s.size();
+                    let (cur_row, cur_col) = s.cursor_position();
+                    dbg_daemon(&format!(
+                        "[read_pty] n={n} esc={} size={cols}x{rows} cursor=({cur_col},{cur_row}) errors={}",
+                        esc_count(&buf[..n]),
+                        s.errors()
+                    ));
                 }
                 Ok(n)
             }
@@ -70,7 +95,17 @@ impl Session {
 
     /// Generate escape sequences that reproduce the current terminal state.
     pub fn snapshot(&self) -> Vec<u8> {
-        self.parser.screen().state_formatted()
+        let s = self.parser.screen();
+        let snap = s.state_formatted();
+        let (rows, cols) = s.size();
+        let wrapped: Vec<u16> = (0..rows).filter(|&r| s.row_wrapped(r)).take(32).collect();
+        dbg_daemon(&format!(
+            "[snapshot] len={} esc={} size={cols}x{rows} cursor={:?} wrapped={wrapped:?}",
+            snap.len(),
+            esc_count(&snap),
+            s.cursor_position()
+        ));
+        snap
     }
 
     /// Get the master fd for polling.
