@@ -94,6 +94,10 @@
             };
           };
 
+          apps = import ./nix/apps {
+            inherit self' pkgs;
+          };
+
           packages = {
             default = pterm;
             inherit pterm pterm-daemon;
