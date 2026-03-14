@@ -8,6 +8,22 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+fn esc_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == 0x1b).count()
+}
+
+fn dbg_daemon(msg: &str) {
+    if let Ok(path) = std::env::var("PTERM_DEBUG_DAEMON") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
@@ -200,6 +216,11 @@ impl Server {
     /// pending-snapshot flag.
     fn send_snapshot_to_client(&mut self, client_id: usize) {
         let snapshot = self.session.snapshot();
+        dbg_daemon(&format!(
+            "[send_snapshot] client={client_id} len={} esc={}",
+            snapshot.len(),
+            esc_count(&snapshot)
+        ));
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
             if !snapshot.is_empty() {
@@ -263,6 +284,12 @@ impl Server {
             .iter()
             .filter_map(|(&id, c)| if c.pending_snapshot { Some(id) } else { None })
             .collect();
+        dbg_daemon(&format!(
+            "[flush_pty] raw_len={} raw_esc={} snapshot_clients={snapshot_ids:?} total_clients={}",
+            self.pending_pty_output.len(),
+            esc_count(&self.pending_pty_output),
+            self.clients.len()
+        ));
         for id in &snapshot_ids {
             log::info!(
                 "Client {} snapshot triggered by PTY output arrival",
@@ -427,6 +454,9 @@ impl Server {
                         // If this client still has a pending snapshot, the
                         // session has now been resized to the correct
                         // dimensions.  Generate and send the snapshot.
+                        dbg_daemon(&format!(
+                            "[resize] client={client_id} cols={cols} rows={rows}"
+                        ));
                         let needs_snapshot = self
                             .clients
                             .get(&client_id)
