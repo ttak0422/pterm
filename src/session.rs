@@ -64,7 +64,7 @@ impl Session {
     /// Resize the pty and VT parser.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.pty.resize(cols, rows)?;
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         Ok(())
     }
 
