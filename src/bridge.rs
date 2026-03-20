@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TOKEN_STDIN: Token = Token(0);
 const TOKEN_SOCKET: Token = Token(1);
 const TOKEN_WAKE: Token = Token(2);
+const DETACH_CLEANUP_SEQUENCES: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h";
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -311,6 +313,7 @@ pub fn run(
     // Send DETACH before exiting
     let msg = proto::encode(proto::client::DETACH, &[]);
     let _ = socket.write_all(&msg);
+    let _ = write_all_raw(stdout_fd, DETACH_CLEANUP_SEQUENCES);
 
     Ok(exit_code)
 }

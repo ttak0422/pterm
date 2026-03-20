@@ -11,6 +11,8 @@ use std::time::Duration;
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
+const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
+const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
 
 struct Client {
     stream: UnixStream,
@@ -231,6 +233,22 @@ impl Server {
                     if self.pending_pty_output.is_empty() {
                         log::error!("pty read error: {}", e);
                     }
+                    break;
+                }
+            }
+        }
+
+        let (pending_da1, pending_da2) = self.session.take_pending_da_queries();
+        if self.clients.is_empty() {
+            for _ in 0..pending_da1 {
+                if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
+                    log::warn!("Failed to write DA1 response to PTY: {}", e);
+                    break;
+                }
+            }
+            for _ in 0..pending_da2 {
+                if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
+                    log::warn!("Failed to write DA2 response to PTY: {}", e);
                     break;
                 }
             }
