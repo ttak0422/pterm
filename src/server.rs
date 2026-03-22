@@ -11,8 +11,8 @@ use std::time::Duration;
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
-const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
-const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
+const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
+const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
 
 struct Client {
     stream: UnixStream,
@@ -282,10 +282,7 @@ impl Server {
             .filter_map(|(&id, c)| if c.pending_snapshot { Some(id) } else { None })
             .collect();
         for id in &snapshot_ids {
-            log::info!(
-                "Client {} snapshot triggered by PTY output arrival",
-                *id
-            );
+            log::info!("Client {} snapshot triggered by PTY output arrival", *id);
             self.send_snapshot_to_client(*id);
         }
 
