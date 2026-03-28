@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-03-28
+
+### Features
+
+- Add nix app for testing pterm in isolated neovim
+Add `nix run .#test-nvim` app that launches Neovim with pterm
+  pre-loaded for quick manual verification without manual setup.
+
+### Bug Fixes
+
+- Update vt100 0.15 → 0.16 to restore dim (SGR 2) attribute in snapshots (#16)
+vt100 0.15 did not track the dim/faint attribute (SGR 2) at all — no
+  TEXT_MODE_DIM bit and no handler in sgr(). As a result, state_formatted()
+  never re-emitted ESC[2m, so text rendered as dim in the live session would
+  appear as normal-weight text after a detach/re-attach cycle.
+
+  vt100 0.16 adds TEXT_MODE_DIM and handles SGR 2 → set_dim(), and
+  state_formatted() correctly re-emits Intensity::Dim as ESC[2m.
+
+  Confirmed via byte-level comparison of live PTY output vs snapshot:
+    ORIGINAL:  ESC[2mNo ESC[0m  (faint)
+    0.15 snap: ESC[m  No        (dim lost)
+    0.16 snap: ESC[m  ESC[2mNo  (dim preserved)
+
+  API changes in 0.16:
+  - screen.errors() removed → dropped from debug log format string
+  - parser.set_size(rows, cols) → parser.screen_mut().set_size(rows, cols)
+- Improve session snapshot and terminal lifecycle management (#17)
+* fix: improve session snapshot and lifecycle management
+
+  - (H) Send terminal cleanup sequences on detach to reset mouse modes,
+    bracketed paste, alternate screen, and cursor visibility in the
+    client terminal
+  - (B) Increase scrollback capacity from 0 to 10,000 lines so history
+    is available after reattach
+  - (G) Respond to DA1/DA2 queries with canned responses when no clients
+    are connected, preventing apps from hanging on capability detection
+  - (A) Prepend ESC[?1049h in snapshots when alternate screen is active
+    so reattaching clients properly enter alternate screen mode
+  - (C) Track window title via vt100 Callbacks and restore it in
+    snapshots via OSC 2 sequence on reattach
 ## [0.2.2] - 2026-03-11
 
 ### Bug Fixes
@@ -184,6 +225,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[0.2.3]: https://github.com/ttak0422/pterm/compare/v0.2.2..v0.2.3
 [0.2.2]: https://github.com/ttak0422/pterm/compare/v0.2.1..v0.2.2
 [0.2.1]: https://github.com/ttak0422/pterm/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/ttak0422/pterm/compare/v0.1.0..v0.2.0
