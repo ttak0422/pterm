@@ -18,8 +18,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TOKEN_STDIN: Token = Token(0);
 const TOKEN_SOCKET: Token = Token(1);
 const TOKEN_WAKE: Token = Token(2);
-const DETACH_CLEANUP_SEQUENCES: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h";
+// Some interactive programs enable xterm/kitty keyboard enhancement modes.
+// Reset them on detach so the next shell prompt does not inherit CSI-u style
+// encodings such as Ctrl-D => `CSI 100;5u`.
+const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
+\x1b[?1000l\
+\x1b[?1002l\
+\x1b[?1003l\
+\x1b[?1006l\
+\x1b[?2004l\
+\x1b[?1049l\
+\x1b[?25h\
+\x1b[>4n\
+\x1b[<u\
+\x1b[=0u";
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -316,4 +328,17 @@ pub fn run(
     let _ = write_all_raw(stdout_fd, DETACH_CLEANUP_SEQUENCES);
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DETACH_CLEANUP_SEQUENCES;
+
+    #[test]
+    fn detach_cleanup_resets_keyboard_protocols() {
+        let cleanup = std::str::from_utf8(DETACH_CLEANUP_SEQUENCES).unwrap();
+        assert!(cleanup.contains("\x1b[>4n"));
+        assert!(cleanup.contains("\x1b[<u"));
+        assert!(cleanup.contains("\x1b[=0u"));
+    }
 }
