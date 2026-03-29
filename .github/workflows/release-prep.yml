@@ -1,0 +1,44 @@
+name: release-prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-prep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Regenerate full changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag v${{ inputs.version }} --output CHANGELOG.md
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Create release prep pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          base: ${{ github.event.repository.default_branch }}
+          branch: release/v${{ inputs.version }}
+          title: chore(release): prepare v${{ inputs.version }}
+          commit-message: chore(release): prepare v${{ inputs.version }}
+          body: |
+            ## Summary
+            - regenerate `CHANGELOG.md` for `v${{ inputs.version }}`
+            - prepare the repository state for tagging `v${{ inputs.version }}`
+            - keep release metadata changes on the normal PR review path
