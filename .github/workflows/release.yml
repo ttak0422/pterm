@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   release:
@@ -33,29 +32,3 @@ jobs:
           body: ${{ steps.changelog.outputs.content }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Checkout default branch
-        run: |
-          git fetch origin ${{ github.event.repository.default_branch }}
-          git checkout -B ${{ github.event.repository.default_branch }} origin/${{ github.event.repository.default_branch }}
-
-      - name: Regenerate full changelog
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --output CHANGELOG.md
-        env:
-          GITHUB_REPO: ${{ github.repository }}
-
-      - name: Create changelog update pull request
-        uses: peter-evans/create-pull-request@v7
-        with:
-          base: ${{ github.event.repository.default_branch }}
-          branch: chore/release-changelog-${{ github.ref_name }}
-          title: chore(release): update CHANGELOG.md for ${{ github.ref_name }}
-          commit-message: chore(release): update CHANGELOG.md for ${{ github.ref_name }}
-          body: |
-            ## Summary
-            - regenerate `CHANGELOG.md` for `${{ github.ref_name }}`
-            - avoid pushing directly to `${{ github.event.repository.default_branch }}`
-            - keep the release workflow aligned with the repository's PR-first policy
