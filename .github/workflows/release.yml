@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   release:
@@ -46,17 +47,15 @@ jobs:
         env:
           GITHUB_REPO: ${{ github.repository }}
 
-      - name: Commit and push CHANGELOG.md
-        run: |
-          # see https://github.com/orgs/community/discussions/26560
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if git diff --quiet -- CHANGELOG.md; then
-            echo "No CHANGELOG.md updates to commit."
-            exit 0
-          fi
-
-          git add CHANGELOG.md
-          git commit -m "chore(release): update CHANGELOG.md"
-          git push origin ${{ github.event.repository.default_branch }}
+      - name: Create changelog update pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          base: ${{ github.event.repository.default_branch }}
+          branch: chore/release-changelog-${{ github.ref_name }}
+          title: chore(release): update CHANGELOG.md for ${{ github.ref_name }}
+          commit-message: chore(release): update CHANGELOG.md for ${{ github.ref_name }}
+          body: |
+            ## Summary
+            - regenerate `CHANGELOG.md` for `${{ github.ref_name }}`
+            - avoid pushing directly to `${{ github.event.repository.default_branch }}`
+            - keep the release workflow aligned with the repository's PR-first policy
