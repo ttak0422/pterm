@@ -117,6 +117,8 @@ require("telescope").load_extension("pterm")
 ```
 
 Connected sessions are shown with a `[connected]` prefix.
+If no existing session matches the current Telescope query, pressing `Enter`
+creates or opens a session using the prompt text as the session name.
 
 ## License
 
