@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-03-31
+
+### Bug Fixes
+
+- Quote colon-containing strings in release-prep workflow
+YAML requires quoting values that contain colons. The title and
+  commit-message fields were causing a parse error on line 38.
 ## [0.2.3] - 2026-03-28
 
 ### Features
@@ -225,6 +232,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[0.2.4]: https://github.com/ttak0422/pterm/compare/v0.2.3..v0.2.4
 [0.2.3]: https://github.com/ttak0422/pterm/compare/v0.2.2..v0.2.3
 [0.2.2]: https://github.com/ttak0422/pterm/compare/v0.2.1..v0.2.2
 [0.2.1]: https://github.com/ttak0422/pterm/compare/v0.2.0..v0.2.1
