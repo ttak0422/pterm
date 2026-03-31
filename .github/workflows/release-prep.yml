@@ -35,8 +35,8 @@ jobs:
         with:
           base: ${{ github.event.repository.default_branch }}
           branch: release/v${{ inputs.version }}
-          title: chore(release): prepare v${{ inputs.version }}
-          commit-message: chore(release): prepare v${{ inputs.version }}
+          title: "chore(release): prepare v${{ inputs.version }}"
+          commit-message: "chore(release): prepare v${{ inputs.version }}"
           body: |
             ## Summary
             - regenerate `CHANGELOG.md` for `v${{ inputs.version }}`
