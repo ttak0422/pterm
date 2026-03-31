@@ -24,10 +24,6 @@ local function sessions(opts)
 	end
 
 	local session_names = pterm.list()
-	if #session_names == 0 then
-		vim.notify("No active pterm sessions", vim.log.levels.INFO)
-		return
-	end
 
 	local entries = {}
 	for _, name in ipairs(session_names) do
@@ -59,6 +55,18 @@ local function sessions(opts)
 
 					local selection = action_state.get_selected_entry()
 					if not selection or not selection.value then
+						local session_name = vim.trim(action_state.get_current_line())
+						if session_name == "" then
+							return
+						end
+
+						local open_ok, err = pcall(pterm.open, session_name)
+						if not open_ok then
+							vim.notify(
+								"Failed to open session '" .. session_name .. "': " .. tostring(err),
+								vim.log.levels.ERROR
+							)
+						end
 						return
 					end
 
@@ -70,7 +78,10 @@ local function sessions(opts)
 
 					local open_ok, err = pcall(pterm.open, session_name)
 					if not open_ok then
-						vim.notify("Failed to open session '" .. session_name .. "': " .. tostring(err), vim.log.levels.ERROR)
+						vim.notify(
+							"Failed to open session '" .. session_name .. "': " .. tostring(err),
+							vim.log.levels.ERROR
+						)
 					end
 				end)
 				return true
