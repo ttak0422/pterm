@@ -1,0 +1,38 @@
+name: tag-release
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  tag-release:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Extract version from branch name
+        id: version
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${BRANCH#release/}"
+          echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Push tag
+        run: |
+          git config user.name "ttak0422-bot[bot]"
+          git config user.email "ttak0422-bot[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag }}
+          git push https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git ${{ steps.version.outputs.tag }}
