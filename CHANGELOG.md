@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] - 2026-04-01
+
+### Features
+
+- Auto-push tag when release PR is merged
+リリースPR（release/v*ブランチ）がmainにマージされると
+  GitHub Appトークンで自動的にタグをpushし、releaseワークフローをトリガーする
+
+### Refactor
+
+- Merge tag-release into release workflow
+tag-releaseとreleaseを統合し、リリースPRマージ時に
+  タグ作成とGitHub Release作成を1つのワークフローで完結させる
 ## [0.2.4] - 2026-04-01
 
 ### Bug Fixes
@@ -237,6 +250,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[0.2.5]: https://github.com/ttak0422/pterm/compare/v0.2.4..v0.2.5
 [0.2.4]: https://github.com/ttak0422/pterm/compare/v0.2.3..v0.2.4
 [0.2.3]: https://github.com/ttak0422/pterm/compare/v0.2.2..v0.2.3
 [0.2.2]: https://github.com/ttak0422/pterm/compare/v0.2.1..v0.2.2
