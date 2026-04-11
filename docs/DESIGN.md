@@ -51,7 +51,7 @@ Current approach:
 
 Responsibilities:
 
-- binary discovery (`setup.binary` override supported)
+- binary discovery from the plugin worktree, Nix build output, or `PATH`
 - session create/list/kill orchestration
 - attach lifecycle in Neovim
 

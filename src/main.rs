@@ -41,10 +41,10 @@ fn print_usage() {
         "pterm - persistent terminal daemon
 
 Usage:
-  pterm new    <session-name> [--cols N] [--rows N] [--] <command> [args...]
-  pterm attach <session-name> [--cols N] [--rows N]
+  pterm new    <session-name> [--] <command> [args...]
+  pterm attach <session-name>
                # attach to session (bridge mode)
-  pterm open   <session-name> [--cols N] [--rows N] [--] <command> [args...]
+  pterm open   <session-name> [--] <command> [args...]
                # attach if exists, otherwise create and attach
   pterm list   [prefix]
   pterm kill   <session-name>
@@ -64,8 +64,6 @@ Environment:
 
 fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     let mut session_name = String::new();
-    let mut cols: u16 = 80;
-    let mut rows: u16 = 24;
     let mut cmd_args: Vec<String> = Vec::new();
     let mut parsing_opts = true;
 
@@ -76,13 +74,7 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
             i += 1;
             continue;
         }
-        if parsing_opts && args[i] == "--cols" {
-            i += 1;
-            cols = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(80);
-        } else if parsing_opts && args[i] == "--rows" {
-            i += 1;
-            rows = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(24);
-        } else if session_name.is_empty() {
+        if session_name.is_empty() {
             session_name = args[i].clone();
         } else {
             cmd_args.push(args[i].clone());
@@ -172,7 +164,7 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     let cmd = &cmd_args[0];
     let str_args: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
 
-    let session = Session::new(session_name, cmd, &str_args, cols, rows)?;
+    let session = Session::new(session_name, cmd, &str_args)?;
     let mut server = Server::new(&sess_dir, session)?;
     server.run()?;
 
@@ -281,7 +273,7 @@ fn cmd_kill(args: &[String]) -> io::Result<()> {
 }
 
 /// Extract session name from args following the same parsing rule as `cmd_new`:
-/// first non-option argument, where `--cols/--rows` consume their next value.
+/// first non-option argument, ignoring an optional `--` separator.
 fn parse_session_name(args: &[String]) -> Option<&str> {
     let mut parsing_opts = true;
     let mut i = 0;
@@ -289,10 +281,6 @@ fn parse_session_name(args: &[String]) -> Option<&str> {
         if parsing_opts && args[i] == "--" {
             parsing_opts = false;
             i += 1;
-            continue;
-        }
-        if parsing_opts && (args[i] == "--cols" || args[i] == "--rows") {
-            i += 2;
             continue;
         }
         return Some(args[i].as_str());
@@ -318,18 +306,10 @@ fn wait_for_socket(sock: &Path, timeout: Duration, poll: Duration) -> io::Result
 
 fn cmd_attach(args: &[String]) -> io::Result<()> {
     let mut session_name = String::new();
-    let mut cols: Option<u16> = None;
-    let mut rows: Option<u16> = None;
 
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--cols" {
-            i += 1;
-            cols = args.get(i).and_then(|s| s.parse().ok());
-        } else if args[i] == "--rows" {
-            i += 1;
-            rows = args.get(i).and_then(|s| s.parse().ok());
-        } else if session_name.is_empty() {
+        if session_name.is_empty() {
             session_name = args[i].clone();
         }
         i += 1;
@@ -346,7 +326,7 @@ fn cmd_attach(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let exit_code = bridge::run(&sock, cols, rows)?;
+    let exit_code = bridge::run(&sock, None, None)?;
     std::process::exit(exit_code);
 }
 
@@ -355,23 +335,6 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         eprintln!("Error: session name required");
         std::process::exit(1);
     });
-
-    // Extract --cols/--rows for bridge
-    let mut cols: Option<u16> = None;
-    let mut rows: Option<u16> = None;
-    {
-        let mut i = 0;
-        while i < args.len() {
-            if args[i] == "--cols" {
-                i += 1;
-                cols = args.get(i).and_then(|s| s.parse().ok());
-            } else if args[i] == "--rows" {
-                i += 1;
-                rows = args.get(i).and_then(|s| s.parse().ok());
-            }
-            i += 1;
-        }
-    }
 
     let sock = session_socket_path(name);
     if !sock.exists() {
@@ -390,7 +353,7 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         }
     }
 
-    let exit_code = bridge::run(&sock, cols, rows)?;
+    let exit_code = bridge::run(&sock, None, None)?;
     std::process::exit(exit_code);
 }
 

@@ -9,7 +9,6 @@ Processes survive Neovim restarts. Terminal rendering is delegated to Neovim's n
 ```sh
 # Create a new persistent session (forks into background)
 pterm new mysession
-pterm new mysession --cols 120 --rows 40
 pterm new mysession -- /bin/zsh        # custom command
 
 # Attach bridge mode (for terminal clients)
@@ -86,20 +85,10 @@ require("pterm").setup()
 
 -- Default configuration:
 require("pterm").setup({
-  -- Path to pterm binary (auto-detected if nil)
-  binary = nil,
   -- Default shell command
   shell = vim.env.SHELL or "/bin/sh",
-  -- Default terminal size for `pterm new` when created outside Neovim
-  -- (the bridge reads the actual PTY size via TIOCGWINSZ at attach time)
-  cols = 80,
-  rows = 24,
   -- Socket directory (nil = let daemon decide)
   socket_dir = nil,
-  -- Max wait time for daemon socket creation after `pterm new`
-  attach_wait_ms = 3000,
-  -- Poll interval while waiting for socket
-  attach_poll_ms = 50,
 })
 ```
 
