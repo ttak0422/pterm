@@ -2,13 +2,8 @@ local M = {}
 
 --- Configuration
 M.config = {
-	-- Path to pterm binary (auto-detected if nil)
-	binary = nil,
 	-- Default shell command
 	shell = vim.env.SHELL or "/bin/sh",
-	-- Default terminal size
-	cols = 80,
-	rows = 24,
 	-- Socket directory (nil = let daemon decide)
 	socket_dir = nil,
 }
@@ -18,10 +13,6 @@ M.connections = {}
 
 --- Find the pterm binary.
 local function find_binary()
-	if M.config.binary then
-		return M.config.binary
-	end
-
 	-- Look relative to plugin root directory (lua/pterm/init.lua -> repo root)
 	local script_path = debug.getinfo(1, "S").source:sub(2)
 	local repo_root = vim.fn.fnamemodify(script_path, ":h:h:h")
@@ -43,7 +34,7 @@ local function find_binary()
 		return "pterm"
 	end
 
-	error("pterm binary not found. Build with: cargo build --release")
+	error("pterm binary not found. Install pterm with Nix or build it in this repository.")
 end
 
 --- Get socket directory (must match daemon's socket_dir() logic).
