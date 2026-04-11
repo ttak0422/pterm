@@ -25,8 +25,10 @@ const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
 \x1b[?1000l\
 \x1b[?1002l\
 \x1b[?1003l\
+\x1b[?1004l\
 \x1b[?1006l\
 \x1b[?2004l\
+\x1b[?2026l\
 \x1b[?1049l\
 \x1b[?69l\
 \x1b[0 q\
@@ -339,6 +341,8 @@ mod tests {
     #[test]
     fn detach_cleanup_resets_keyboard_protocols() {
         let cleanup = std::str::from_utf8(DETACH_CLEANUP_SEQUENCES).unwrap();
+        assert!(cleanup.contains("\x1b[?1004l"));
+        assert!(cleanup.contains("\x1b[?2026l"));
         assert!(cleanup.contains("\x1b[>4n"));
         assert!(cleanup.contains("\x1b[<u"));
         assert!(cleanup.contains("\x1b[=0u"));
