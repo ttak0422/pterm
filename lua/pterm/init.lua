@@ -256,9 +256,9 @@ end
 function M.open(session_name, args)
 	args = args or {}
 
-	-- Default session name
 	if not session_name or session_name == "" then
-		session_name = "main"
+		vim.notify("Session name required", vim.log.levels.ERROR)
+		return
 	end
 
 	-- Already connected?
