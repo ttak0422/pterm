@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 #[derive(Default)]
 struct SessionCallbacks {
     window_title: Option<String>,
+    window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
     passthrough_sequences: Vec<Vec<u8>>,
@@ -118,6 +119,15 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     let mut snapshot = screen.state_formatted();
     let mut prefix = Vec::new();
 
+    // Rebuild the window title stack so subsequent ESC[23;0t restores work
+    // correctly after snapshot replay.
+    for stacked_title in &callbacks.window_title_stack {
+        prefix.extend_from_slice(b"\x1b]2;");
+        prefix.extend_from_slice(stacked_title.as_bytes());
+        prefix.extend_from_slice(b"\x1b\\");
+        prefix.extend_from_slice(b"\x1b[22;0t");
+    }
+
     if let Some(title) = callbacks.window_title.as_ref() {
         prefix.extend_from_slice(b"\x1b]2;");
         prefix.extend_from_slice(title.as_bytes());
@@ -154,14 +164,49 @@ impl vt100::Callbacks for SessionCallbacks {
         params: &[&[u16]],
         c: char,
     ) {
-        // Preserve DECSCUSR (CSI Ps SP q) so cursor shape survives snapshot
-        // replay.  Vim emits these when switching between normal/insert mode
+        // DECSCUSR (CSI Ps SP q): cursor shape.
+        // Vim emits these when switching between normal/insert mode
         // (e.g. ESC[2 q for block, ESC[6 q for bar).
         if i1 == Some(b' ') && i2.is_none() && c == 'q' {
             self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
             return;
         }
 
+        // DEC private mode sequences (CSI ? Ps h/l) not handled by vt100.
+        if i1 == Some(b'?') && i2.is_none() && (c == 'h' || c == 'l') {
+            let mode = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+            match mode {
+                // ?12h/l: cursor blink (AT&T 610 origin, widely supported)
+                // ?69h/l: left-right margin mode (DECLRMM)
+                12 | 69 => {
+                    self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Window title save/restore (CSI 22;?t / CSI 23;?t).
+        // Vim uses these to save the terminal title on entry and restore on
+        // exit.  We track the stack ourselves so snapshots can replay it.
+        if i1.is_none() && i2.is_none() && c == 't' {
+            let op = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+            match op {
+                22 => {
+                    let title = self.window_title.clone().unwrap_or_default();
+                    self.window_title_stack.push(title);
+                }
+                23 => {
+                    if let Some(title) = self.window_title_stack.pop() {
+                        self.window_title = if title.is_empty() { None } else { Some(title) };
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Device attribute queries (CSI c).
         if c != 'c' || i2.is_some() || !Self::default_da_params(params) {
             return;
         }
@@ -332,6 +377,102 @@ mod tests {
         assert!(
             snapshot.contains("\x1b[6 q"),
             "DECSCUSR (ESC[6 q) should be preserved in snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_cursor_blink_mode() {
+        // AT&T 610: ESC[?12l disables cursor blink, ESC[?12h enables it.
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[?12l");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(
+            snapshot_str.contains("\x1b[?12l"),
+            "cursor blink disable (ESC[?12l) should be preserved in snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_declrmm() {
+        // DECLRMM: ESC[?69h enables left-right margin mode.
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[?69h");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(
+            snapshot_str.contains("\x1b[?69h"),
+            "DECLRMM (ESC[?69h) should be preserved in snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_window_title_stack() {
+        // Vim saves the original title on entry with ESC[22;0t, then sets its
+        // own title. On exit it restores with ESC[23;0t.
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+
+        // Set initial title, save it, then set a new title (Vim's title)
+        parser.process(b"\x1b]2;original\x1b\\");
+        parser.process(b"\x1b[22;0t");
+        parser.process(b"\x1b]2;vim - file.txt\x1b\\");
+
+        assert_eq!(
+            parser.callbacks().window_title_stack,
+            vec!["original"],
+            "title stack should contain the saved title"
+        );
+        assert_eq!(
+            parser.callbacks().window_title.as_deref(),
+            Some("vim - file.txt"),
+            "current title should be updated"
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        // Snapshot must contain both: the stacked title with a save command,
+        // and the current title.
+        assert!(
+            snapshot_str.contains("original"),
+            "stacked title should appear in snapshot"
+        );
+        assert!(
+            snapshot_str.contains("\x1b[22;0t"),
+            "title save command should appear in snapshot"
+        );
+        assert!(
+            snapshot_str.contains("vim - file.txt"),
+            "current title should appear in snapshot"
+        );
+    }
+
+    #[test]
+    fn window_title_restore_pops_stack() {
+        // ESC[23;0t restores the previously saved title.
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+
+        parser.process(b"\x1b]2;original\x1b\\");
+        parser.process(b"\x1b[22;0t");
+        parser.process(b"\x1b]2;vim\x1b\\");
+        parser.process(b"\x1b[23;0t");
+
+        assert!(
+            parser.callbacks().window_title_stack.is_empty(),
+            "stack should be empty after restore"
+        );
+        assert_eq!(
+            parser.callbacks().window_title.as_deref(),
+            Some("original"),
+            "title should be restored to original"
         );
     }
 
