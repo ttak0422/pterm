@@ -2,6 +2,77 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.6] - 2026-04-11
+
+### Bug Fixes
+
+- Preserve unhandled OSC/CSI/escape sequences in snapshots
+vt100's state_formatted() drops sequences it does not handle (e.g. OSC 8
+  hyperlinks). Implement unhandled_osc, unhandled_escape, and unhandled_csi
+  on SessionCallbacks to capture and re-emit those sequences as a prefix in
+  build_snapshot(), so attach/reconnect sees the same output as live display.
+
+  Passthrough storage is bounded at 256 sequences / 16 KiB to prevent
+  unbounded growth. Adds two regression tests: one confirming OSC 8 survives
+  the snapshot round-trip, one confirming SGR (handled by vt100) is NOT
+  duplicated into the passthrough buffer.
+- Preserve cursor shape (DECSCUSR) across snapshots and reset on detach
+Vim emits DECSCUSR sequences (ESC[Ps SP q) when switching between
+  normal/insert mode to change cursor shape (e.g. block vs bar). These
+  sequences were silently dropped, causing the cursor shape to appear
+  frozen or incorrect after a snapshot replay.
+
+  Three related fixes:
+
+  1. `unhandled_csi`: Preserve DECSCUSR sequences in the passthrough
+     buffer instead of discarding them. vt100 does not handle DECSCUSR
+     internally and state_formatted() never emits them, so they must be
+     captured here.
+
+  2. `format_unhandled_csi`: Fix byte ordering for true intermediate bytes
+     (0x20-0x2F, e.g. SP in DECSCUSR). These must be emitted after
+     numerical parameters, not before. Private prefix bytes (0x3C-0x3F,
+     e.g. ?) continue to be emitted before parameters.
+
+  3. `build_snapshot`: Move passthrough sequences to the end of the
+     snapshot, after state_formatted() output. state_formatted() emits
+     cursor-positioning sequences at the end; passthrough sequences
+     (including DECSCUSR) must follow so they are not overwritten.
+
+  4. `DETACH_CLEANUP_SEQUENCES`: Add ESC[0 q to reset cursor shape on
+     detach so the enclosing terminal is not left with Vim's cursor style.
+- Handle cursor blink, DECLRMM, and window title stack in snapshots
+Three additional Vim-related control sequences were silently dropped,
+  causing state loss across snapshot replay:
+
+  1. ESC[?12h/l (AT&T 610 cursor blink): vt100 does not handle mode 12
+     in decset/decrst, so it reaches unhandled_csi.  Preserve it in the
+     passthrough buffer so replay restores the blink state.
+
+  2. ESC[?69h/l (DECLRMM left-right margin mode): same path as above.
+     Also add ESC[?69l to DETACH_CLEANUP_SEQUENCES so the mode is reset
+     when the user detaches.
+
+  3. ESC[22;0t / ESC[23;0t (window title save/restore): Vim saves the
+     original terminal title on entry and restores it on exit via these
+     sequences.  Track a title stack in SessionCallbacks; build_snapshot
+     now replays the stack so a subsequent ESC[23;0t after attach pops
+     the correct title.
+- Preserve Neovim control sequences and refactor passthrough logic
+Add passthrough handling for sequences that vt100 does not track but
+  Neovim uses in normal operation, so they survive snapshot replay on
+  re-attach:
+
+  - ESC[?1004h/l: focus tracking (Neovim emits on startup)
+  - ESC[?2026h/l: synchronized output
+  - CSI > Ps u / CSI = Ps u / CSI < u: Kitty keyboard protocol
+  - SGR 4:N (undercurl) and SGR 58:2:r:g:b (underline color)
+  - OSC 52: clipboard copy/paste via copy_to_clipboard callback
+  - CSI Nt (t sequences other than 22/23) are now passed through
+    instead of being silently dropped
+
+  Also add ESC[?1004l and ESC[?2026l to DETACH_CLEANUP_SEQUENCES so
+  focus-tracking and synchronized-output modes are reset on detach.
 ## [0.2.5] - 2026-04-01
 
 ### Features
@@ -250,6 +321,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[0.2.6]: https://github.com/ttak0422/pterm/compare/v0.2.5..v0.2.6
 [0.2.5]: https://github.com/ttak0422/pterm/compare/v0.2.4..v0.2.5
 [0.2.4]: https://github.com/ttak0422/pterm/compare/v0.2.3..v0.2.4
 [0.2.3]: https://github.com/ttak0422/pterm/compare/v0.2.2..v0.2.3
