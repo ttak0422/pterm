@@ -43,7 +43,6 @@ pterm kill parent          # kills parent and parent/child
 ## Neovim Usage
 
 ```vim
-:Pterm              " opens/creates 'main' session
 :Pterm dev          " opens/creates named session
 :Pterm dev zsh      " opens/creates session with custom command
 :PtermList          " list sessions
