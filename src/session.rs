@@ -66,8 +66,13 @@ impl SessionCallbacks {
 
     fn format_unhandled_csi(i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) -> Vec<u8> {
         let mut seq = vec![0x1b, b'['];
-        if let Some(i1) = i1 {
-            seq.push(i1);
+        // Private/prefix bytes (0x3C-0x3F: <, =, >, ?) are collected before
+        // numerical parameters in the CSI entry state, so they must be emitted
+        // before params.
+        if let Some(i) = i1 {
+            if i >= 0x3C {
+                seq.push(i);
+            }
         }
         for (idx, param) in params.iter().enumerate() {
             if idx > 0 {
@@ -78,6 +83,14 @@ impl SessionCallbacks {
                     seq.push(b':');
                 }
                 seq.extend_from_slice(value.to_string().as_bytes());
+            }
+        }
+        // True intermediate bytes (0x20-0x2F, e.g. SP in DECSCUSR ESC[Ps SP q)
+        // are collected after numerical parameters, so they must be emitted
+        // after params.
+        if let Some(i) = i1 {
+            if i < 0x3C {
+                seq.push(i);
             }
         }
         if let Some(i2) = i2 {
@@ -101,6 +114,7 @@ impl SessionCallbacks {
 }
 
 fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u8> {
+    let passthrough = callbacks.passthrough_sequences_formatted();
     let mut snapshot = screen.state_formatted();
     let mut prefix = Vec::new();
 
@@ -112,14 +126,19 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     if screen.alternate_screen() {
         prefix.extend_from_slice(b"\x1b[?1049h");
     }
-    prefix.extend_from_slice(&callbacks.passthrough_sequences_formatted());
 
-    if prefix.is_empty() {
-        snapshot
-    } else {
+    if !prefix.is_empty() {
         prefix.append(&mut snapshot);
-        prefix
+        snapshot = prefix;
     }
+
+    // Passthrough sequences (e.g. DECSCUSR cursor shape) must come after
+    // state_formatted() so they are not overwritten by cursor-positioning
+    // sequences that state_formatted() emits at the end.
+    if !passthrough.is_empty() {
+        snapshot.extend_from_slice(&passthrough);
+    }
+    snapshot
 }
 
 impl vt100::Callbacks for SessionCallbacks {
@@ -135,6 +154,14 @@ impl vt100::Callbacks for SessionCallbacks {
         params: &[&[u16]],
         c: char,
     ) {
+        // Preserve DECSCUSR (CSI Ps SP q) so cursor shape survives snapshot
+        // replay.  Vim emits these when switching between normal/insert mode
+        // (e.g. ESC[2 q for block, ESC[6 q for bar).
+        if i1 == Some(b' ') && i2.is_none() && c == 'q' {
+            self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
+            return;
+        }
+
         if c != 'c' || i2.is_some() || !Self::default_da_params(params) {
             return;
         }
@@ -289,5 +316,50 @@ mod tests {
         parser.process(b"\x1b[31mRED\x1b[m");
 
         assert!(parser.callbacks().passthrough_sequences.is_empty());
+    }
+
+    #[test]
+    fn snapshot_preserves_decscusr_cursor_shape() {
+        // Vim emits DECSCUSR when switching modes (e.g. ESC[6 q for bar cursor
+        // in insert mode, ESC[2 q for block in normal mode).
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[6 q");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot = String::from_utf8_lossy(&snapshot);
+
+        assert!(
+            snapshot.contains("\x1b[6 q"),
+            "DECSCUSR (ESC[6 q) should be preserved in snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_decscusr_comes_after_state_formatted() {
+        // DECSCUSR must appear after state_formatted() output so it is not
+        // overwritten by the cursor-positioning sequences that state_formatted()
+        // emits at the end.
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[6 q");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+
+        // state_formatted() ends with a cursor-position sequence (ESC[...H or
+        // similar).  Find DECSCUSR and the last ESC occurrence before it to
+        // confirm ordering.
+        let decscusr_pos = snapshot
+            .windows(5)
+            .position(|w| w == b"\x1b[6 q")
+            .expect("DECSCUSR not found");
+
+        // ESC[H (home) or ESC[r;cH appears in state_formatted output.
+        // Any ESC before decscusr_pos indicates state_formatted came first.
+        let has_esc_before = snapshot[..decscusr_pos].contains(&0x1b);
+        assert!(
+            has_esc_before,
+            "state_formatted() sequences should appear before DECSCUSR in snapshot"
+        );
     }
 }

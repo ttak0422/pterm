@@ -28,6 +28,7 @@ const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
 \x1b[?1006l\
 \x1b[?2004l\
 \x1b[?1049l\
+\x1b[0 q\
 \x1b[?25h\
 \x1b[>4n\
 \x1b[<u\
