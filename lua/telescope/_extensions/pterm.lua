@@ -27,7 +27,7 @@ local function sessions(opts)
 
 	local entries = {}
 	for _, name in ipairs(session_names) do
-		local connected = pterm.connections[name] ~= nil
+		local connected = pterm.is_connected(name)
 		table.insert(entries, {
 			value = name,
 			ordinal = name,
