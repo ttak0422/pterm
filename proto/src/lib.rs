@@ -28,6 +28,11 @@ pub mod client {
 
     /// Request terminal redraw (no payload)
     pub const REDRAW: u8 = 0x04;
+
+    /// Sync environment variables to the session env file.
+    /// Payload: UTF-8 JSON object mapping variable names to string values or
+    /// null. A string value exports the variable; null unsets it.
+    pub const SET_ENV: u8 = 0x05;
 }
 
 /// Daemon → Client message types

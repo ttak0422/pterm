@@ -302,10 +302,17 @@ pub struct Session {
 
 impl Session {
     /// Create a new session with the given name and command.
-    pub fn new(name: String, cmd: &str, args: &[&str]) -> io::Result<Self> {
+    /// `extra_env` is forwarded to `Pty::spawn` as additional environment
+    /// variables for the child process (see `Pty::spawn` for details).
+    pub fn new(
+        name: String,
+        cmd: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> io::Result<Self> {
         let cols = DEFAULT_TERMINAL_COLS;
         let rows = DEFAULT_TERMINAL_ROWS;
-        let pty = Pty::spawn(cmd, args, cols, rows)?;
+        let pty = Pty::spawn(cmd, args, cols, rows, extra_env)?;
         Ok(Self {
             name,
             pty,

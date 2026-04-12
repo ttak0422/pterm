@@ -24,6 +24,8 @@ struct Client {
 
 pub struct Server {
     socket_path: PathBuf,
+    /// Path to the per-session env file updated by SET_ENV frames.
+    env_file_path: PathBuf,
     session: Session,
     poll: Poll,
     listener: UnixListener,
@@ -67,6 +69,7 @@ impl Server {
 
         Ok(Self {
             socket_path,
+            env_file_path: session_dir.join("env.sh"),
             session,
             poll,
             listener,
@@ -440,6 +443,11 @@ impl Server {
                     }
                 }
                 proto::client::DETACH => {}
+                proto::client::SET_ENV => {
+                    if let Err(e) = self.write_env_file(&frame.payload) {
+                        log::warn!("Client {} SET_ENV error: {}", client_id, e);
+                    }
+                }
                 proto::client::REDRAW => {
                     log::info!("Redraw requested by client {}", client_id);
                     let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
@@ -457,6 +465,57 @@ impl Server {
             client.recv_buf = recv_buf;
         }
         Ok(flush_all)
+    }
+
+    /// Write per-session env file from a SET_ENV JSON payload.
+    ///
+    /// The payload is a UTF-8 JSON object: `{"KEY": "value", "OTHER": null}`.
+    /// String values produce `export KEY='value'`; null produces `unset KEY`.
+    /// The file is written atomically (write temp → rename) with mode 0600.
+    fn write_env_file(&self, payload: &[u8]) -> io::Result<()> {
+        let map: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_slice(payload).map_err(io::Error::other)?;
+
+        let mut lines: Vec<String> = Vec::with_capacity(map.len());
+        for (k, v) in &map {
+            // Reject keys that would break shell syntax.
+            if k.is_empty() || k.contains('=') || k.contains('\0') || k.contains('\n') {
+                log::warn!("SET_ENV: skipping invalid key {:?}", k);
+                continue;
+            }
+            match v {
+                serde_json::Value::String(s) => {
+                    // Escape single quotes so the value is safe in single-quoted shell strings.
+                    let escaped = s.replace('\'', "'\\''");
+                    lines.push(format!("export {}='{}'", k, escaped));
+                }
+                serde_json::Value::Null => {
+                    lines.push(format!("unset {}", k));
+                }
+                _ => {}
+            }
+        }
+        lines.sort();
+
+        let content = lines.join("\n") + "\n";
+        let tmp_path = self.env_file_path.with_file_name("env.sh.tmp");
+
+        std::fs::write(&tmp_path, content.as_bytes())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        std::fs::rename(&tmp_path, &self.env_file_path)?;
+
+        log::info!(
+            "Env file updated ({} entries) at {:?}",
+            map.len(),
+            self.env_file_path
+        );
+        Ok(())
     }
 }
 

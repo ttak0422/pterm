@@ -141,7 +141,13 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     let cmd = &cmd_args[0];
     let str_args: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
 
-    let session = Session::new(session_name, cmd, &str_args)?;
+    // Inject PTERM_ENV_FILE so the shell can source per-session env overrides
+    // pushed by Neovim at attach time.
+    let env_file = sess_dir.join("env.sh");
+    let env_file_str = env_file.to_string_lossy().into_owned();
+    let extra_env = [("PTERM_ENV_FILE", env_file_str.as_str())];
+
+    let session = Session::new(session_name, cmd, &str_args, &extra_env)?;
     let mut server = Server::new(&sess_dir, session)?;
     server.run()?;
 

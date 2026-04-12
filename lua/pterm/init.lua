@@ -6,6 +6,21 @@ M.config = {
 	shell = vim.env.SHELL or "/bin/sh",
 	-- Socket directory (nil = let daemon decide)
 	socket_dir = nil,
+	-- Function returning a table of env vars to sync on each attach.
+	-- Keys are variable names; values are strings to export, or false/nil to
+	-- unset.  Return nil or an empty table to disable env sync.
+	--
+	-- Example: to also forward GOPATH:
+	--   sync_env = function(_) return { GOPATH = vim.env.GOPATH } end
+	sync_env = function(_session_name)
+		return {
+			EDITOR = vim.env.EDITOR,
+			VISUAL = vim.env.VISUAL,
+			GIT_EDITOR = vim.env.GIT_EDITOR,
+			NVIM_LISTEN_ADDRESS = vim.v.servername ~= "" and vim.v.servername or nil,
+			NVIM = vim.v.progpath ~= "" and vim.v.progpath or nil,
+		}
+	end,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
@@ -177,6 +192,28 @@ local function start_terminal(session_name, cmd)
 	vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
 	vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
 
+	-- Build PTERM_SYNC_ENV from the sync_env config callback.
+	-- The bridge process will read this and send a SET_ENV frame to the daemon
+	-- before the initial RESIZE, so the session env file is updated on every
+	-- attach with the current Neovim's relevant env vars.
+	local pterm_sync_env = ""
+	if type(M.config.sync_env) == "function" then
+		local ok, result = pcall(M.config.sync_env, session_name)
+		if ok and type(result) == "table" then
+			local env_map = {}
+			for k, v in pairs(result) do
+				if type(k) == "string" and k ~= "" then
+					if v == false then
+						env_map[k] = vim.NIL
+					elseif type(v) == "string" and v ~= "" then
+						env_map[k] = v
+					end
+				end
+			end
+			pterm_sync_env = vim.json.encode(env_map)
+		end
+	end
+
 	-- Let the bridge read the actual PTY size via TIOCGWINSZ instead of
 	-- passing --cols/--rows from Lua.  jobstart({term=true}) creates a PTY
 	-- sized to the current window, and the bridge's get_winsize(stdout)
@@ -184,6 +221,7 @@ local function start_terminal(session_name, cmd)
 	local job_id
 	job_id = vim.fn.jobstart(cmd, {
 		term = true,
+		env = { PTERM_SYNC_ENV = pterm_sync_env },
 		on_exit = function(_, exit_code, _)
 			vim.schedule(function()
 				local conn = connections[session_name]

@@ -1,6 +1,6 @@
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
-use nix::unistd::{dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::unistd::{dup2, execve, execvp, fork, setsid, ForkResult, Pid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -15,7 +15,16 @@ impl Pty {
     /// `cmd` is the command to execute (e.g., "/bin/bash").
     /// `args` are the arguments (argv[0] should be the command name).
     /// `cols` and `rows` set the initial terminal size.
-    pub fn spawn(cmd: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<Self> {
+    /// `extra_env` is a list of `(key, value)` pairs to add or override in the
+    /// child environment. When non-empty the child is started with `execve`
+    /// using the current process environment merged with the overrides.
+    pub fn spawn(
+        cmd: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        extra_env: &[(&str, &str)],
+    ) -> io::Result<Self> {
         // Open a pty pair
         let OpenptyResult { master, slave } = openpty(None, None).map_err(io::Error::other)?;
 
@@ -62,7 +71,22 @@ impl Pty {
                 // Exec the command
                 let c_cmd = CString::new(cmd).unwrap();
                 let c_args: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
-                execvp(&c_cmd, &c_args).ok();
+
+                if extra_env.is_empty() {
+                    execvp(&c_cmd, &c_args).ok();
+                } else {
+                    // Build full environment: current env merged with overrides.
+                    let mut env_map: std::collections::HashMap<String, String> =
+                        std::env::vars().collect();
+                    for (k, v) in extra_env {
+                        env_map.insert(k.to_string(), v.to_string());
+                    }
+                    let c_env: Vec<CString> = env_map
+                        .into_iter()
+                        .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
+                        .collect();
+                    execve(&c_cmd, &c_args, &c_env).ok();
+                }
 
                 // If exec fails
                 std::process::exit(127);

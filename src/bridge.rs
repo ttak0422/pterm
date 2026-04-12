@@ -190,6 +190,16 @@ pub fn run(
     poll.registry()
         .register(&mut wake_source, TOKEN_WAKE, Interest::READABLE)?;
 
+    // Send SET_ENV frame if PTERM_SYNC_ENV is set in the bridge process
+    // environment.  Neovim passes this via jobstart(..., {env = {...}}) so each
+    // attach carries the current Neovim's env vars.
+    if let Ok(sync_env) = std::env::var("PTERM_SYNC_ENV") {
+        if !sync_env.is_empty() {
+            let msg = proto::encode(proto::client::SET_ENV, sync_env.as_bytes());
+            socket.write_all(&msg)?;
+        }
+    }
+
     // Send initial RESIZE to sync terminal size.
     // CLI-supplied values take priority, then TIOCGWINSZ, then the default
     // terminal size.
