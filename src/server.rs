@@ -205,7 +205,7 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
             if !snapshot.is_empty() {
-                let msg = proto::encode(proto::server::SCROLLBACK, &snapshot);
+                let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
                 client.send_buf.extend_from_slice(&msg);
             }
         }
@@ -413,42 +413,30 @@ impl Server {
         };
 
         let mut flush_all = false;
-        let mut offset = 0;
-        while offset + proto::HEADER_SIZE <= recv_buf.len() {
-            let header: [u8; proto::HEADER_SIZE] = recv_buf[offset..offset + proto::HEADER_SIZE]
-                .try_into()
-                .unwrap();
-            let (msg_type, payload_len) = proto::decode_header(&header);
-
-            let payload_len = payload_len as usize;
-            if offset + proto::HEADER_SIZE + payload_len > recv_buf.len() {
-                break; // incomplete message, wait for more data
-            }
-
-            offset += proto::HEADER_SIZE;
-            let payload = &recv_buf[offset..offset + payload_len];
-            offset += payload_len;
-
-            match msg_type {
+        for frame in proto::decode_frames(&mut recv_buf) {
+            match frame.msg_type {
                 proto::client::INPUT => {
-                    self.session.write_pty(payload)?;
+                    self.session.write_pty(&frame.payload)?;
                 }
                 proto::client::RESIZE => {
-                    if payload.len() >= 4 {
-                        let r: [u8; 4] = payload[..4].try_into().unwrap();
-                        let (cols, rows) = proto::decode_resize(&r);
-                        self.session.resize(cols, rows)?;
-
-                        // If this client still has a pending snapshot, the
-                        // session has now been resized to the correct
-                        // dimensions.  Generate and send the snapshot.
-                        let needs_snapshot = self
-                            .clients
-                            .get(&client_id)
-                            .map_or(false, |c| c.pending_snapshot);
-                        if needs_snapshot {
-                            self.send_snapshot_to_client(client_id);
+                    let (cols, rows) = match proto::parse_resize(&frame.payload) {
+                        Ok(size) => size,
+                        Err(e) => {
+                            log::warn!("Client {} sent invalid resize payload: {}", client_id, e);
+                            continue;
                         }
+                    };
+                    self.session.resize(cols, rows)?;
+
+                    // If this client still has a pending snapshot, the
+                    // session has now been resized to the correct
+                    // dimensions. Generate and send the snapshot.
+                    let needs_snapshot = self
+                        .clients
+                        .get(&client_id)
+                        .map_or(false, |c| c.pending_snapshot);
+                    if needs_snapshot {
+                        self.send_snapshot_to_client(client_id);
                     }
                 }
                 proto::client::DETACH => {}
@@ -456,19 +444,14 @@ impl Server {
                     log::info!("Redraw requested by client {}", client_id);
                     let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
                     redraw_data.extend_from_slice(&self.session.snapshot());
-                    let msg = proto::encode(proto::server::SCROLLBACK, &redraw_data);
+                    let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
                     for (_, client) in self.clients.iter_mut() {
                         client.send_buf.extend_from_slice(&msg);
                     }
                     flush_all = true;
                 }
-                _ => log::warn!("Unknown message type: 0x{:02x}", msg_type),
+                _ => log::warn!("Unknown message type: 0x{:02x}", frame.msg_type),
             }
-        }
-
-        // Put remaining bytes back into the client's buffer
-        if offset > 0 {
-            recv_buf.drain(..offset);
         }
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.recv_buf = recv_buf;

@@ -4,6 +4,7 @@
 //! Neovim owns the PTY that the bridge's stdin/stdout are connected to, so
 //! libvterm processes escape sequences natively in C -- no Lua intermediary.
 
+use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use mio::net::UnixStream;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
@@ -18,9 +19,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TOKEN_STDIN: Token = Token(0);
 const TOKEN_SOCKET: Token = Token(1);
 const TOKEN_WAKE: Token = Token(2);
+
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
 // encodings such as Ctrl-D => `CSI 100;5u`.
+//
+// Cleanup sequences:
+// - `CSI ? 1000/1002/1003 l`: disable mouse tracking modes used by full-screen TUIs.
+// - `CSI ? 1004 l`: disable focus in/out reporting.
+// - `CSI ? 1006 l`: disable SGR mouse encoding.
+// - `CSI ? 2004 l`: disable bracketed paste mode.
+// - `CSI ? 2026 l`: disable synchronized output mode.
+// - `CSI ? 1049 l`: leave the alternate screen buffer.
+// - `CSI ? 69 l`: disable left/right margin mode (DECLRMM).
+// - `CSI 0 q`: restore the default cursor shape.
+// - `CSI ? 25 h`: ensure the text cursor is visible again.
+// - `CSI > 4 n`: reset xterm's modifyOtherKeys state.
+// - `CSI < u`: disable kitty's progressive keyboard enhancement flags.
+// - `CSI = 0 u`: reset kitty keyboard protocol to the base mode.
 const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
 \x1b[?1000l\
 \x1b[?1002l\
@@ -119,8 +135,8 @@ fn write_all_raw(fd: RawFd, data: &[u8]) -> io::Result<()> {
 /// Returns the child process exit code (from the daemon's EXIT message).
 ///
 /// `initial_cols` / `initial_rows` override the terminal size sent in the
-/// initial RESIZE message.  When `None`, the size is read from `TIOCGWINSZ`
-/// (stdout) with a final fallback to 80×24.
+/// initial RESIZE message. When `None`, the size is read from `TIOCGWINSZ`
+/// (stdout) with a final fallback to the default terminal size.
 pub fn run(
     socket_path: &Path,
     initial_cols: Option<u16>,
@@ -175,11 +191,16 @@ pub fn run(
         .register(&mut wake_source, TOKEN_WAKE, Interest::READABLE)?;
 
     // Send initial RESIZE to sync terminal size.
-    // CLI-supplied values take priority, then TIOCGWINSZ, then 80×24.
+    // CLI-supplied values take priority, then TIOCGWINSZ, then the default
+    // terminal size.
     let (cols, rows) = {
         let winsize = get_winsize(stdout_fd).ok();
-        let c = initial_cols.or(winsize.map(|(c, _)| c)).unwrap_or(80);
-        let r = initial_rows.or(winsize.map(|(_, r)| r)).unwrap_or(24);
+        let c = initial_cols
+            .or(winsize.map(|(c, _)| c))
+            .unwrap_or(DEFAULT_TERMINAL_COLS);
+        let r = initial_rows
+            .or(winsize.map(|(_, r)| r))
+            .unwrap_or(DEFAULT_TERMINAL_ROWS);
         (c, r)
     };
     {
@@ -253,32 +274,15 @@ pub fn run(
 
                     // Process complete frames, batching output payloads into
                     // a single write to avoid incremental rendering.
-                    let mut offset = 0;
                     let mut output_batch: Vec<u8> = Vec::new();
-                    while offset + proto::HEADER_SIZE <= recv_buf.len() {
-                        let header: [u8; proto::HEADER_SIZE] = recv_buf
-                            [offset..offset + proto::HEADER_SIZE]
-                            .try_into()
-                            .unwrap();
-                        let (msg_type, payload_len) = proto::decode_header(&header);
-                        let payload_len = payload_len as usize;
-
-                        if offset + proto::HEADER_SIZE + payload_len > recv_buf.len() {
-                            break; // incomplete frame
-                        }
-
-                        offset += proto::HEADER_SIZE;
-                        let payload = &recv_buf[offset..offset + payload_len];
-                        offset += payload_len;
-
-                        match msg_type {
-                            proto::server::OUTPUT | proto::server::SCROLLBACK => {
-                                output_batch.extend_from_slice(payload);
+                    for frame in proto::decode_frames(&mut recv_buf) {
+                        match frame.msg_type {
+                            proto::server::OUTPUT | proto::server::STATE_SYNC => {
+                                output_batch.extend_from_slice(&frame.payload);
                             }
                             proto::server::EXIT => {
-                                if payload.len() >= 4 {
-                                    exit_code =
-                                        i32::from_le_bytes(payload[..4].try_into().unwrap());
+                                if let Ok(code) = proto::parse_exit(&frame.payload) {
+                                    exit_code = code;
                                 }
                                 // Flush any batched output before exiting
                                 if !output_batch.is_empty() {
@@ -290,14 +294,9 @@ pub fn run(
                         }
                     }
 
-                    if !output_batch.is_empty() {
-                        if write_all_raw(stdout_fd, &output_batch).is_err() {
-                            break 'main;
-                        }
-                    }
-
-                    if offset > 0 {
-                        recv_buf.drain(..offset);
+                    if !output_batch.is_empty() && write_all_raw(stdout_fd, &output_batch).is_err()
+                    {
+                        break 'main;
                     }
                 }
 

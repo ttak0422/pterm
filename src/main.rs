@@ -1,40 +1,17 @@
 mod bridge;
+mod constants;
+mod paths;
 mod pty;
 mod server;
 mod session;
 
+use crate::paths::{find_sessions, session_dir, session_socket_path, socket_dir, SOCKET_FILENAME};
 use server::Server;
 use session::Session;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
-
-fn socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PTERM_SOCKET_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("pterm");
-    }
-    let uid = nix::unistd::getuid();
-    PathBuf::from(format!("/tmp/pterm-{}", uid))
-}
-
-/// Socket file name within a session directory.
-const SOCKET_FILENAME: &str = "socket";
-
-/// Resolve the socket path for a session name.
-/// Session name may contain `/` for hierarchical sessions (e.g. "parent/child").
-/// Returns: `<socket_dir>/<session_name>/socket`
-fn session_socket_path(session_name: &str) -> PathBuf {
-    socket_dir().join(session_name).join(SOCKET_FILENAME)
-}
-
-/// Resolve the session directory for a session name.
-fn session_dir(session_name: &str) -> PathBuf {
-    socket_dir().join(session_name)
-}
 
 fn print_usage() {
     eprintln!(
@@ -169,52 +146,6 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     server.run()?;
 
     Ok(())
-}
-
-/// Recursively find all sessions under a directory.
-/// Returns session names relative to the socket root directory.
-fn find_sessions(base: &std::path::Path, prefix: &str) -> io::Result<Vec<String>> {
-    let mut sessions = Vec::new();
-    if !base.exists() {
-        return Ok(sessions);
-    }
-
-    for entry in std::fs::read_dir(base)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = match entry.file_name().to_str() {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        // Skip the socket file itself
-        if name == SOCKET_FILENAME {
-            continue;
-        }
-
-        if path.is_dir() {
-            let full_name = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", prefix, name)
-            };
-
-            // Check if this directory has a socket (is a session)
-            let sock = path.join(SOCKET_FILENAME);
-            if sock.exists() {
-                let meta = std::fs::metadata(&sock)?;
-                if meta.file_type().is_socket() {
-                    sessions.push(full_name.clone());
-                }
-            }
-
-            // Recurse into subdirectories for child sessions
-            let children = find_sessions(&path, &full_name)?;
-            sessions.extend(children);
-        }
-    }
-
-    Ok(sessions)
 }
 
 fn cmd_list(args: &[String]) -> io::Result<()> {
