@@ -13,6 +13,73 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Return true when `cmd` resolves to the zsh executable.
+fn is_zsh(cmd: &str) -> bool {
+    Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == "zsh")
+        .unwrap_or(false)
+}
+
+/// Create a ZDOTDIR shim directory for the given session.
+///
+/// The shim intercepts `.zshenv` and `.zshrc` loading transparently:
+///
+/// - `.zshenv` forwards to the user's original `.zshenv`
+/// - `.zshrc` unsets ZDOTDIR (so child shells behave normally), forwards to
+///   the user's original `.zshrc`, then installs a `precmd` hook that sources
+///   `$PTERM_ENV_FILE` before each prompt.
+///
+/// Returns the path to the created zdotdir directory.
+fn setup_zsh_zdotdir(sess_dir: &Path) -> io::Result<std::path::PathBuf> {
+    let zdotdir = sess_dir.join("zdotdir");
+    std::fs::create_dir_all(&zdotdir)?;
+
+    // Resolve the user's original dotfile directory (ZDOTDIR or HOME).
+    let orig = std::env::var("ZDOTDIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "~".to_string());
+
+    // Single-quote a path for safe shell embedding.
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let orig_q = q(&orig);
+
+    let zshenv = format!(
+        "# pterm: forward to original .zshenv\n\
+         [[ -f {orig}/.zshenv ]] && builtin source {orig}/.zshenv\n",
+        orig = orig_q,
+    );
+
+    let zshrc = format!(
+        "# pterm: restore ZDOTDIR for child shells and forward to original .zshrc\n\
+         unset ZDOTDIR\n\
+         [[ -f {orig}/.zshrc ]] && builtin source {orig}/.zshrc\n\
+         # Install pterm env-sync hook (no-op when PTERM_ENV_FILE is unset)\n\
+         if [[ -n ${{PTERM_ENV_FILE:-}} ]]; then\n\
+           autoload -Uz add-zsh-hook 2>/dev/null\n\
+           _pterm_precmd() {{ [[ -r $PTERM_ENV_FILE ]] && builtin source $PTERM_ENV_FILE; }}\n\
+           add-zsh-hook precmd _pterm_precmd\n\
+         fi\n",
+        orig = orig_q,
+    );
+
+    std::fs::write(zdotdir.join(".zshenv"), zshenv.as_bytes())?;
+    std::fs::write(zdotdir.join(".zshrc"), zshrc.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in &[".zshenv", ".zshrc"] {
+            std::fs::set_permissions(zdotdir.join(name), std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    Ok(zdotdir)
+}
+
 fn print_usage() {
     eprintln!(
         "pterm - persistent terminal daemon
@@ -141,11 +208,29 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     let cmd = &cmd_args[0];
     let str_args: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
 
-    // Inject PTERM_ENV_FILE so the shell can source per-session env overrides
-    // pushed by Neovim at attach time.
+    // Always inject PTERM_ENV_FILE so the shell knows where Neovim's env
+    // overrides are written on each attach.
     let env_file = sess_dir.join("env.sh");
     let env_file_str = env_file.to_string_lossy().into_owned();
-    let extra_env = [("PTERM_ENV_FILE", env_file_str.as_str())];
+
+    // For zsh: create a ZDOTDIR shim that installs the precmd hook
+    // automatically.  Users do not need to modify their .zshrc.
+    let zdotdir_str: Option<String> = if is_zsh(cmd) {
+        match setup_zsh_zdotdir(&sess_dir) {
+            Ok(p) => Some(p.to_string_lossy().into_owned()),
+            Err(e) => {
+                log::warn!("Failed to set up zsh ZDOTDIR shim: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut extra_env: Vec<(&str, &str)> = vec![("PTERM_ENV_FILE", &env_file_str)];
+    if let Some(ref zd) = zdotdir_str {
+        extra_env.push(("ZDOTDIR", zd.as_str()));
+    }
 
     let session = Session::new(session_name, cmd, &str_args, &extra_env)?;
     let mut server = Server::new(&sess_dir, session)?;
