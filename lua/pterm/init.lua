@@ -9,7 +9,7 @@ M.config = {
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
-M.connections = {}
+local connections = {}
 
 --- Find the pterm binary.
 local function find_binary()
@@ -95,6 +95,10 @@ function M.list()
 	return sessions
 end
 
+function M.is_connected(session_name)
+	return connections[session_name] ~= nil
+end
+
 --- Kill a session.
 function M.kill(session_name)
 	if not session_name then
@@ -103,7 +107,7 @@ function M.kill(session_name)
 	end
 
 	-- Detach if connected
-	local conn = M.connections[session_name]
+	local conn = connections[session_name]
 	if conn then
 		M.detach(session_name)
 	end
@@ -111,6 +115,42 @@ function M.kill(session_name)
 	local bin = find_binary()
 	vim.fn.system({ bin, "kill", session_name })
 	vim.notify("Killed session: " .. session_name, vim.log.levels.INFO)
+end
+
+local function augroup_name(session_name)
+	return "pterm_" .. session_name:gsub("/", "_")
+end
+
+local function teardown_connection(session_name, opts)
+	opts = opts or {}
+
+	local conn = connections[session_name]
+	if not conn then
+		return
+	end
+
+	connections[session_name] = nil
+
+	if opts.stop_job ~= false and conn.job_id then
+		pcall(vim.fn.jobstop, conn.job_id)
+	end
+
+	pcall(function()
+		vim.api.nvim_del_augroup_by_name(augroup_name(session_name))
+	end)
+
+	if conn.buf and vim.api.nvim_buf_is_valid(conn.buf) then
+		local buf = conn.buf
+		vim.schedule(function()
+			if vim.api.nvim_buf_is_valid(buf) then
+				pcall(vim.api.nvim_buf_delete, buf, { force = true })
+			end
+		end)
+	end
+
+	if opts.exit_code ~= nil then
+		vim.notify("Session '" .. session_name .. "' exited (" .. opts.exit_code .. ")", vim.log.levels.INFO)
+	end
 end
 
 --- Internal: create a terminal buffer and start a pterm bridge process.
@@ -146,10 +186,12 @@ local function start_terminal(session_name, cmd)
 		term = true,
 		on_exit = function(_, exit_code, _)
 			vim.schedule(function()
-				local conn = M.connections[session_name]
+				local conn = connections[session_name]
 				if conn and conn.job_id == job_id then
-					M.connections[session_name] = nil
-					vim.notify("Session '" .. session_name .. "' exited (" .. exit_code .. ")", vim.log.levels.INFO)
+					teardown_connection(session_name, {
+						stop_job = false,
+						exit_code = exit_code,
+					})
 				end
 			end)
 		end,
@@ -166,14 +208,13 @@ local function start_terminal(session_name, cmd)
 	vim.api.nvim_buf_set_name(buf, buf_name)
 
 	-- Store connection
-	M.connections[session_name] = {
+	connections[session_name] = {
 		buf = buf,
 		job_id = job_id,
 		session_name = session_name,
 	}
 
-	local augroup_name = "pterm_" .. session_name:gsub("/", "_")
-	local augroup = vim.api.nvim_create_augroup(augroup_name, { clear = true })
+	local augroup = vim.api.nvim_create_augroup(augroup_name(session_name), { clear = true })
 
 	-- Clean up on buffer delete.
 	-- BufDelete fires both when a buffer is truly deleted (:bdelete/:bwipeout)
@@ -188,7 +229,7 @@ local function start_terminal(session_name, cmd)
 				if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
 					return
 				end
-				M.detach(session_name)
+				teardown_connection(session_name)
 			end)
 		end,
 	})
@@ -198,7 +239,7 @@ local function start_terminal(session_name, cmd)
 	vim.api.nvim_create_autocmd("VimResized", {
 		group = augroup,
 		callback = function()
-			local conn = M.connections[session_name]
+			local conn = connections[session_name]
 			if not conn or not conn.job_id then
 				return
 			end
@@ -219,7 +260,7 @@ local function start_terminal(session_name, cmd)
 		vim.api.nvim_create_autocmd("WinResized", {
 			group = augroup,
 			callback = function()
-				local conn = M.connections[session_name]
+				local conn = connections[session_name]
 				if not conn or not conn.job_id then
 					return
 				end
@@ -253,16 +294,16 @@ function M.open(session_name, args)
 	end
 
 	-- Already connected?
-	if M.connections[session_name] then
+	if connections[session_name] then
 		-- Switch to existing buffer
-		local conn = M.connections[session_name]
+		local conn = connections[session_name]
 		if vim.api.nvim_buf_is_valid(conn.buf) then
 			vim.api.nvim_set_current_buf(conn.buf)
 			vim.cmd("startinsert")
 			return
 		else
 			-- Buffer was closed, clean up
-			M.connections[session_name] = nil
+			connections[session_name] = nil
 		end
 	end
 
@@ -306,37 +347,11 @@ end
 
 --- Detach from a session (does not kill the daemon).
 function M.detach(session_name)
-	local conn = M.connections[session_name]
-	if not conn then
-		return
-	end
-
-	-- Remove from connections first to prevent re-entry from BufDelete autocmd
-	M.connections[session_name] = nil
-
-	if conn.job_id then
-		pcall(vim.fn.jobstop, conn.job_id)
-	end
-
-	pcall(function()
-		vim.api.nvim_del_augroup_by_name("pterm_" .. session_name:gsub("/", "_"))
-	end)
-
-	-- Wipe the associated buffer so it doesn't remain in the buffer list
-	-- and doesn't block re-attach.  Use vim.schedule to defer the wipe so
-	-- it never runs inside a BufDelete handler (which causes E937).
-	if conn.buf and vim.api.nvim_buf_is_valid(conn.buf) then
-		local b = conn.buf
-		vim.schedule(function()
-			if vim.api.nvim_buf_is_valid(b) then
-				pcall(vim.api.nvim_buf_delete, b, { force = true })
-			end
-		end)
-	end
+	teardown_connection(session_name)
 end
 
 --- Redraw a session (resend terminal snapshot via the daemon).
---- Stateless: no buffer or window changes. The daemon sends a SCROLLBACK
+--- Stateless: no buffer or window changes. The daemon sends a STATE_SYNC
 --- message through the existing bridge, which writes it to Neovim's terminal.
 function M.redraw(session_name)
 	if not session_name then

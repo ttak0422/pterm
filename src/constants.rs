@@ -1,0 +1,2 @@
+pub const DEFAULT_TERMINAL_COLS: u16 = 80;
+pub const DEFAULT_TERMINAL_ROWS: u16 = 24;

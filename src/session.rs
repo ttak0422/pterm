@@ -1,3 +1,4 @@
+use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::pty::Pty;
 use std::collections::VecDeque;
 use std::io;
@@ -16,6 +17,14 @@ struct SessionCallbacks {
 impl SessionCallbacks {
     const MAX_PASSTHROUGH_SEQUENCES: usize = 256;
     const MAX_PASSTHROUGH_BYTES: usize = 16 * 1024;
+    // DEC private modes that are not fully reconstructed by
+    // `vt100::Screen::state_formatted()`, so snapshot replay needs to emit
+    // their original enable/disable sequences explicitly.
+    //
+    // - `?12`: cursor blink enable/disable
+    // - `?69`: DECLRMM (left/right margin mode)
+    // - `?1004`: focus in/out reporting
+    // - `?2026`: synchronized output mode
     const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 4] = [12, 69, 1004, 2026];
 
     fn default_da_params(params: &[&[u16]]) -> bool {
@@ -283,8 +292,8 @@ pub struct Session {
 impl Session {
     /// Create a new session with the given name and command.
     pub fn new(name: String, cmd: &str, args: &[&str]) -> io::Result<Self> {
-        let cols = 80;
-        let rows = 24;
+        let cols = DEFAULT_TERMINAL_COLS;
+        let rows = DEFAULT_TERMINAL_ROWS;
         let pty = Pty::spawn(cmd, args, cols, rows)?;
         Ok(Self {
             name,
@@ -329,8 +338,8 @@ impl Session {
                     ));
                 }
                 Ok(n) => written += n,
-                Err(e) if e == nix::errno::Errno::EINTR => continue,
-                Err(e) if e == nix::errno::Errno::EAGAIN => {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::EAGAIN) => {
                     std::thread::yield_now();
                 }
                 Err(e) => return Err(io::Error::other(e)),
@@ -386,11 +395,16 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{build_snapshot, SessionCallbacks};
+    use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 
     #[test]
     fn snapshot_preserves_unhandled_osc_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -402,8 +416,12 @@ mod tests {
 
     #[test]
     fn handled_sgr_is_not_added_to_passthrough_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[31mRED\x1b[m");
 
         assert!(parser.callbacks().passthrough_sequences.is_empty());
@@ -413,8 +431,12 @@ mod tests {
     fn snapshot_preserves_decscusr_cursor_shape() {
         // Vim emits DECSCUSR when switching modes (e.g. ESC[6 q for bar cursor
         // in insert mode, ESC[2 q for block in normal mode).
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[6 q");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -429,8 +451,12 @@ mod tests {
     #[test]
     fn snapshot_preserves_cursor_blink_mode() {
         // AT&T 610: ESC[?12l disables cursor blink, ESC[?12h enables it.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?12l");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -445,8 +471,12 @@ mod tests {
     #[test]
     fn snapshot_preserves_declrmm() {
         // DECLRMM: ESC[?69h enables left-right margin mode.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?69h");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -460,8 +490,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_focus_tracking_and_synchronized_output() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?1004h\x1b[?2026h");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -473,8 +507,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_kitty_keyboard_protocol_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         let mut screen = parser.screen().clone();
         let gt_params = [1u16];
         let eq_params = [5u16];
@@ -511,8 +549,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_unhandled_sgr_subparams() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[4:3m\x1b[58:2:1:2:3m");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -524,8 +566,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_osc_52_clipboard_copy() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b]52;c;SGVsbG8=\x1b\\");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -536,8 +582,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_non_title_csi_t_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[14t\x1b[16t\x1b[18t");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -552,8 +602,12 @@ mod tests {
     fn snapshot_preserves_window_title_stack() {
         // Vim saves the original title on entry with ESC[22;0t, then sets its
         // own title. On exit it restores with ESC[23;0t.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
 
         // Set initial title, save it, then set a new title (Vim's title)
         parser.process(b"\x1b]2;original\x1b\\");
@@ -593,8 +647,12 @@ mod tests {
     #[test]
     fn window_title_restore_pops_stack() {
         // ESC[23;0t restores the previously saved title.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
 
         parser.process(b"\x1b]2;original\x1b\\");
         parser.process(b"\x1b[22;0t");
@@ -617,14 +675,18 @@ mod tests {
         // DECSCUSR must appear after state_formatted() output so it is not
         // overwritten by the cursor-positioning sequences that state_formatted()
         // emits at the end.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[6 q");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
 
         // state_formatted() ends with a cursor-position sequence (ESC[...H or
-        // similar).  Find DECSCUSR and the last ESC occurrence before it to
+        // similar). Find DECSCUSR and the last ESC occurrence before it to
         // confirm ordering.
         let decscusr_pos = snapshot
             .windows(5)

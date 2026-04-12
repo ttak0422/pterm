@@ -58,8 +58,9 @@ Responsibilities:
 Key behavior:
 
 - `:Pterm <name>`:
-1. if session socket exists, attach
-2. else run `pterm new <name>` and wait for socket, then attach
+1. if the session is already connected in the current Neovim instance, jump to its buffer
+2. otherwise run `pterm open <name>` in a terminal buffer
+3. `pterm open` attaches if the session exists, or creates it and then attaches in one process
 
 - attach uses a fresh buffer because `jobstart(..., { term = true })` requires an unmodified current buffer.
 - closing/deleting the pterm buffer detaches only; it does not kill the daemon session.
@@ -87,7 +88,7 @@ Notable behavior:
 Responsibilities:
 
 - stdin -> daemon `INPUT`
-- daemon `OUTPUT/SCROLLBACK` -> stdout
+- daemon `OUTPUT/STATE_SYNC` -> stdout
 - resize propagation (`SIGWINCH` -> daemon `RESIZE`)
 
 Implementation notes:
@@ -96,7 +97,7 @@ Implementation notes:
 - raw mode guard for terminal settings restoration
 - framed protocol parsing with buffered partial-frame handling
 - `EINTR` on `poll` is retried
-- **output batching**: accumulates OUTPUT and SCROLLBACK payloads per poll cycle into a single `write_all_raw()` call to prevent incremental rendering on the Neovim side
+- **output batching**: accumulates OUTPUT and STATE_SYNC payloads per poll cycle into a single `write_all_raw()` call to prevent incremental rendering on the Neovim side
 
 ## Wire Protocol
 
@@ -117,7 +118,7 @@ Daemon -> client:
 
 - `OUTPUT` (`0x01`): raw PTY output bytes
 - `EXIT` (`0x02`): `exit_code:i32`
-- `SCROLLBACK` (`0x80`): terminal state snapshot on attach (via `vt100::Screen::state_formatted`)
+- `STATE_SYNC` (`0x80`): terminal state snapshot on attach/redraw; built from `vt100::Screen::state_formatted()` plus replayed terminal metadata such as passthrough control sequences and window-title state
 
 ## Socket and Session Layout
 
