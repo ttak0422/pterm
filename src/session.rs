@@ -166,6 +166,15 @@ impl SessionCallbacks {
         seq
     }
 
+    fn is_passthrough_osc(params: &[&[u8]]) -> bool {
+        // OSC queries like `OSC 10 ; ? ST`, `OSC 11 ; ? ST`, or
+        // `OSC 4 ; index ; ? ST` ask the attached terminal for runtime
+        // information. Replaying them from a snapshot would trigger a fresh
+        // query against the client terminal, and its reply can then be
+        // forwarded into the PTY as if it were user input.
+        !params.last().is_some_and(|param| *param == b"?")
+    }
+
     fn format_clipboard_copy(screen: &[u8], data: &[u8]) -> Vec<u8> {
         let mut seq = Vec::with_capacity(8 + screen.len() + data.len());
         seq.extend_from_slice(b"\x1b]52;");
@@ -274,7 +283,9 @@ impl vt100::Callbacks for SessionCallbacks {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        self.push_passthrough_sequence(Self::format_unhandled_osc(params));
+        if Self::is_passthrough_osc(params) {
+            self.push_passthrough_sequence(Self::format_unhandled_osc(params));
+        }
     }
 
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
@@ -412,6 +423,24 @@ mod tests {
 
         assert!(snapshot.contains("\x1b]8;;https://example.com\x1b\\"));
         assert!(snapshot.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn snapshot_drops_osc_color_queries() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
+        parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot = String::from_utf8_lossy(&snapshot);
+
+        assert!(!snapshot.contains("\x1b]10;?\x1b\\"));
+        assert!(!snapshot.contains("\x1b]11;?\x1b\\"));
+        assert!(!snapshot.contains("\x1b]4;1;?\x1b\\"));
     }
 
     #[test]
