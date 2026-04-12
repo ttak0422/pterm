@@ -35,6 +35,11 @@ pub struct Server {
     pending_pty_output: Vec<u8>,
     /// `true` after the EXIT message has been broadcast to clients.
     exit_sent: bool,
+    /// Per-client env payloads received via SET_ENV.
+    client_envs: HashMap<usize, Vec<u8>>,
+    /// ID of the client whose env vars are currently written to env_file_path.
+    /// Switches to a different client when that client sends the first INPUT.
+    active_env_client: Option<usize>,
 }
 
 impl Server {
@@ -77,6 +82,8 @@ impl Server {
             next_client_id: 0,
             pending_pty_output: Vec::new(),
             exit_sent: false,
+            client_envs: HashMap::new(),
+            active_env_client: None,
         })
     }
 
@@ -121,13 +128,13 @@ impl Server {
                         if event.is_readable() {
                             if let Err(e) = self.handle_client_data(id, &mut client_buf) {
                                 log::warn!("Client {} read error: {}", id, e);
-                                self.clients.remove(&id);
+                                self.remove_client(id);
                             }
                         }
                         if event.is_writable() {
                             if let Err(e) = self.flush_client_send_buf(id) {
                                 log::warn!("Client {} write error: {}", id, e);
-                                self.clients.remove(&id);
+                                self.remove_client(id);
                             }
                         }
                     }
@@ -310,7 +317,7 @@ impl Server {
         }
         for id in disconnected {
             log::info!("Client {} disconnected", id);
-            self.clients.remove(&id);
+            self.remove_client(id);
         }
     }
 
@@ -370,7 +377,7 @@ impl Server {
         }
         for id in disconnected {
             log::info!("Client {} disconnected during flush", id);
-            self.clients.remove(&id);
+            self.remove_client(id);
         }
     }
 
@@ -393,7 +400,7 @@ impl Server {
 
         if remove {
             log::info!("Client {} disconnected", client_id);
-            self.clients.remove(&client_id);
+            self.remove_client(client_id);
         } else if let Some(client) = self.clients.get_mut(&client_id) {
             if !client.recv_buf.is_empty() {
                 // Flush pending PTY output so the vt state is current before
@@ -420,6 +427,28 @@ impl Server {
             match frame.msg_type {
                 proto::client::INPUT => {
                     self.session.write_pty(&frame.payload)?;
+                    // Switch active env client when input arrives from a
+                    // different client than the current one.  This ensures
+                    // env.sh always reflects the Neovim that the user is
+                    // actively typing in, even when multiple clients are
+                    // simultaneously attached to the same session.
+                    if self.active_env_client != Some(client_id) {
+                        if let Some(env_payload) = self.client_envs.get(&client_id).cloned() {
+                            match self.write_env_file(&env_payload) {
+                                Ok(()) => {
+                                    log::info!(
+                                        "Active env client: {:?} → {}",
+                                        self.active_env_client,
+                                        client_id
+                                    );
+                                    self.active_env_client = Some(client_id);
+                                }
+                                Err(e) => {
+                                    log::warn!("Client {} env switch failed: {}", client_id, e)
+                                }
+                            }
+                        }
+                    }
                 }
                 proto::client::RESIZE => {
                     let (cols, rows) = match proto::parse_resize(&frame.payload) {
@@ -444,8 +473,18 @@ impl Server {
                 }
                 proto::client::DETACH => {}
                 proto::client::SET_ENV => {
-                    if let Err(e) = self.write_env_file(&frame.payload) {
-                        log::warn!("Client {} SET_ENV error: {}", client_id, e);
+                    self.client_envs.insert(client_id, frame.payload.clone());
+                    // Write env.sh immediately only when this client is already
+                    // the active one, or when no active client exists yet (first
+                    // attach, or after the previous active client disconnected).
+                    if self.active_env_client.is_none() || self.active_env_client == Some(client_id)
+                    {
+                        match self.write_env_file(&frame.payload) {
+                            Ok(()) => self.active_env_client = Some(client_id),
+                            Err(e) => {
+                                log::warn!("Client {} SET_ENV error: {}", client_id, e)
+                            }
+                        }
                     }
                 }
                 proto::client::REDRAW => {
@@ -465,6 +504,34 @@ impl Server {
             client.recv_buf = recv_buf;
         }
         Ok(flush_all)
+    }
+
+    /// Remove a client from all tracking structures.
+    ///
+    /// When the active env client disconnects, fall back to another connected
+    /// client (if any) so env.sh stays up to date.
+    fn remove_client(&mut self, client_id: usize) {
+        self.clients.remove(&client_id);
+        self.client_envs.remove(&client_id);
+
+        if self.active_env_client == Some(client_id) {
+            self.active_env_client = None;
+            // Fall back to an arbitrary remaining client.
+            if let Some((&other_id, payload)) = self.client_envs.iter().next() {
+                let payload = payload.clone();
+                match self.write_env_file(&payload) {
+                    Ok(()) => {
+                        log::info!(
+                            "Active env client fell back to {} after {} disconnected",
+                            other_id,
+                            client_id
+                        );
+                        self.active_env_client = Some(other_id);
+                    }
+                    Err(e) => log::warn!("Env fallback write error: {}", e),
+                }
+            }
+        }
     }
 
     /// Write per-session env file from a SET_ENV JSON payload.
