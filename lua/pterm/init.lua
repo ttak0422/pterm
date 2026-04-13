@@ -6,10 +6,13 @@ M.config = {
 	shell = vim.env.SHELL or "/bin/sh",
 	-- Socket directory (nil = let daemon decide)
 	socket_dir = nil,
+	auto_redraw = true,
+	auto_redraw_delay_ms = 50,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
 local connections = {}
+local redraw_timers = {}
 
 --- Find the pterm binary.
 local function find_binary()
@@ -129,6 +132,13 @@ local function teardown_connection(session_name, opts)
 		return
 	end
 
+	local timer = redraw_timers[session_name]
+	if timer then
+		timer:stop()
+		timer:close()
+		redraw_timers[session_name] = nil
+	end
+
 	connections[session_name] = nil
 
 	if opts.stop_job ~= false and conn.job_id then
@@ -151,6 +161,35 @@ local function teardown_connection(session_name, opts)
 	if opts.exit_code ~= nil then
 		vim.notify("Session '" .. session_name .. "' exited (" .. opts.exit_code .. ")", vim.log.levels.INFO)
 	end
+end
+
+local function schedule_redraw(session_name, delay_ms)
+	if not M.config.auto_redraw then
+		return
+	end
+	delay_ms = delay_ms or M.config.auto_redraw_delay_ms
+	local existing = redraw_timers[session_name]
+	if existing then
+		existing:stop()
+		existing:close()
+		redraw_timers[session_name] = nil
+	end
+	local timer = vim.uv.new_timer()
+	redraw_timers[session_name] = timer
+	timer:start(
+		delay_ms,
+		0,
+		vim.schedule_wrap(function()
+			timer:stop()
+			timer:close()
+			redraw_timers[session_name] = nil
+			local conn = connections[session_name]
+			if conn and conn.job_id then
+				local bin = find_binary()
+				vim.fn.jobstart({ bin, "redraw", session_name })
+			end
+		end)
+	)
 end
 
 --- Internal: create a terminal buffer and start a pterm bridge process.
@@ -276,6 +315,22 @@ local function start_terminal(session_name, cmd)
 			end,
 		})
 	end
+
+	vim.api.nvim_create_autocmd("BufEnter", {
+		group = augroup,
+		buffer = buf,
+		callback = function()
+			schedule_redraw(session_name)
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("TermEnter", {
+		group = augroup,
+		buffer = buf,
+		callback = function()
+			schedule_redraw(session_name)
+		end,
+	})
 
 	vim.cmd("startinsert")
 end
