@@ -7,7 +7,7 @@ M.config = {
 	-- Socket directory (nil = let daemon decide)
 	socket_dir = nil,
 	auto_redraw = true,
-	auto_redraw_delay_ms = 50,
+	auto_redraw_delay_ms = 1000,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
