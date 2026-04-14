@@ -13,9 +13,14 @@ M.config = {
 --- Active connections: session_name -> { buf, job_id, session_name }
 local connections = {}
 local redraw_timers = {}
+local cached_binary = nil
 
---- Find the pterm binary.
+--- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
+	if cached_binary then
+		return cached_binary
+	end
+
 	-- Look relative to plugin root directory (lua/pterm/init.lua -> repo root)
 	local script_path = debug.getinfo(1, "S").source:sub(2)
 	local repo_root = vim.fn.fnamemodify(script_path, ":h:h:h")
@@ -23,18 +28,21 @@ local function find_binary()
 	-- Prefer release build in development worktrees.
 	local release_bin = repo_root .. "/target/release/pterm"
 	if vim.fn.executable(release_bin) == 1 then
-		return release_bin
+		cached_binary = release_bin
+		return cached_binary
 	end
 
 	-- Nix build output
 	local nix_bin = repo_root .. "/result/bin/pterm"
 	if vim.fn.executable(nix_bin) == 1 then
-		return nix_bin
+		cached_binary = nix_bin
+		return cached_binary
 	end
 
 	-- Fall back to PATH
 	if vim.fn.executable("pterm") == 1 then
-		return "pterm"
+		cached_binary = "pterm"
+		return cached_binary
 	end
 
 	error("pterm binary not found. Install pterm with Nix or build it in this repository.")
@@ -180,9 +188,12 @@ local function schedule_redraw(session_name, delay_ms)
 		delay_ms,
 		0,
 		vim.schedule_wrap(function()
+			if redraw_timers[session_name] ~= timer then
+				return
+			end
+			redraw_timers[session_name] = nil
 			timer:stop()
 			timer:close()
-			redraw_timers[session_name] = nil
 			local conn = connections[session_name]
 			if conn and conn.job_id then
 				local bin = find_binary()
