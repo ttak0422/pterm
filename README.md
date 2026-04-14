@@ -88,6 +88,11 @@ require("pterm").setup({
   shell = vim.env.SHELL or "/bin/sh",
   -- Socket directory (nil = let daemon decide)
   socket_dir = nil,
+  -- Automatically redraw on BufEnter / TermEnter to recover from rendering
+  -- corruption that can occur during mode or window focus switches.
+  auto_redraw = true,
+  -- Debounce delay in milliseconds for automatic redraws.
+  auto_redraw_delay_ms = 1000,
 })
 ```
 
