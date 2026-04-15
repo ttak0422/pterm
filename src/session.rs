@@ -1,6 +1,7 @@
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::pty::Pty;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io;
 use std::os::fd::AsRawFd;
 
@@ -84,9 +85,12 @@ impl SessionCallbacks {
             return;
         }
 
-        self.passthrough_bytes += seq.len();
+        let incoming_len = seq.len();
+        self.passthrough_bytes += incoming_len;
         self.passthrough_sequences.push_back(seq);
 
+        let mut dropped_sequences = 0usize;
+        let mut dropped_bytes = 0usize;
         while self.passthrough_sequences.len() > Self::MAX_PASSTHROUGH_SEQUENCES
             || self.passthrough_bytes > Self::MAX_PASSTHROUGH_BYTES
         {
@@ -94,7 +98,22 @@ impl SessionCallbacks {
                 .passthrough_sequences
                 .pop_front()
                 .expect("passthrough sequence queue should not be empty");
+            dropped_sequences += 1;
+            dropped_bytes += removed.len();
             self.passthrough_bytes -= removed.len();
+        }
+
+        if dropped_sequences > 0 {
+            log::warn!(
+                "Dropped {} passthrough sequence(s) totaling {} bytes after enqueueing {} bytes; queue now holds {} sequence(s) / {} bytes (limits: {} sequence(s) / {} bytes)",
+                dropped_sequences,
+                dropped_bytes,
+                incoming_len,
+                self.passthrough_sequences.len(),
+                self.passthrough_bytes,
+                Self::MAX_PASSTHROUGH_SEQUENCES,
+                Self::MAX_PASSTHROUGH_BYTES
+            );
         }
     }
 
@@ -184,6 +203,17 @@ impl SessionCallbacks {
         seq.extend_from_slice(b"\x1b\\");
         seq
     }
+
+    fn format_bytes_hex(bytes: &[u8]) -> String {
+        let mut formatted = String::with_capacity(bytes.len().saturating_mul(3));
+        for (idx, byte) in bytes.iter().enumerate() {
+            if idx > 0 {
+                formatted.push(' ');
+            }
+            let _ = write!(&mut formatted, "{:02x}", byte);
+        }
+        formatted
+    }
 }
 
 fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u8> {
@@ -266,6 +296,13 @@ impl vt100::Callbacks for SessionCallbacks {
         }
 
         if c != 'c' || i2.is_some() || !Self::default_da_params(params) {
+            if log::log_enabled!(log::Level::Debug) {
+                let seq = Self::format_unhandled_csi(i1, i2, params, c);
+                log::debug!(
+                    "Dropping unhandled CSI sequence from snapshot replay path: {}",
+                    Self::format_bytes_hex(&seq)
+                );
+            }
             return;
         }
 
@@ -279,7 +316,12 @@ impl vt100::Callbacks for SessionCallbacks {
     }
 
     fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
-        self.push_passthrough_sequence(Self::format_unhandled_escape(i1, i2, b));
+        let seq = Self::format_unhandled_escape(i1, i2, b);
+        log::debug!(
+            "Preserving unhandled ESC sequence as passthrough: {}",
+            Self::format_bytes_hex(&seq)
+        );
+        self.push_passthrough_sequence(seq);
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {

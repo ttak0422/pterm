@@ -13,11 +13,14 @@ const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
 const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
+const DA_QUERY_WARN_THRESHOLD: usize = 2;
+const LARGE_SEND_BUF_WARN_BYTES: usize = 64 * 1024;
 
 struct Client {
     stream: UnixStream,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    large_send_buf_warned: bool,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
 }
@@ -187,6 +190,7 @@ impl Server {
                             stream,
                             recv_buf: Vec::new(),
                             send_buf: Vec::new(),
+                            large_send_buf_warned: false,
                             pending_snapshot: true,
                         },
                     );
@@ -201,6 +205,28 @@ impl Server {
     /// Send the current terminal snapshot to a specific client and clear its
     /// pending-snapshot flag.
     fn send_snapshot_to_client(&mut self, client_id: usize) {
+        let buffered_pty_bytes = self.pending_pty_output.len();
+        let other_pending_snapshots = self
+            .clients
+            .iter()
+            .filter(|&(id, client)| *id != client_id && client.pending_snapshot)
+            .count();
+        let pending_send_clients = self
+            .clients
+            .values()
+            .filter(|client| !client.send_buf.is_empty())
+            .count();
+
+        if buffered_pty_bytes > 0 || other_pending_snapshots > 0 || pending_send_clients > 1 {
+            log::debug!(
+                "Client {} snapshot sent while {} PTY byte(s) are buffered, {} other client(s) still await snapshot, and {} client(s) have queued output",
+                client_id,
+                buffered_pty_bytes,
+                other_pending_snapshots,
+                pending_send_clients
+            );
+        }
+
         let snapshot = self.session.snapshot();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
@@ -239,6 +265,18 @@ impl Server {
         }
 
         let (pending_da1, pending_da2) = self.session.take_pending_da_queries();
+        let total_pending_da = pending_da1 + pending_da2;
+        if !self.clients.is_empty()
+            && (total_pending_da > DA_QUERY_WARN_THRESHOLD
+                || (self.clients.len() > 1 && total_pending_da > 0))
+        {
+            log::warn!(
+                "Observed pending device-attribute queries while {} client(s) are attached (DA1={}, DA2={}); terminal replies will be routed via client INPUT and may be duplicated or misdirected",
+                self.clients.len(),
+                pending_da1,
+                pending_da2
+            );
+        }
         if self.clients.is_empty() {
             for _ in 0..pending_da1 {
                 if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
@@ -349,6 +387,19 @@ impl Server {
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e),
                 }
+            }
+
+            if client.send_buf.len() >= LARGE_SEND_BUF_WARN_BYTES {
+                if !client.large_send_buf_warned {
+                    log::warn!(
+                        "Client {} send buffer backlog reached {} bytes",
+                        client_id,
+                        client.send_buf.len()
+                    );
+                    client.large_send_buf_warned = true;
+                }
+            } else {
+                client.large_send_buf_warned = false;
             }
 
             !client.send_buf.is_empty()
