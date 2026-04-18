@@ -12,12 +12,18 @@ struct SessionCallbacks {
     pending_da1_queries: usize,
     pending_da2_queries: usize,
     cursor_shape: Option<u8>,
-    kitty_keyboard_flags: Option<u32>,
+    kitty_keyboard_state: KittyKeyboardState,
     focus_tracking: bool,
     synchronized_output: bool,
     hyperlink_uri: Option<String>,
     passthrough_sequences: VecDeque<Vec<u8>>,
     passthrough_bytes: usize,
+}
+
+#[derive(Default)]
+struct KittyKeyboardState {
+    flags: u32,
+    stack: Vec<u32>,
 }
 
 impl SessionCallbacks {
@@ -39,6 +45,14 @@ impl SessionCallbacks {
 
     fn first_param_u32(params: &[&[u16]]) -> Option<u32> {
         Self::first_param(params).map(u32::from)
+    }
+
+    fn param_u32(params: &[&[u16]], idx: usize) -> Option<u32> {
+        params
+            .get(idx)
+            .and_then(|param| param.first())
+            .copied()
+            .map(u32::from)
     }
 
     fn is_passthrough_private_mode(
@@ -238,12 +252,38 @@ impl SessionCallbacks {
 
     fn update_kitty_keyboard_state(&mut self, i1: Option<u8>, params: &[&[u16]]) -> bool {
         match i1 {
-            Some(b'>') | Some(b'=') => {
-                self.kitty_keyboard_flags = Some(Self::first_param_u32(params).unwrap_or(0));
+            Some(b'=') => {
+                let flags = Self::first_param_u32(params).unwrap_or(0);
+                let mode = Self::param_u32(params, 1).unwrap_or(1);
+                match mode {
+                    1 => self.kitty_keyboard_state.flags = flags,
+                    2 => self.kitty_keyboard_state.flags |= flags,
+                    3 => self.kitty_keyboard_state.flags &= !flags,
+                    _ => return false,
+                }
+                true
+            }
+            Some(b'>') => {
+                self.kitty_keyboard_state
+                    .stack
+                    .push(self.kitty_keyboard_state.flags);
+                self.kitty_keyboard_state.flags = Self::first_param_u32(params).unwrap_or(0);
                 true
             }
             Some(b'<') => {
-                self.kitty_keyboard_flags = None;
+                let count = match Self::first_param_u32(params) {
+                    Some(0) | None => 1,
+                    Some(count) => count,
+                };
+                for _ in 0..count {
+                    match self.kitty_keyboard_state.stack.pop() {
+                        Some(flags) => self.kitty_keyboard_state.flags = flags,
+                        None => {
+                            self.kitty_keyboard_state.flags = 0;
+                            break;
+                        }
+                    }
+                }
                 true
             }
             _ => false,
@@ -314,12 +354,45 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
         snapshot.extend_from_slice(ps.to_string().as_bytes());
         snapshot.extend_from_slice(b" q");
     }
-    if let Some(flags) = callbacks.kitty_keyboard_flags {
+    callbacks
+        .kitty_keyboard_state
+        .append_snapshot(&mut snapshot);
+    snapshot
+}
+
+impl KittyKeyboardState {
+    fn append_snapshot(&self, snapshot: &mut Vec<u8>) {
+        if self.stack.is_empty() {
+            if self.flags != 0 {
+                Self::push_set_mode(snapshot, self.flags);
+            }
+            return;
+        }
+
+        let mut stack_iter = self.stack.iter().copied();
+        let first = stack_iter
+            .next()
+            .expect("kitty keyboard stack should be non-empty");
+        if first != 0 {
+            Self::push_set_mode(snapshot, first);
+        }
+        for flags in stack_iter {
+            Self::push_stack(snapshot, flags);
+        }
+        Self::push_stack(snapshot, self.flags);
+    }
+
+    fn push_set_mode(snapshot: &mut Vec<u8>, flags: u32) {
+        snapshot.extend_from_slice(b"\x1b[=");
+        snapshot.extend_from_slice(flags.to_string().as_bytes());
+        snapshot.extend_from_slice(b";1u");
+    }
+
+    fn push_stack(snapshot: &mut Vec<u8>, flags: u32) {
         snapshot.extend_from_slice(b"\x1b[>");
         snapshot.extend_from_slice(flags.to_string().as_bytes());
         snapshot.extend_from_slice(b"u");
     }
-    snapshot
 }
 
 impl vt100::Callbacks for SessionCallbacks {
@@ -734,23 +807,57 @@ mod tests {
         assert!(!snapshot_str.contains("\x1b[>1u"));
         assert!(!snapshot_str.contains("\x1b[=5u"));
         assert!(!snapshot_str.contains("\x1b[<u"));
-        assert_eq!(parser.callbacks().kitty_keyboard_flags, None);
+        assert_eq!(parser.callbacks().kitty_keyboard_state.flags, 0);
+        assert!(parser.callbacks().kitty_keyboard_state.stack.is_empty());
         assert_eq!(parser.callbacks().pending_da2_queries, 0);
     }
 
     #[test]
-    fn snapshot_replays_latest_kitty_keyboard_flags() {
+    fn snapshot_replays_kitty_keyboard_stack_and_current_flags() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
         parser.process(b"\x1b[=3u\x1b[>7u");
 
-        assert_eq!(parser.callbacks().kitty_keyboard_flags, Some(7));
+        assert_eq!(parser.callbacks().kitty_keyboard_state.flags, 7);
+        assert_eq!(parser.callbacks().kitty_keyboard_state.stack, vec![3]);
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot_str = String::from_utf8_lossy(&snapshot);
 
         assert!(snapshot_str.contains("\x1b[>7u"));
-        assert!(!snapshot_str.contains("\x1b[=3u"));
+        assert!(snapshot_str.contains("\x1b[=3;1u"));
+    }
+
+    #[test]
+    fn kitty_keyboard_enhancement_modes_update_current_flags() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[=3u\x1b[=4;2u\x1b[=1;3u");
+
+        assert_eq!(parser.callbacks().kitty_keyboard_state.flags, 6);
+        assert!(parser.callbacks().kitty_keyboard_state.stack.is_empty());
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[=6;1u"));
+    }
+
+    #[test]
+    fn kitty_keyboard_pop_restores_previous_flags() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[=3u\x1b[>7u\x1b[>0u\x1b[<u");
+
+        assert_eq!(parser.callbacks().kitty_keyboard_state.flags, 7);
+        assert_eq!(parser.callbacks().kitty_keyboard_state.stack, vec![3]);
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[=3;1u"));
+        assert!(snapshot_str.contains("\x1b[>7u"));
+        assert!(!snapshot_str.contains("\x1b[>0u"));
     }
 
     #[test]
