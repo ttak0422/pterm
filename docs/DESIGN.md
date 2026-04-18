@@ -5,7 +5,7 @@
 pterm provides persistent terminal sessions for Neovim.
 
 - `pterm new` starts a background daemon that owns a PTY + child process.
-- Neovim uses `jobstart({"pterm", "attach", name}, { term = true })` to attach.
+- Neovim normally uses `jobstart({"pterm", "open", name}, { term = true })` so create+attach happens in one process without a create/attach race.
 - `pterm attach` is a bridge process between Neovim terminal PTY and daemon socket.
 
 This architecture keeps process/session persistence in Rust while letting libvterm handle rendering natively.
@@ -16,7 +16,7 @@ This architecture keeps process/session persistence in Rust while letting libvte
 ┌─ Neovim ───────────────────────────────────────────┐
 │ Lua plugin                                         │
 │ ├─ :Pterm creates/fetches session                  │
-│ └─ jobstart({"pterm","attach",name},{term=true})   │
+│ └─ jobstart({"pterm","open",name},{term=true})     │
 └───────────────────┬────────────────────────────────┘
                     │ terminal PTY (owned by Neovim)
                     ▼
@@ -61,6 +61,7 @@ Key behavior:
 1. if the session is already connected in the current Neovim instance, jump to its buffer
 2. otherwise run `pterm open <name>` in a terminal buffer
 3. `pterm open` attaches if the session exists, or creates it and then attaches in one process
+4. this single-process `open` path avoids the timing gap between daemon creation and bridge connection that previously caused wrong-size initial snapshots
 
 - attach uses a fresh buffer because `jobstart(..., { term = true })` requires an unmodified current buffer.
 - closing/deleting the pterm buffer detaches only; it does not kill the daemon session.
@@ -78,6 +79,7 @@ Notable behavior:
 
 - session socket path: `<socket_root>/<session>/socket`
 - if socket file is removed externally, daemon treats session as deleted and exits
+- a session has one PTY size at a time; the latest `RESIZE` received from any attached client becomes authoritative for all attached clients, and the daemon resends snapshots so everyone converges to that size
 - output delivery uses per-client send queues and writable polling to avoid disconnecting on backpressure (`WouldBlock`)
 - **snapshot delivery**: no timer-based deferral; snapshot is sent either when the client sends RESIZE (correct dimensions) or when the first PTY OUTPUT arrives (current dimensions as fallback). Clients that receive a snapshot are excluded from the same flush cycle's OUTPUT broadcast to prevent duplicate rendering (the snapshot already reflects the effect of those bytes)
 - **drain-and-flush**: PTY output uses non-blocking drain (reads until `WouldBlock`) followed by immediate flush — no timer-based micro-batching, minimizing latency while naturally coalescing bytes available at each poll cycle
@@ -97,6 +99,7 @@ Implementation notes:
 - raw mode guard for terminal settings restoration
 - framed protocol parsing with buffered partial-frame handling
 - `EINTR` on `poll` is retried
+- bridge is not a pure byte-for-byte relay: before replaying `STATE_SYNC` it injects terminal cleanup for keyboard protocol state, and on detach it emits cleanup sequences so the next shell prompt does not inherit TUI modes
 - **output batching**: accumulates OUTPUT and STATE_SYNC payloads per poll cycle into a single `write_all_raw()` call to prevent incremental rendering on the Neovim side
 
 ## Wire Protocol
@@ -140,6 +143,7 @@ Hierarchical sessions are represented by directories:
 - Detach (buffer close / job stop) does not delete session.
 - Session deletion is explicit via `pterm kill` / `:PtermKill`, or by removing the session socket file externally.
 - plugin code should not remove socket files automatically.
+- `pterm kill <parent>` removes the parent session directory recursively, so hierarchical children under that prefix are deleted too.
 
 ## Known Limitations / TODO
 
