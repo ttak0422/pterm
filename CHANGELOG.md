@@ -2,6 +2,108 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-04-18
+
+### Features
+
+- Auto-redraw on BufEnter/TermEnter to fix rendering corruption
+Register BufEnter and TermEnter autocmds on each pterm buffer so that
+  switching window focus or re-entering terminal mode automatically
+  triggers a redraw, recovering from rendering corruption caused by
+  mid-flight interruptions.
+
+  Debounce (50 ms default) avoids redundant redraws when both events fire
+  together. The feature is on by default and can be disabled via
+  `setup({ auto_redraw = false })`.
+- *(logging)* Add rendering corruption detection log points
+Adds targeted warn!/debug! calls to help correlate rendering glitches
+  with observable server-side events, without changing any behavior.
+
+  Detectable signals:
+  - warn: passthrough sequence dropped due to buffer overflow (>256 seqs /
+    >16 KiB); next snapshot will be missing those sequences
+  - warn: DA1/DA2 query pile-up while clients are attached; replies may be
+    duplicated or misdirected across multiple clients
+  - warn: client send buffer backlog exceeds 64 KiB; burst flush after
+    stall can cause visual tearing
+  - debug: snapshot sent while PTY bytes are still buffered (race window)
+  - debug: unhandled CSI dropped from snapshot replay path (hex dump)
+  - debug: unhandled ESC preserved as passthrough (hex dump)
+
+### Bug Fixes
+
+- Guard stale timer callback and cache binary path
+- Add identity check in schedule_redraw callback so that a stale timer
+    fired after being replaced cannot nil-out the newer timer's entry in
+    redraw_timers, fixing a debounce race condition with vim.schedule_wrap
+  - Cache the result of find_binary() so repeated BufEnter/TermEnter
+    events no longer pay the filesystem lookup cost each time
+- Replace stale-size snapshot on RESIZE to prevent dimension mismatch
+If a client sent RESIZE after the server had already queued a snapshot
+  (or queued raw OUTPUT frames), the bridge could replay bytes sized for
+  the old terminal dimensions into the newly-sized Neovim window, causing
+  rendering corruption.
+- DA always reply, resize broadcast, and structured terminal state
+Fix 1 — DA1/DA2 always reply (src/server.rs):
+  Daemon now answers pending DA1/DA2 queries regardless of client
+  attachment state. Previously queries were silently dropped while a
+  client was connected, causing applications that probe terminal identity
+  after attach or reset to hang.
+
+  Fix 2 — Multi-client resize broadcast (src/server.rs):
+  After RESIZE, replacement snapshots are now sent to ALL attached
+  clients (not only the resizing one), with replace_send_buf=true so
+  stale-size output frames are cleared for every client. Implements
+  last-write-wins: the most recent RESIZE is authoritative for all.
+
+  Fix 3 — Promote stateful sequences to structured state (src/session.rs):
+  Four long-lived terminal modes that previously survived reconnect only
+  via the bounded passthrough queue are now stored as explicit fields on
+  SessionCallbacks and reconstructed deterministically in build_snapshot():
+  - cursor_shape: Option<u8>  (DECSCUSR Ps value)
+  - kitty_keyboard_flags: Option<u32>  (CSI >/= Ps u; cleared by CSI < u)
+  - focus_tracking: bool  (DEC private mode 1004)
+  - synchronized_output: bool  (DEC private mode 2026)
+  - hyperlink_uri: Option<String>  (OSC 8 open URI)
+
+  Modes 1004 and 2026 removed from PASSTHROUGH_DEC_PRIVATE_MODES.
+  Tests added for kitty flag replay and open hyperlink replay.
+- Trigger auto redraw immediately
+- Move find_binary before trigger_redraw to fix nil call error
+trigger_redraw referenced find_binary before it was declared as a local,
+  causing Lua to resolve it as a global (nil). Exposed by PR #47 which added
+  an immediate trigger_redraw() call in schedule_redraw().
+
+### Documentation
+
+- Document auto_redraw options in README and CONFIGURATION.md
+- Add ADR-0001 for rendering corruption mitigations
+Records findings from Codex + Zellij source analysis:
+  - DONE: RESIZE stale-buffer fix (PR #43)
+  - DONE: corruption detection logging (PR #42)
+  - TODO-1 (high): multi-client resize contention — architecture decision needed
+  - TODO-2 (medium): DA1/DA2 always reply regardless of client attachment
+  - TODO-3 (medium): promote stateful sequences to explicit SessionCallbacks fields
+  - TODO-4 (low): passthrough overflow in high-OSC workloads — deferred
+  - TODO-5 (low): reconnect regression test coverage
+- *(adr)* Decide last-write-wins for multi-client resize
+On RESIZE, broadcast a replacement snapshot to all attached clients
+  (not only the resizing one) so every client stays aligned with the
+  new PTY dimensions.
+- *(adr)* Drop TODO-4 and TODO-5 from ADR-0001
+- *(adr)* Mark all TODOs as completed in ADR-0001
+- Refresh design notes for open flow
+
+### Miscellaneous Tasks
+
+- Increase default auto_redraw_delay_ms from 50 to 1000
+Rendering corruption does not occur within milliseconds of focus
+  changes, so a 1 second debounce is sufficient and avoids unnecessary
+  redraws during rapid window switching.
+- Remove harper-dictionary and add PR template
+- drop .harper-dictionary.txt (noise, not worth maintaining)
+  - add .github/pull_request_template.md: English-only, AI-filled checklist
+    (CHANGELOG is automated via git-cliff so excluded)
 ## [0.2.6] - 2026-04-11
 
 ### Bug Fixes
@@ -321,6 +423,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[1.0.0]: https://github.com/ttak0422/pterm/compare/v0.2.6..v1.0.0
 [0.2.6]: https://github.com/ttak0422/pterm/compare/v0.2.5..v0.2.6
 [0.2.5]: https://github.com/ttak0422/pterm/compare/v0.2.4..v0.2.5
 [0.2.4]: https://github.com/ttak0422/pterm/compare/v0.2.3..v0.2.4
