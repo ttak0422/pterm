@@ -34,24 +34,16 @@ On client attach/reconnect, `build_snapshot()` combines both layers and replays 
 
 ---
 
-### 🔴 TODO-1 — Multi-client resize contention
+### 🟡 TODO-1 — Multi-client resize contention
 
 **Severity**: High  
-**Status**: Architecture decision required — not yet implemented
+**Status**: Decided — not yet implemented
 
 **Problem**: The session has a single shared PTY. Any client's `RESIZE` changes the PTY dimensions for all clients. Only the resizing client receives a fresh replacement snapshot; other attached clients silently end up with a mismatched terminal size.
 
-**Options**:
+**Decision**: Last-write-wins. The most recent `RESIZE` from any client becomes the authoritative PTY size. All other attached clients receive a replacement snapshot at the new dimensions immediately after the resize.
 
-| Option | Trade-off |
-|--------|-----------|
-| A. Enforce single active display client per session | Simple; matches current real-world usage pattern |
-| B. Authoritative session size; additional clients are watch-only (read-only, no resize) | Allows monitoring from multiple terminals |
-| C. Per-client virtual canvas with server-side reflow | Highest fidelity; large implementation cost |
-
-**Recommended decision**: Option A — document and enforce single-display semantics. Reject or ignore `RESIZE` from a second client if one is already attached as a display client.
-
-**Files to change**: `src/server.rs` (RESIZE handler), `lua/pterm/init.lua` (attach guard), `docs/DESIGN.md`
+**Files to change**: `src/server.rs` (RESIZE handler — broadcast replacement snapshot to all clients, not only the resizing one)
 
 ---
 
