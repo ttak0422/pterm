@@ -86,41 +86,10 @@ Modes currently at risk:
 
 ---
 
-### 🟢 TODO-4 — Passthrough overflow in high-OSC workloads
-
-**Severity**: Low (normal Neovim editing), Medium (OSC-heavy apps)  
-**Status**: Logged but not structurally fixed
-
-**Problem**: The 256 seq / 16 KiB FIFO evicts oldest entries first. Normal Neovim editing is unlikely to overflow (cursor-shape changes, title updates, and focus events are sparse). However, terminal apps emitting frequent OSC 8 hyperlinks, OSC 52 clipboard writes, or desktop notifications (OSC 99) can realistically overflow.
-
-**Decision**: The logging added in PR #42 is sufficient for now. When TODO-3 promotes common modes to structured state, overflow risk shrinks naturally. Revisit limits after structured state work lands.
-
----
-
-### 🟢 TODO-5 — Reconnect regression test coverage
-
-**Severity**: Low  
-**Status**: Not yet added
-
-**Problem**: `vt100`'s `state_formatted()` correctness is assumed. If `vt100` mishandles a sequence internally (emits wrong output), neither the passthrough queue nor the logging catches it.
-
-**Decision**: Add integration-level reconnect tests for real Neovim workflows:
-- Alternate-screen enter/exit (Neovim startup/shutdown)
-- Cursor-shape transitions (normal ↔ insert mode)
-- Hyperlink open/close round-trip
-- Title push/pop stack
-- Resize-after-attach
-
-**Files to change**: `src/session.rs` (test module)
-
----
-
 ## Priority Order
 
 | # | TODO | Severity | Effort | Suggested PR |
 |---|------|----------|--------|--------------|
 | 1 | TODO-2: DA query reply | Medium | Small | Add to `fix/rendering-corruption` |
-| 2 | TODO-1: Multi-client resize | High | Medium | Separate PR after design confirmed |
+| 2 | TODO-1: Multi-client resize broadcast | High | Medium | Separate PR |
 | 3 | TODO-3: Structured state for top modes | Medium | Medium–Large | Separate PR per mode |
-| 4 | TODO-5: Reconnect regression tests | Low | Medium | Can accompany TODO-3 PRs |
-| 5 | TODO-4: Passthrough overflow | Low | Deferred | Revisit after TODO-3 |
