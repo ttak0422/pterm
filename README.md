@@ -91,7 +91,9 @@ require("pterm").setup({
   -- Automatically redraw on BufEnter / TermEnter to recover from rendering
   -- corruption that can occur during mode or window focus switches.
   auto_redraw = true,
-  -- Debounce delay in milliseconds for automatic redraws.
+  -- Cooldown window in milliseconds for automatic redraws. The first
+  -- BufEnter / TermEnter redraw fires immediately; repeated events are
+  -- suppressed until the cooldown expires.
   auto_redraw_delay_ms = 1000,
 })
 ```
