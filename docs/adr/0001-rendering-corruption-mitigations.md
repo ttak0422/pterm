@@ -1,6 +1,6 @@
 # ADR-0001: Rendering Corruption Mitigations
 
-**Status**: In Progress  
+**Status**: Completed  
 **Branch**: `fix/rendering-corruption`
 
 ---
@@ -34,7 +34,7 @@ On client attach/reconnect, `build_snapshot()` combines both layers and replays 
 
 ---
 
-### 🟡 TODO-1 — Multi-client resize contention
+### ✅ DONE — Multi-client resize contention (TODO-1)
 
 **Severity**: High  
 **Status**: Decided — not yet implemented
@@ -47,7 +47,7 @@ On client attach/reconnect, `build_snapshot()` combines both layers and replays 
 
 ---
 
-### 🟡 TODO-2 — DA1/DA2 queries unanswered while client is attached
+### ✅ DONE — DA1/DA2 queries unanswered while client is attached (TODO-2)
 
 **Severity**: Medium  
 **Status**: Not yet fixed
@@ -60,7 +60,7 @@ On client attach/reconnect, `build_snapshot()` combines both layers and replays 
 
 ---
 
-### 🟡 TODO-3 — Stateful sequences relying solely on passthrough replay
+### ✅ DONE — Stateful sequences relying solely on passthrough replay (TODO-3)
 
 **Severity**: Medium  
 **Status**: Ongoing / gradual improvement
