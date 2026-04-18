@@ -577,6 +577,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_relies_on_vt100_for_tracked_input_modes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(
+            b"\x1b[?25l\x1b[?2004h\x1b[?1002h\x1b[?1006h\
+              tracked by vt100",
+        );
+
+        assert!(
+            parser.callbacks().passthrough_sequences.is_empty(),
+            "vt100 handles cursor visibility, bracketed paste, and mouse modes"
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[?25l"));
+        assert!(snapshot_str.contains("\x1b[?2004h"));
+        assert!(snapshot_str.contains("\x1b[?1002h"));
+        assert!(snapshot_str.contains("\x1b[?1006h"));
+    }
+
+    #[test]
     fn snapshot_preserves_kitty_keyboard_protocol_sequences() {
         let mut parser = vt100::Parser::new_with_callbacks(
             DEFAULT_TERMINAL_ROWS,

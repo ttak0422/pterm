@@ -204,7 +204,12 @@ impl Server {
 
     /// Send the current terminal snapshot to a specific client and clear its
     /// pending-snapshot flag.
-    fn send_snapshot_to_client(&mut self, client_id: usize) {
+    ///
+    /// When `replace_send_buf` is `true`, any queued outbound bytes for that
+    /// client are dropped first. This is used on RESIZE so an older-size
+    /// snapshot or stale OUTPUT frame cannot remain queued ahead of the fresh
+    /// snapshot for the client's new dimensions.
+    fn send_snapshot_to_client(&mut self, client_id: usize, replace_send_buf: bool) {
         let buffered_pty_bytes = self.pending_pty_output.len();
         let other_pending_snapshots = self
             .clients
@@ -230,6 +235,9 @@ impl Server {
         let snapshot = self.session.snapshot();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
+            if replace_send_buf {
+                client.send_buf.clear();
+            }
             if !snapshot.is_empty() {
                 let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
                 client.send_buf.extend_from_slice(&msg);
@@ -321,7 +329,7 @@ impl Server {
             .collect();
         for id in &snapshot_ids {
             log::info!("Client {} snapshot triggered by PTY output arrival", *id);
-            self.send_snapshot_to_client(*id);
+            self.send_snapshot_to_client(*id, true);
         }
 
         let msg = proto::encode(proto::server::OUTPUT, &self.pending_pty_output);
@@ -479,16 +487,13 @@ impl Server {
                     };
                     self.session.resize(cols, rows)?;
 
-                    // If this client still has a pending snapshot, the
-                    // session has now been resized to the correct
-                    // dimensions. Generate and send the snapshot.
-                    let needs_snapshot = self
-                        .clients
-                        .get(&client_id)
-                        .map_or(false, |c| c.pending_snapshot);
-                    if needs_snapshot {
-                        self.send_snapshot_to_client(client_id);
-                    }
+                    // Always refresh this client's snapshot after RESIZE.
+                    // If a previous snapshot was already queued but not yet
+                    // fully delivered, keeping it would replay stale
+                    // dimensions into the bridge. Replacing the outbound
+                    // queue keeps the next frame aligned with the client's
+                    // current size.
+                    self.send_snapshot_to_client(client_id, true);
                 }
                 proto::client::DETACH => {}
                 proto::client::REDRAW => {
