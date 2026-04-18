@@ -252,6 +252,13 @@ impl Server {
         }
     }
 
+    fn send_snapshot_to_all_clients(&mut self, replace_send_buf: bool) {
+        let client_ids: Vec<usize> = self.clients.keys().copied().collect();
+        for client_id in client_ids {
+            self.send_snapshot_to_client(client_id, replace_send_buf);
+        }
+    }
+
     fn handle_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
         // Drain all available PTY data (non-blocking) and flush immediately.
         // No timer-based batching — the drain loop itself coalesces all bytes
@@ -279,24 +286,22 @@ impl Server {
                 || (self.clients.len() > 1 && total_pending_da > 0))
         {
             log::warn!(
-                "Observed pending device-attribute queries while {} client(s) are attached (DA1={}, DA2={}); terminal replies will be routed via client INPUT and may be duplicated or misdirected",
+                "Observed pending device-attribute queries while {} client(s) are attached (DA1={}, DA2={})",
                 self.clients.len(),
                 pending_da1,
                 pending_da2
             );
         }
-        if self.clients.is_empty() {
-            for _ in 0..pending_da1 {
-                if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
-                    log::warn!("Failed to write DA1 response to PTY: {}", e);
-                    break;
-                }
+        for _ in 0..pending_da1 {
+            if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
+                log::warn!("Failed to write DA1 response to PTY: {}", e);
+                break;
             }
-            for _ in 0..pending_da2 {
-                if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
-                    log::warn!("Failed to write DA2 response to PTY: {}", e);
-                    break;
-                }
+        }
+        for _ in 0..pending_da2 {
+            if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
+                log::warn!("Failed to write DA2 response to PTY: {}", e);
+                break;
             }
         }
 
@@ -487,13 +492,10 @@ impl Server {
                     };
                     self.session.resize(cols, rows)?;
 
-                    // Always refresh this client's snapshot after RESIZE.
-                    // If a previous snapshot was already queued but not yet
-                    // fully delivered, keeping it would replay stale
-                    // dimensions into the bridge. Replacing the outbound
-                    // queue keeps the next frame aligned with the client's
-                    // current size.
-                    self.send_snapshot_to_client(client_id, true);
+                    // The latest RESIZE is authoritative for every attached
+                    // client. Replacing all outbound queues prevents stale-size
+                    // frames from surviving ahead of the fresh snapshot.
+                    self.send_snapshot_to_all_clients(true);
                 }
                 proto::client::DETACH => {}
                 proto::client::REDRAW => {
