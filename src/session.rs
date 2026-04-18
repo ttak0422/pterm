@@ -1,5 +1,7 @@
+use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::pty::Pty;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io;
 use std::os::fd::AsRawFd;
 
@@ -9,6 +11,11 @@ struct SessionCallbacks {
     window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
+    cursor_shape: Option<u8>,
+    kitty_keyboard_flags: Option<u32>,
+    focus_tracking: bool,
+    synchronized_output: bool,
+    hyperlink_uri: Option<String>,
     passthrough_sequences: VecDeque<Vec<u8>>,
     passthrough_bytes: usize,
 }
@@ -16,7 +23,9 @@ struct SessionCallbacks {
 impl SessionCallbacks {
     const MAX_PASSTHROUGH_SEQUENCES: usize = 256;
     const MAX_PASSTHROUGH_BYTES: usize = 16 * 1024;
-    const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 4] = [12, 69, 1004, 2026];
+    // DEC private modes not fully reconstructed by `vt100::Screen::state_formatted()`.
+    // Modes 1004 and 2026 are now tracked as explicit struct fields instead.
+    const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 2] = [12, 69];
 
     fn default_da_params(params: &[&[u16]]) -> bool {
         params.is_empty()
@@ -26,6 +35,10 @@ impl SessionCallbacks {
 
     fn first_param(params: &[&[u16]]) -> Option<u16> {
         params.first().and_then(|param| param.first()).copied()
+    }
+
+    fn first_param_u32(params: &[&[u16]]) -> Option<u32> {
+        Self::first_param(params).map(u32::from)
     }
 
     fn is_passthrough_private_mode(
@@ -75,9 +88,12 @@ impl SessionCallbacks {
             return;
         }
 
-        self.passthrough_bytes += seq.len();
+        let incoming_len = seq.len();
+        self.passthrough_bytes += incoming_len;
         self.passthrough_sequences.push_back(seq);
 
+        let mut dropped_sequences = 0usize;
+        let mut dropped_bytes = 0usize;
         while self.passthrough_sequences.len() > Self::MAX_PASSTHROUGH_SEQUENCES
             || self.passthrough_bytes > Self::MAX_PASSTHROUGH_BYTES
         {
@@ -85,7 +101,22 @@ impl SessionCallbacks {
                 .passthrough_sequences
                 .pop_front()
                 .expect("passthrough sequence queue should not be empty");
+            dropped_sequences += 1;
+            dropped_bytes += removed.len();
             self.passthrough_bytes -= removed.len();
+        }
+
+        if dropped_sequences > 0 {
+            log::warn!(
+                "Dropped {} passthrough sequence(s) totaling {} bytes after enqueueing {} bytes; queue now holds {} sequence(s) / {} bytes (limits: {} sequence(s) / {} bytes)",
+                dropped_sequences,
+                dropped_bytes,
+                incoming_len,
+                self.passthrough_sequences.len(),
+                self.passthrough_bytes,
+                Self::MAX_PASSTHROUGH_SEQUENCES,
+                Self::MAX_PASSTHROUGH_BYTES
+            );
         }
     }
 
@@ -157,6 +188,15 @@ impl SessionCallbacks {
         seq
     }
 
+    fn is_passthrough_osc(params: &[&[u8]]) -> bool {
+        // OSC queries like `OSC 10 ; ? ST`, `OSC 11 ; ? ST`, or
+        // `OSC 4 ; index ; ? ST` ask the attached terminal for runtime
+        // information. Replaying them from a snapshot would trigger a fresh
+        // query against the client terminal, and its reply can then be
+        // forwarded into the PTY as if it were user input.
+        !params.last().is_some_and(|param| *param == b"?")
+    }
+
     fn format_clipboard_copy(screen: &[u8], data: &[u8]) -> Vec<u8> {
         let mut seq = Vec::with_capacity(8 + screen.len() + data.len());
         seq.extend_from_slice(b"\x1b]52;");
@@ -165,6 +205,62 @@ impl SessionCallbacks {
         seq.extend_from_slice(data);
         seq.extend_from_slice(b"\x1b\\");
         seq
+    }
+
+    fn format_bytes_hex(bytes: &[u8]) -> String {
+        let mut formatted = String::with_capacity(bytes.len().saturating_mul(3));
+        for (idx, byte) in bytes.iter().enumerate() {
+            if idx > 0 {
+                formatted.push(' ');
+            }
+            let _ = write!(&mut formatted, "{:02x}", byte);
+        }
+        formatted
+    }
+
+    fn update_private_mode_state(&mut self, params: &[&[u16]], c: char) -> bool {
+        if !matches!(c, 'h' | 'l') {
+            return false;
+        }
+
+        match Self::first_param(params) {
+            Some(1004) => {
+                self.focus_tracking = c == 'h';
+                true
+            }
+            Some(2026) => {
+                self.synchronized_output = c == 'h';
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn update_kitty_keyboard_state(&mut self, i1: Option<u8>, params: &[&[u16]]) -> bool {
+        match i1 {
+            Some(b'>') | Some(b'=') => {
+                self.kitty_keyboard_flags = Some(Self::first_param_u32(params).unwrap_or(0));
+                true
+            }
+            Some(b'<') => {
+                self.kitty_keyboard_flags = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn update_hyperlink_state(&mut self, params: &[&[u8]]) -> bool {
+        if params.first() != Some(&b"8".as_slice()) || params.len() < 3 {
+            return false;
+        }
+
+        if params[2].is_empty() {
+            self.hyperlink_uri = None;
+        } else {
+            self.hyperlink_uri = Some(String::from_utf8_lossy(params[2]).into_owned());
+        }
+        true
     }
 }
 
@@ -190,6 +286,17 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     if screen.alternate_screen() {
         prefix.extend_from_slice(b"\x1b[?1049h");
     }
+    if callbacks.focus_tracking {
+        prefix.extend_from_slice(b"\x1b[?1004h");
+    }
+    if callbacks.synchronized_output {
+        prefix.extend_from_slice(b"\x1b[?2026h");
+    }
+    if let Some(uri) = callbacks.hyperlink_uri.as_ref() {
+        prefix.extend_from_slice(b"\x1b]8;;");
+        prefix.extend_from_slice(uri.as_bytes());
+        prefix.extend_from_slice(b"\x1b\\");
+    }
 
     if !prefix.is_empty() {
         prefix.append(&mut snapshot);
@@ -201,6 +308,16 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     // sequences that state_formatted() emits at the end.
     if !passthrough.is_empty() {
         snapshot.extend_from_slice(&passthrough);
+    }
+    if let Some(ps) = callbacks.cursor_shape {
+        snapshot.extend_from_slice(b"\x1b[");
+        snapshot.extend_from_slice(ps.to_string().as_bytes());
+        snapshot.extend_from_slice(b" q");
+    }
+    if let Some(flags) = callbacks.kitty_keyboard_flags {
+        snapshot.extend_from_slice(b"\x1b[>");
+        snapshot.extend_from_slice(flags.to_string().as_bytes());
+        snapshot.extend_from_slice(b"u");
     }
     snapshot
 }
@@ -219,12 +336,27 @@ impl vt100::Callbacks for SessionCallbacks {
         c: char,
     ) {
         if i1 == Some(b' ') && i2.is_none() && c == 'q' {
+            self.cursor_shape =
+                Self::first_param(params).and_then(|param| u8::try_from(param).ok());
+            return;
+        }
+
+        if i1 == Some(b'?') && i2.is_none() && self.update_private_mode_state(params, c) {
+            if Self::is_passthrough_private_mode(i1, i2, params, c) {
+                self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
+            }
+            return;
+        }
+
+        if Self::is_kitty_keyboard_protocol(i1, i2, c) {
+            if self.update_kitty_keyboard_state(i1, params) {
+                return;
+            }
             self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
             return;
         }
 
         if Self::is_passthrough_private_mode(i1, i2, params, c)
-            || Self::is_kitty_keyboard_protocol(i1, i2, c)
             || Self::is_passthrough_sgr_subparams(i1, i2, params, c)
         {
             self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
@@ -248,6 +380,13 @@ impl vt100::Callbacks for SessionCallbacks {
         }
 
         if c != 'c' || i2.is_some() || !Self::default_da_params(params) {
+            if log::log_enabled!(log::Level::Debug) {
+                let seq = Self::format_unhandled_csi(i1, i2, params, c);
+                log::debug!(
+                    "Dropping unhandled CSI sequence from snapshot replay path: {}",
+                    Self::format_bytes_hex(&seq)
+                );
+            }
             return;
         }
 
@@ -261,11 +400,21 @@ impl vt100::Callbacks for SessionCallbacks {
     }
 
     fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
-        self.push_passthrough_sequence(Self::format_unhandled_escape(i1, i2, b));
+        let seq = Self::format_unhandled_escape(i1, i2, b);
+        log::debug!(
+            "Preserving unhandled ESC sequence as passthrough: {}",
+            Self::format_bytes_hex(&seq)
+        );
+        self.push_passthrough_sequence(seq);
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        self.push_passthrough_sequence(Self::format_unhandled_osc(params));
+        if self.update_hyperlink_state(params) {
+            return;
+        }
+        if Self::is_passthrough_osc(params) {
+            self.push_passthrough_sequence(Self::format_unhandled_osc(params));
+        }
     }
 
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
@@ -282,7 +431,9 @@ pub struct Session {
 
 impl Session {
     /// Create a new session with the given name and command.
-    pub fn new(name: String, cmd: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<Self> {
+    pub fn new(name: String, cmd: &str, args: &[&str]) -> io::Result<Self> {
+        let cols = DEFAULT_TERMINAL_COLS;
+        let rows = DEFAULT_TERMINAL_ROWS;
         let pty = Pty::spawn(cmd, args, cols, rows)?;
         Ok(Self {
             name,
@@ -327,8 +478,8 @@ impl Session {
                     ));
                 }
                 Ok(n) => written += n,
-                Err(e) if e == nix::errno::Errno::EINTR => continue,
-                Err(e) if e == nix::errno::Errno::EAGAIN => {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::EAGAIN) => {
                     std::thread::yield_now();
                 }
                 Err(e) => return Err(io::Error::other(e)),
@@ -384,24 +535,53 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{build_snapshot, SessionCallbacks};
+    use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 
     #[test]
     fn snapshot_preserves_unhandled_osc_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        parser.process(b"\x1b]1337;Custom=1\x1b\\");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot = String::from_utf8_lossy(&snapshot);
 
-        assert!(snapshot.contains("\x1b]8;;https://example.com\x1b\\"));
-        assert!(snapshot.contains("\x1b]8;;\x1b\\"));
+        assert!(!snapshot.contains("\x1b]8;;https://example.com\x1b\\"));
+        assert!(!snapshot.contains("\x1b]8;;\x1b\\"));
+        assert!(snapshot.contains("\x1b]1337;Custom=1\x1b\\"));
+    }
+
+    #[test]
+    fn snapshot_drops_osc_color_queries() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
+        parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot = String::from_utf8_lossy(&snapshot);
+
+        assert!(!snapshot.contains("\x1b]10;?\x1b\\"));
+        assert!(!snapshot.contains("\x1b]11;?\x1b\\"));
+        assert!(!snapshot.contains("\x1b]4;1;?\x1b\\"));
     }
 
     #[test]
     fn handled_sgr_is_not_added_to_passthrough_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[31mRED\x1b[m");
 
         assert!(parser.callbacks().passthrough_sequences.is_empty());
@@ -411,9 +591,16 @@ mod tests {
     fn snapshot_preserves_decscusr_cursor_shape() {
         // Vim emits DECSCUSR when switching modes (e.g. ESC[6 q for bar cursor
         // in insert mode, ESC[2 q for block in normal mode).
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[6 q");
+
+        assert!(parser.callbacks().passthrough_sequences.is_empty());
+        assert_eq!(parser.callbacks().cursor_shape, Some(6));
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot = String::from_utf8_lossy(&snapshot);
@@ -427,8 +614,12 @@ mod tests {
     #[test]
     fn snapshot_preserves_cursor_blink_mode() {
         // AT&T 610: ESC[?12l disables cursor blink, ESC[?12h enables it.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?12l");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -443,8 +634,12 @@ mod tests {
     #[test]
     fn snapshot_preserves_declrmm() {
         // DECLRMM: ESC[?69h enables left-right margin mode.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?69h");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -458,9 +653,17 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_focus_tracking_and_synchronized_output() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[?1004h\x1b[?2026h");
+
+        assert!(parser.callbacks().passthrough_sequences.is_empty());
+        assert!(parser.callbacks().focus_tracking);
+        assert!(parser.callbacks().synchronized_output);
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot_str = String::from_utf8_lossy(&snapshot);
@@ -470,9 +673,36 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_kitty_keyboard_protocol_sequences() {
+    fn snapshot_relies_on_vt100_for_tracked_input_modes() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(
+            b"\x1b[?25l\x1b[?2004h\x1b[?1002h\x1b[?1006h\
+              tracked by vt100",
+        );
+
+        assert!(
+            parser.callbacks().passthrough_sequences.is_empty(),
+            "vt100 handles cursor visibility, bracketed paste, and mouse modes"
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[?25l"));
+        assert!(snapshot_str.contains("\x1b[?2004h"));
+        assert!(snapshot_str.contains("\x1b[?1002h"));
+        assert!(snapshot_str.contains("\x1b[?1006h"));
+    }
+
+    #[test]
+    fn snapshot_preserves_kitty_keyboard_protocol_sequences() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         let mut screen = parser.screen().clone();
         let gt_params = [1u16];
         let eq_params = [5u16];
@@ -501,16 +731,53 @@ mod tests {
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot_str = String::from_utf8_lossy(&snapshot);
 
-        assert!(snapshot_str.contains("\x1b[>1u"));
-        assert!(snapshot_str.contains("\x1b[=5u"));
-        assert!(snapshot_str.contains("\x1b[<u"));
+        assert!(!snapshot_str.contains("\x1b[>1u"));
+        assert!(!snapshot_str.contains("\x1b[=5u"));
+        assert!(!snapshot_str.contains("\x1b[<u"));
+        assert_eq!(parser.callbacks().kitty_keyboard_flags, None);
         assert_eq!(parser.callbacks().pending_da2_queries, 0);
     }
 
     #[test]
-    fn snapshot_preserves_unhandled_sgr_subparams() {
+    fn snapshot_replays_latest_kitty_keyboard_flags() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[=3u\x1b[>7u");
+
+        assert_eq!(parser.callbacks().kitty_keyboard_flags, Some(7));
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[>7u"));
+        assert!(!snapshot_str.contains("\x1b[=3u"));
+    }
+
+    #[test]
+    fn snapshot_replays_open_hyperlink_only() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b]8;;https://example.com\x1b\\link");
+
+        assert_eq!(
+            parser.callbacks().hyperlink_uri.as_deref(),
+            Some("https://example.com")
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b]8;;https://example.com\x1b\\"));
+    }
+
+    #[test]
+    fn snapshot_preserves_unhandled_sgr_subparams() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[4:3m\x1b[58:2:1:2:3m");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -522,8 +789,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_osc_52_clipboard_copy() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b]52;c;SGVsbG8=\x1b\\");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -534,8 +805,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_non_title_csi_t_sequences() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[14t\x1b[16t\x1b[18t");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
@@ -550,8 +825,12 @@ mod tests {
     fn snapshot_preserves_window_title_stack() {
         // Vim saves the original title on entry with ESC[22;0t, then sets its
         // own title. On exit it restores with ESC[23;0t.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
 
         // Set initial title, save it, then set a new title (Vim's title)
         parser.process(b"\x1b]2;original\x1b\\");
@@ -591,8 +870,12 @@ mod tests {
     #[test]
     fn window_title_restore_pops_stack() {
         // ESC[23;0t restores the previously saved title.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
 
         parser.process(b"\x1b]2;original\x1b\\");
         parser.process(b"\x1b[22;0t");
@@ -615,14 +898,18 @@ mod tests {
         // DECSCUSR must appear after state_formatted() output so it is not
         // overwritten by the cursor-positioning sequences that state_formatted()
         // emits at the end.
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[6 q");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
 
         // state_formatted() ends with a cursor-position sequence (ESC[...H or
-        // similar).  Find DECSCUSR and the last ESC occurrence before it to
+        // similar). Find DECSCUSR and the last ESC occurrence before it to
         // confirm ordering.
         let decscusr_pos = snapshot
             .windows(5)

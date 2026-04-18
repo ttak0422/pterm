@@ -13,11 +13,14 @@ const PTY_BASE: Token = Token(0x1000_0000);
 const CLIENT_BASE: Token = Token(0x2000_0000);
 const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
+const DA_QUERY_WARN_THRESHOLD: usize = 2;
+const LARGE_SEND_BUF_WARN_BYTES: usize = 64 * 1024;
 
 struct Client {
     stream: UnixStream,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    large_send_buf_warned: bool,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
 }
@@ -187,6 +190,7 @@ impl Server {
                             stream,
                             recv_buf: Vec::new(),
                             send_buf: Vec::new(),
+                            large_send_buf_warned: false,
                             pending_snapshot: true,
                         },
                     );
@@ -200,12 +204,42 @@ impl Server {
 
     /// Send the current terminal snapshot to a specific client and clear its
     /// pending-snapshot flag.
-    fn send_snapshot_to_client(&mut self, client_id: usize) {
+    ///
+    /// When `replace_send_buf` is `true`, any queued outbound bytes for that
+    /// client are dropped first. This is used on RESIZE so an older-size
+    /// snapshot or stale OUTPUT frame cannot remain queued ahead of the fresh
+    /// snapshot for the client's new dimensions.
+    fn send_snapshot_to_client(&mut self, client_id: usize, replace_send_buf: bool) {
+        let buffered_pty_bytes = self.pending_pty_output.len();
+        let other_pending_snapshots = self
+            .clients
+            .iter()
+            .filter(|&(id, client)| *id != client_id && client.pending_snapshot)
+            .count();
+        let pending_send_clients = self
+            .clients
+            .values()
+            .filter(|client| !client.send_buf.is_empty())
+            .count();
+
+        if buffered_pty_bytes > 0 || other_pending_snapshots > 0 || pending_send_clients > 1 {
+            log::debug!(
+                "Client {} snapshot sent while {} PTY byte(s) are buffered, {} other client(s) still await snapshot, and {} client(s) have queued output",
+                client_id,
+                buffered_pty_bytes,
+                other_pending_snapshots,
+                pending_send_clients
+            );
+        }
+
         let snapshot = self.session.snapshot();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
+            if replace_send_buf {
+                client.send_buf.clear();
+            }
             if !snapshot.is_empty() {
-                let msg = proto::encode(proto::server::SCROLLBACK, &snapshot);
+                let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
                 client.send_buf.extend_from_slice(&msg);
             }
         }
@@ -215,6 +249,13 @@ impl Server {
                 client_id,
                 e
             );
+        }
+    }
+
+    fn send_snapshot_to_all_clients(&mut self, replace_send_buf: bool) {
+        let client_ids: Vec<usize> = self.clients.keys().copied().collect();
+        for client_id in client_ids {
+            self.send_snapshot_to_client(client_id, replace_send_buf);
         }
     }
 
@@ -239,18 +280,28 @@ impl Server {
         }
 
         let (pending_da1, pending_da2) = self.session.take_pending_da_queries();
-        if self.clients.is_empty() {
-            for _ in 0..pending_da1 {
-                if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
-                    log::warn!("Failed to write DA1 response to PTY: {}", e);
-                    break;
-                }
+        let total_pending_da = pending_da1 + pending_da2;
+        if !self.clients.is_empty()
+            && (total_pending_da > DA_QUERY_WARN_THRESHOLD
+                || (self.clients.len() > 1 && total_pending_da > 0))
+        {
+            log::warn!(
+                "Observed pending device-attribute queries while {} client(s) are attached (DA1={}, DA2={})",
+                self.clients.len(),
+                pending_da1,
+                pending_da2
+            );
+        }
+        for _ in 0..pending_da1 {
+            if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
+                log::warn!("Failed to write DA1 response to PTY: {}", e);
+                break;
             }
-            for _ in 0..pending_da2 {
-                if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
-                    log::warn!("Failed to write DA2 response to PTY: {}", e);
-                    break;
-                }
+        }
+        for _ in 0..pending_da2 {
+            if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
+                log::warn!("Failed to write DA2 response to PTY: {}", e);
+                break;
             }
         }
 
@@ -283,7 +334,7 @@ impl Server {
             .collect();
         for id in &snapshot_ids {
             log::info!("Client {} snapshot triggered by PTY output arrival", *id);
-            self.send_snapshot_to_client(*id);
+            self.send_snapshot_to_client(*id, true);
         }
 
         let msg = proto::encode(proto::server::OUTPUT, &self.pending_pty_output);
@@ -351,6 +402,19 @@ impl Server {
                 }
             }
 
+            if client.send_buf.len() >= LARGE_SEND_BUF_WARN_BYTES {
+                if !client.large_send_buf_warned {
+                    log::warn!(
+                        "Client {} send buffer backlog reached {} bytes",
+                        client_id,
+                        client.send_buf.len()
+                    );
+                    client.large_send_buf_warned = true;
+                }
+            } else {
+                client.large_send_buf_warned = false;
+            }
+
             !client.send_buf.is_empty()
         };
 
@@ -413,62 +477,39 @@ impl Server {
         };
 
         let mut flush_all = false;
-        let mut offset = 0;
-        while offset + proto::HEADER_SIZE <= recv_buf.len() {
-            let header: [u8; proto::HEADER_SIZE] = recv_buf[offset..offset + proto::HEADER_SIZE]
-                .try_into()
-                .unwrap();
-            let (msg_type, payload_len) = proto::decode_header(&header);
-
-            let payload_len = payload_len as usize;
-            if offset + proto::HEADER_SIZE + payload_len > recv_buf.len() {
-                break; // incomplete message, wait for more data
-            }
-
-            offset += proto::HEADER_SIZE;
-            let payload = &recv_buf[offset..offset + payload_len];
-            offset += payload_len;
-
-            match msg_type {
+        for frame in proto::decode_frames(&mut recv_buf) {
+            match frame.msg_type {
                 proto::client::INPUT => {
-                    self.session.write_pty(payload)?;
+                    self.session.write_pty(&frame.payload)?;
                 }
                 proto::client::RESIZE => {
-                    if payload.len() >= 4 {
-                        let r: [u8; 4] = payload[..4].try_into().unwrap();
-                        let (cols, rows) = proto::decode_resize(&r);
-                        self.session.resize(cols, rows)?;
-
-                        // If this client still has a pending snapshot, the
-                        // session has now been resized to the correct
-                        // dimensions.  Generate and send the snapshot.
-                        let needs_snapshot = self
-                            .clients
-                            .get(&client_id)
-                            .map_or(false, |c| c.pending_snapshot);
-                        if needs_snapshot {
-                            self.send_snapshot_to_client(client_id);
+                    let (cols, rows) = match proto::parse_resize(&frame.payload) {
+                        Ok(size) => size,
+                        Err(e) => {
+                            log::warn!("Client {} sent invalid resize payload: {}", client_id, e);
+                            continue;
                         }
-                    }
+                    };
+                    self.session.resize(cols, rows)?;
+
+                    // The latest RESIZE is authoritative for every attached
+                    // client. Replacing all outbound queues prevents stale-size
+                    // frames from surviving ahead of the fresh snapshot.
+                    self.send_snapshot_to_all_clients(true);
                 }
                 proto::client::DETACH => {}
                 proto::client::REDRAW => {
                     log::info!("Redraw requested by client {}", client_id);
                     let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
                     redraw_data.extend_from_slice(&self.session.snapshot());
-                    let msg = proto::encode(proto::server::SCROLLBACK, &redraw_data);
+                    let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
                     for (_, client) in self.clients.iter_mut() {
                         client.send_buf.extend_from_slice(&msg);
                     }
                     flush_all = true;
                 }
-                _ => log::warn!("Unknown message type: 0x{:02x}", msg_type),
+                _ => log::warn!("Unknown message type: 0x{:02x}", frame.msg_type),
             }
-        }
-
-        // Put remaining bytes back into the client's buffer
-        if offset > 0 {
-            recv_buf.drain(..offset);
         }
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.recv_buf = recv_buf;

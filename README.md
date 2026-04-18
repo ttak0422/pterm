@@ -9,7 +9,6 @@ Processes survive Neovim restarts. Terminal rendering is delegated to Neovim's n
 ```sh
 # Create a new persistent session (forks into background)
 pterm new mysession
-pterm new mysession --cols 120 --rows 40
 pterm new mysession -- /bin/zsh        # custom command
 
 # Attach bridge mode (for terminal clients)
@@ -44,7 +43,6 @@ pterm kill parent          # kills parent and parent/child
 ## Neovim Usage
 
 ```vim
-:Pterm              " opens/creates 'main' session
 :Pterm dev          " opens/creates named session
 :Pterm dev zsh      " opens/creates session with custom command
 :PtermList          " list sessions
@@ -86,20 +84,15 @@ require("pterm").setup()
 
 -- Default configuration:
 require("pterm").setup({
-  -- Path to pterm binary (auto-detected if nil)
-  binary = nil,
   -- Default shell command
   shell = vim.env.SHELL or "/bin/sh",
-  -- Default terminal size for `pterm new` when created outside Neovim
-  -- (the bridge reads the actual PTY size via TIOCGWINSZ at attach time)
-  cols = 80,
-  rows = 24,
   -- Socket directory (nil = let daemon decide)
   socket_dir = nil,
-  -- Max wait time for daemon socket creation after `pterm new`
-  attach_wait_ms = 3000,
-  -- Poll interval while waiting for socket
-  attach_poll_ms = 50,
+  -- Automatically redraw on BufEnter / TermEnter to recover from rendering
+  -- corruption that can occur during mode or window focus switches.
+  auto_redraw = true,
+  -- Debounce delay in milliseconds for automatic redraws.
+  auto_redraw_delay_ms = 1000,
 })
 ```
 
