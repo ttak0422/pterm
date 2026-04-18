@@ -11,6 +11,11 @@ struct SessionCallbacks {
     window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
+    cursor_shape: Option<u8>,
+    kitty_keyboard_flags: Option<u32>,
+    focus_tracking: bool,
+    synchronized_output: bool,
+    hyperlink_uri: Option<String>,
     passthrough_sequences: VecDeque<Vec<u8>>,
     passthrough_bytes: usize,
 }
@@ -18,15 +23,9 @@ struct SessionCallbacks {
 impl SessionCallbacks {
     const MAX_PASSTHROUGH_SEQUENCES: usize = 256;
     const MAX_PASSTHROUGH_BYTES: usize = 16 * 1024;
-    // DEC private modes that are not fully reconstructed by
-    // `vt100::Screen::state_formatted()`, so snapshot replay needs to emit
-    // their original enable/disable sequences explicitly.
-    //
-    // - `?12`: cursor blink enable/disable
-    // - `?69`: DECLRMM (left/right margin mode)
-    // - `?1004`: focus in/out reporting
-    // - `?2026`: synchronized output mode
-    const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 4] = [12, 69, 1004, 2026];
+    // DEC private modes not fully reconstructed by `vt100::Screen::state_formatted()`.
+    // Modes 1004 and 2026 are now tracked as explicit struct fields instead.
+    const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 2] = [12, 69];
 
     fn default_da_params(params: &[&[u16]]) -> bool {
         params.is_empty()
@@ -36,6 +35,10 @@ impl SessionCallbacks {
 
     fn first_param(params: &[&[u16]]) -> Option<u16> {
         params.first().and_then(|param| param.first()).copied()
+    }
+
+    fn first_param_u32(params: &[&[u16]]) -> Option<u32> {
+        Self::first_param(params).map(u32::from)
     }
 
     fn is_passthrough_private_mode(
@@ -214,6 +217,51 @@ impl SessionCallbacks {
         }
         formatted
     }
+
+    fn update_private_mode_state(&mut self, params: &[&[u16]], c: char) -> bool {
+        if !matches!(c, 'h' | 'l') {
+            return false;
+        }
+
+        match Self::first_param(params) {
+            Some(1004) => {
+                self.focus_tracking = c == 'h';
+                true
+            }
+            Some(2026) => {
+                self.synchronized_output = c == 'h';
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn update_kitty_keyboard_state(&mut self, i1: Option<u8>, params: &[&[u16]]) -> bool {
+        match i1 {
+            Some(b'>') | Some(b'=') => {
+                self.kitty_keyboard_flags = Some(Self::first_param_u32(params).unwrap_or(0));
+                true
+            }
+            Some(b'<') => {
+                self.kitty_keyboard_flags = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn update_hyperlink_state(&mut self, params: &[&[u8]]) -> bool {
+        if params.first() != Some(&b"8".as_slice()) || params.len() < 3 {
+            return false;
+        }
+
+        if params[2].is_empty() {
+            self.hyperlink_uri = None;
+        } else {
+            self.hyperlink_uri = Some(String::from_utf8_lossy(params[2]).into_owned());
+        }
+        true
+    }
 }
 
 fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u8> {
@@ -238,6 +286,17 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     if screen.alternate_screen() {
         prefix.extend_from_slice(b"\x1b[?1049h");
     }
+    if callbacks.focus_tracking {
+        prefix.extend_from_slice(b"\x1b[?1004h");
+    }
+    if callbacks.synchronized_output {
+        prefix.extend_from_slice(b"\x1b[?2026h");
+    }
+    if let Some(uri) = callbacks.hyperlink_uri.as_ref() {
+        prefix.extend_from_slice(b"\x1b]8;;");
+        prefix.extend_from_slice(uri.as_bytes());
+        prefix.extend_from_slice(b"\x1b\\");
+    }
 
     if !prefix.is_empty() {
         prefix.append(&mut snapshot);
@@ -249,6 +308,16 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     // sequences that state_formatted() emits at the end.
     if !passthrough.is_empty() {
         snapshot.extend_from_slice(&passthrough);
+    }
+    if let Some(ps) = callbacks.cursor_shape {
+        snapshot.extend_from_slice(b"\x1b[");
+        snapshot.extend_from_slice(ps.to_string().as_bytes());
+        snapshot.extend_from_slice(b" q");
+    }
+    if let Some(flags) = callbacks.kitty_keyboard_flags {
+        snapshot.extend_from_slice(b"\x1b[>");
+        snapshot.extend_from_slice(flags.to_string().as_bytes());
+        snapshot.extend_from_slice(b"u");
     }
     snapshot
 }
@@ -267,12 +336,27 @@ impl vt100::Callbacks for SessionCallbacks {
         c: char,
     ) {
         if i1 == Some(b' ') && i2.is_none() && c == 'q' {
+            self.cursor_shape =
+                Self::first_param(params).and_then(|param| u8::try_from(param).ok());
+            return;
+        }
+
+        if i1 == Some(b'?') && i2.is_none() && self.update_private_mode_state(params, c) {
+            if Self::is_passthrough_private_mode(i1, i2, params, c) {
+                self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
+            }
+            return;
+        }
+
+        if Self::is_kitty_keyboard_protocol(i1, i2, c) {
+            if self.update_kitty_keyboard_state(i1, params) {
+                return;
+            }
             self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
             return;
         }
 
         if Self::is_passthrough_private_mode(i1, i2, params, c)
-            || Self::is_kitty_keyboard_protocol(i1, i2, c)
             || Self::is_passthrough_sgr_subparams(i1, i2, params, c)
         {
             self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
@@ -325,6 +409,9 @@ impl vt100::Callbacks for SessionCallbacks {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if self.update_hyperlink_state(params) {
+            return;
+        }
         if Self::is_passthrough_osc(params) {
             self.push_passthrough_sequence(Self::format_unhandled_osc(params));
         }
@@ -459,12 +546,14 @@ mod tests {
             SessionCallbacks::default(),
         );
         parser.process(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        parser.process(b"\x1b]1337;Custom=1\x1b\\");
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot = String::from_utf8_lossy(&snapshot);
 
-        assert!(snapshot.contains("\x1b]8;;https://example.com\x1b\\"));
-        assert!(snapshot.contains("\x1b]8;;\x1b\\"));
+        assert!(!snapshot.contains("\x1b]8;;https://example.com\x1b\\"));
+        assert!(!snapshot.contains("\x1b]8;;\x1b\\"));
+        assert!(snapshot.contains("\x1b]1337;Custom=1\x1b\\"));
     }
 
     #[test]
@@ -509,6 +598,9 @@ mod tests {
             SessionCallbacks::default(),
         );
         parser.process(b"\x1b[6 q");
+
+        assert!(parser.callbacks().passthrough_sequences.is_empty());
+        assert_eq!(parser.callbacks().cursor_shape, Some(6));
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot = String::from_utf8_lossy(&snapshot);
@@ -569,11 +661,38 @@ mod tests {
         );
         parser.process(b"\x1b[?1004h\x1b[?2026h");
 
+        assert!(parser.callbacks().passthrough_sequences.is_empty());
+        assert!(parser.callbacks().focus_tracking);
+        assert!(parser.callbacks().synchronized_output);
+
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot_str = String::from_utf8_lossy(&snapshot);
 
         assert!(snapshot_str.contains("\x1b[?1004h"));
         assert!(snapshot_str.contains("\x1b[?2026h"));
+    }
+
+    #[test]
+    fn snapshot_relies_on_vt100_for_tracked_input_modes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(
+            b"\x1b[?25l\x1b[?2004h\x1b[?1002h\x1b[?1006h\
+              tracked by vt100",
+        );
+
+        assert!(
+            parser.callbacks().passthrough_sequences.is_empty(),
+            "vt100 handles cursor visibility, bracketed paste, and mouse modes"
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[?25l"));
+        assert!(snapshot_str.contains("\x1b[?2004h"));
+        assert!(snapshot_str.contains("\x1b[?1002h"));
+        assert!(snapshot_str.contains("\x1b[?1006h"));
     }
 
     #[test]
@@ -612,10 +731,43 @@ mod tests {
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot_str = String::from_utf8_lossy(&snapshot);
 
-        assert!(snapshot_str.contains("\x1b[>1u"));
-        assert!(snapshot_str.contains("\x1b[=5u"));
-        assert!(snapshot_str.contains("\x1b[<u"));
+        assert!(!snapshot_str.contains("\x1b[>1u"));
+        assert!(!snapshot_str.contains("\x1b[=5u"));
+        assert!(!snapshot_str.contains("\x1b[<u"));
+        assert_eq!(parser.callbacks().kitty_keyboard_flags, None);
         assert_eq!(parser.callbacks().pending_da2_queries, 0);
+    }
+
+    #[test]
+    fn snapshot_replays_latest_kitty_keyboard_flags() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[=3u\x1b[>7u");
+
+        assert_eq!(parser.callbacks().kitty_keyboard_flags, Some(7));
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b[>7u"));
+        assert!(!snapshot_str.contains("\x1b[=3u"));
+    }
+
+    #[test]
+    fn snapshot_replays_open_hyperlink_only() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b]8;;https://example.com\x1b\\link");
+
+        assert_eq!(
+            parser.callbacks().hyperlink_uri.as_deref(),
+            Some("https://example.com")
+        );
+
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
+
+        assert!(snapshot_str.contains("\x1b]8;;https://example.com\x1b\\"));
     }
 
     #[test]
