@@ -53,6 +53,11 @@ const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
 \x1b[<u\
 \x1b[=0u";
 
+// Snapshot replay must start from a known kitty keyboard state; otherwise an
+// already-attached terminal can retain its own current flags / push-pop stack
+// and later `CSI < u` from the PTY will restore the wrong state.
+const STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES: &[u8] = b"\x1b[<u\x1b[=0u";
+
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard that restores terminal settings on drop.
@@ -275,9 +280,18 @@ pub fn run(
                     // Process complete frames, batching output payloads into
                     // a single write to avoid incremental rendering.
                     let mut output_batch: Vec<u8> = Vec::new();
+                    let mut state_sync_cleanup_queued = false;
                     for frame in proto::decode_frames(&mut recv_buf) {
                         match frame.msg_type {
-                            proto::server::OUTPUT | proto::server::STATE_SYNC => {
+                            proto::server::OUTPUT => {
+                                output_batch.extend_from_slice(&frame.payload);
+                            }
+                            proto::server::STATE_SYNC => {
+                                if !state_sync_cleanup_queued {
+                                    output_batch
+                                        .extend_from_slice(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES);
+                                    state_sync_cleanup_queued = true;
+                                }
                                 output_batch.extend_from_slice(&frame.payload);
                             }
                             proto::server::EXIT => {
@@ -335,7 +349,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::DETACH_CLEANUP_SEQUENCES;
+    use super::{DETACH_CLEANUP_SEQUENCES, STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES};
 
     #[test]
     fn detach_cleanup_resets_keyboard_protocols() {
@@ -345,5 +359,11 @@ mod tests {
         assert!(cleanup.contains("\x1b[>4n"));
         assert!(cleanup.contains("\x1b[<u"));
         assert!(cleanup.contains("\x1b[=0u"));
+    }
+
+    #[test]
+    fn state_sync_cleanup_resets_kitty_keyboard_state() {
+        let cleanup = std::str::from_utf8(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES).unwrap();
+        assert_eq!(cleanup, "\x1b[<u\x1b[=0u");
     }
 }
