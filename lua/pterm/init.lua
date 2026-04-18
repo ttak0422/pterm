@@ -15,14 +15,6 @@ local connections = {}
 local redraw_timers = {}
 local cached_binary = nil
 
-local function trigger_redraw(session_name)
-	local conn = connections[session_name]
-	if conn and conn.job_id then
-		local bin = find_binary()
-		vim.fn.jobstart({ bin, "redraw", session_name })
-	end
-end
-
 --- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
 	if cached_binary then
@@ -54,6 +46,14 @@ local function find_binary()
 	end
 
 	error("pterm binary not found. Install pterm with Nix or build it in this repository.")
+end
+
+local function trigger_redraw(session_name)
+	local conn = connections[session_name]
+	if conn and conn.job_id then
+		local bin = find_binary()
+		vim.fn.jobstart({ bin, "redraw", session_name })
+	end
 end
 
 --- Get socket directory (must match daemon's socket_dir() logic).
