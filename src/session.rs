@@ -11,6 +11,7 @@ struct SessionCallbacks {
     window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
+    pending_terminal_responses: VecDeque<Vec<u8>>,
     cursor_shape: Option<u8>,
     kitty_keyboard_states: ScreenKittyKeyboardStates,
     focus_tracking: bool,
@@ -223,6 +224,72 @@ impl SessionCallbacks {
         // query against the client terminal, and its reply can then be
         // forwarded into the PTY as if it were user input.
         !params.last().is_some_and(|param| *param == b"?")
+    }
+
+    fn queue_osc_query_response(&mut self, params: &[&[u8]]) -> bool {
+        if !params.last().is_some_and(|param| *param == b"?") {
+            return false;
+        }
+
+        match params {
+            [b"10", b"?"] => {
+                self.push_terminal_response(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\".to_vec());
+                true
+            }
+            [b"11", b"?"] => {
+                self.push_terminal_response(b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec());
+                true
+            }
+            [b"12", b"?"] => {
+                self.push_terminal_response(b"\x1b]12;rgb:ffff/ffff/ffff\x1b\\".to_vec());
+                true
+            }
+            [b"4", index, b"?"] => {
+                let color = Self::palette_color_response(index);
+                let mut response = Vec::with_capacity(16 + index.len() + color.len());
+                response.extend_from_slice(b"\x1b]4;");
+                response.extend_from_slice(index);
+                response.push(b';');
+                response.extend_from_slice(color);
+                response.extend_from_slice(b"\x1b\\");
+                self.push_terminal_response(response);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn palette_color_response(index: &[u8]) -> &'static [u8] {
+        match std::str::from_utf8(index)
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+        {
+            Some(0) => b"rgb:0000/0000/0000",
+            Some(1) => b"rgb:cdcd/0000/0000",
+            Some(2) => b"rgb:0000/cdcd/0000",
+            Some(3) => b"rgb:cdcd/cdcd/0000",
+            Some(4) => b"rgb:0000/0000/eeee",
+            Some(5) => b"rgb:cdcd/0000/cdcd",
+            Some(6) => b"rgb:0000/cdcd/cdcd",
+            Some(7) => b"rgb:e5e5/e5e5/e5e5",
+            Some(8) => b"rgb:7f7f/7f7f/7f7f",
+            Some(9) => b"rgb:ffff/0000/0000",
+            Some(10) => b"rgb:0000/ffff/0000",
+            Some(11) => b"rgb:ffff/ffff/0000",
+            Some(12) => b"rgb:5c5c/5c5c/ffff",
+            Some(13) => b"rgb:ffff/0000/ffff",
+            Some(14) => b"rgb:0000/ffff/ffff",
+            Some(15) => b"rgb:ffff/ffff/ffff",
+            _ => b"rgb:0000/0000/0000",
+        }
+    }
+
+    fn push_terminal_response(&mut self, response: Vec<u8>) {
+        self.pending_terminal_responses.push_back(response);
+    }
+
+    fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
+        self.pending_terminal_responses.drain(..).collect()
     }
 
     fn format_clipboard_copy(screen: &[u8], data: &[u8]) -> Vec<u8> {
@@ -526,6 +593,9 @@ impl vt100::Callbacks for SessionCallbacks {
         if self.update_hyperlink_state(params) {
             return;
         }
+        if self.queue_osc_query_response(params) {
+            return;
+        }
         if Self::is_passthrough_osc(params) {
             self.push_passthrough_sequence(Self::format_unhandled_osc(params));
         }
@@ -540,7 +610,112 @@ pub struct Session {
     pub name: String,
     pub pty: Pty,
     parser: vt100::Parser<SessionCallbacks>,
+    output_filter: TerminalOutputFilter,
     pub exited: Option<i32>,
+}
+
+#[derive(Default)]
+struct TerminalOutputFilter {
+    state: OutputFilterState,
+    pending: Vec<u8>,
+}
+
+#[derive(Default)]
+enum OutputFilterState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+    Osc,
+}
+
+impl TerminalOutputFilter {
+    const MAX_CONTROL_SEQUENCE_LEN: usize = 1024 * 1024;
+
+    fn filter(&mut self, input: &[u8], output: &mut Vec<u8>) {
+        for &byte in input {
+            match self.state {
+                OutputFilterState::Ground => {
+                    if byte == 0x1b {
+                        self.pending.clear();
+                        self.pending.push(byte);
+                        self.state = OutputFilterState::Esc;
+                    } else {
+                        output.push(byte);
+                    }
+                }
+                OutputFilterState::Esc => {
+                    self.pending.push(byte);
+                    match byte {
+                        b'[' => self.state = OutputFilterState::Csi,
+                        b']' => self.state = OutputFilterState::Osc,
+                        _ => self.flush_pending(output),
+                    }
+                }
+                OutputFilterState::Csi => {
+                    self.pending.push(byte);
+                    if (0x40..=0x7e).contains(&byte) {
+                        if !Self::is_terminal_query_csi(&self.pending) {
+                            output.extend_from_slice(&self.pending);
+                        }
+                        self.pending.clear();
+                        self.state = OutputFilterState::Ground;
+                    } else {
+                        self.flush_if_too_long(output);
+                    }
+                }
+                OutputFilterState::Osc => {
+                    self.pending.push(byte);
+                    if byte == 0x07 || self.pending.ends_with(b"\x1b\\") {
+                        if !Self::is_terminal_query_osc(&self.pending) {
+                            output.extend_from_slice(&self.pending);
+                        }
+                        self.pending.clear();
+                        self.state = OutputFilterState::Ground;
+                    } else {
+                        self.flush_if_too_long(output);
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_pending(&mut self, output: &mut Vec<u8>) {
+        output.extend_from_slice(&self.pending);
+        self.pending.clear();
+        self.state = OutputFilterState::Ground;
+    }
+
+    fn flush_if_too_long(&mut self, output: &mut Vec<u8>) {
+        if self.pending.len() > Self::MAX_CONTROL_SEQUENCE_LEN {
+            self.flush_pending(output);
+        }
+    }
+
+    fn is_terminal_query_csi(seq: &[u8]) -> bool {
+        if !seq.starts_with(b"\x1b[") || seq.last() != Some(&b'c') {
+            return false;
+        }
+        matches!(&seq[2..seq.len() - 1], b"" | b"0" | b">" | b">0")
+    }
+
+    fn is_terminal_query_osc(seq: &[u8]) -> bool {
+        if !seq.starts_with(b"\x1b]") {
+            return false;
+        }
+
+        let end = if seq.ends_with(b"\x1b\\") {
+            seq.len() - 2
+        } else if seq.last() == Some(&0x07) {
+            seq.len() - 1
+        } else {
+            return false;
+        };
+        let body = &seq[2..end];
+        body.split(|&byte| byte == b';')
+            .last()
+            .is_some_and(|param| param == b"?")
+    }
 }
 
 impl Session {
@@ -558,6 +733,7 @@ impl Session {
                 10_000,
                 SessionCallbacks::default(),
             ),
+            output_filter: TerminalOutputFilter::default(),
             exited: None,
         })
     }
@@ -570,6 +746,11 @@ impl Session {
             Ok(n) => {
                 if n > 0 {
                     self.parser.process(&buf[..n]);
+                    let mut filtered = Vec::with_capacity(n);
+                    self.output_filter.filter(&buf[..n], &mut filtered);
+                    let filtered_len = filtered.len();
+                    buf[..filtered_len].copy_from_slice(&filtered);
+                    return Ok(filtered_len);
                 }
                 Ok(n)
             }
@@ -618,6 +799,12 @@ impl Session {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
 
+    pub fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
+        self.parser
+            .callbacks_mut()
+            .take_pending_terminal_responses()
+    }
+
     /// Get the master fd for polling.
     pub fn master_fd(&self) -> i32 {
         self.pty.master.as_raw_fd()
@@ -648,7 +835,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_snapshot, KittyKeyboardState, SessionCallbacks};
+    use super::{build_snapshot, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter};
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
 
@@ -687,6 +874,62 @@ mod tests {
         assert!(!snapshot.contains("\x1b]10;?\x1b\\"));
         assert!(!snapshot.contains("\x1b]11;?\x1b\\"));
         assert!(!snapshot.contains("\x1b]4;1;?\x1b\\"));
+    }
+
+    #[test]
+    fn osc_color_queries_queue_daemon_responses() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            DEFAULT_TERMINAL_ROWS,
+            DEFAULT_TERMINAL_COLS,
+            1000,
+            SessionCallbacks::default(),
+        );
+        parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+
+        let responses = parser.callbacks_mut().take_pending_terminal_responses();
+        let response_text = String::from_utf8_lossy(&responses.concat()).into_owned();
+
+        assert!(response_text.contains("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"));
+        assert!(response_text.contains("\x1b]11;rgb:0000/0000/0000\x1b\\"));
+        assert!(response_text.contains("\x1b]4;1;rgb:cdcd/0000/0000\x1b\\"));
+    }
+
+    #[test]
+    fn terminal_output_filter_strips_reply_generating_queries() {
+        let mut filter = TerminalOutputFilter::default();
+        let mut output = Vec::new();
+
+        filter.filter(
+            b"a\x1b]10;?\x1b\\b\x1b]11;?\x07c\x1b[c\x1b[>0cd",
+            &mut output,
+        );
+
+        assert_eq!(output, b"abcd");
+    }
+
+    #[test]
+    fn terminal_output_filter_handles_split_queries() {
+        let mut filter = TerminalOutputFilter::default();
+        let mut output = Vec::new();
+
+        filter.filter(b"a\x1b]10", &mut output);
+        assert_eq!(output, b"a");
+
+        filter.filter(b";?\x1b\\b\x1b[", &mut output);
+        assert_eq!(output, b"ab");
+
+        filter.filter(b">cb", &mut output);
+        assert_eq!(output, b"abb");
+    }
+
+    #[test]
+    fn terminal_output_filter_preserves_non_query_controls() {
+        let mut filter = TerminalOutputFilter::default();
+        let mut output = Vec::new();
+
+        filter.filter(b"\x1b]2;title\x1b\\\x1b[31mred", &mut output);
+
+        assert_eq!(output, b"\x1b]2;title\x1b\\\x1b[31mred");
     }
 
     #[test]
