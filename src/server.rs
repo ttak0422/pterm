@@ -304,6 +304,12 @@ impl Server {
                 break;
             }
         }
+        for response in self.session.take_pending_terminal_responses() {
+            if let Err(e) = self.session.write_pty(&response) {
+                log::warn!("Failed to write terminal query response to PTY: {}", e);
+                break;
+            }
+        }
 
         if !self.pending_pty_output.is_empty() {
             self.flush_pty_output();
