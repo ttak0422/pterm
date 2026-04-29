@@ -1,5 +1,6 @@
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::pty::Pty;
+use nix::sys::termios;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
@@ -781,6 +782,11 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    pub fn echo_enabled(&self) -> io::Result<bool> {
+        let termios = termios::tcgetattr(&self.pty.master).map_err(io::Error::other)?;
+        Ok(termios.local_flags.contains(termios::LocalFlags::ECHO))
     }
 
     /// Resize the pty and VT parser.
