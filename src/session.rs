@@ -12,7 +12,6 @@ struct SessionCallbacks {
     window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
-    pending_terminal_responses: VecDeque<Vec<u8>>,
     cursor_shape: Option<u8>,
     kitty_keyboard_states: ScreenKittyKeyboardStates,
     focus_tracking: bool,
@@ -225,72 +224,6 @@ impl SessionCallbacks {
         // query against the client terminal, and its reply can then be
         // forwarded into the PTY as if it were user input.
         !params.last().is_some_and(|param| *param == b"?")
-    }
-
-    fn queue_osc_query_response(&mut self, params: &[&[u8]]) -> bool {
-        if !params.last().is_some_and(|param| *param == b"?") {
-            return false;
-        }
-
-        match params {
-            [b"10", b"?"] => {
-                self.push_terminal_response(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\".to_vec());
-                true
-            }
-            [b"11", b"?"] => {
-                self.push_terminal_response(b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec());
-                true
-            }
-            [b"12", b"?"] => {
-                self.push_terminal_response(b"\x1b]12;rgb:ffff/ffff/ffff\x1b\\".to_vec());
-                true
-            }
-            [b"4", index, b"?"] => {
-                let color = Self::palette_color_response(index);
-                let mut response = Vec::with_capacity(16 + index.len() + color.len());
-                response.extend_from_slice(b"\x1b]4;");
-                response.extend_from_slice(index);
-                response.push(b';');
-                response.extend_from_slice(color);
-                response.extend_from_slice(b"\x1b\\");
-                self.push_terminal_response(response);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn palette_color_response(index: &[u8]) -> &'static [u8] {
-        match std::str::from_utf8(index)
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-        {
-            Some(0) => b"rgb:0000/0000/0000",
-            Some(1) => b"rgb:cdcd/0000/0000",
-            Some(2) => b"rgb:0000/cdcd/0000",
-            Some(3) => b"rgb:cdcd/cdcd/0000",
-            Some(4) => b"rgb:0000/0000/eeee",
-            Some(5) => b"rgb:cdcd/0000/cdcd",
-            Some(6) => b"rgb:0000/cdcd/cdcd",
-            Some(7) => b"rgb:e5e5/e5e5/e5e5",
-            Some(8) => b"rgb:7f7f/7f7f/7f7f",
-            Some(9) => b"rgb:ffff/0000/0000",
-            Some(10) => b"rgb:0000/ffff/0000",
-            Some(11) => b"rgb:ffff/ffff/0000",
-            Some(12) => b"rgb:5c5c/5c5c/ffff",
-            Some(13) => b"rgb:ffff/0000/ffff",
-            Some(14) => b"rgb:0000/ffff/ffff",
-            Some(15) => b"rgb:ffff/ffff/ffff",
-            _ => b"rgb:0000/0000/0000",
-        }
-    }
-
-    fn push_terminal_response(&mut self, response: Vec<u8>) {
-        self.pending_terminal_responses.push_back(response);
-    }
-
-    fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
-        self.pending_terminal_responses.drain(..).collect()
     }
 
     fn format_clipboard_copy(screen: &[u8], data: &[u8]) -> Vec<u8> {
@@ -594,9 +527,6 @@ impl vt100::Callbacks for SessionCallbacks {
         if self.update_hyperlink_state(params) {
             return;
         }
-        if self.queue_osc_query_response(params) {
-            return;
-        }
         if Self::is_passthrough_osc(params) {
             self.push_passthrough_sequence(Self::format_unhandled_osc(params));
         }
@@ -805,12 +735,6 @@ impl Session {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
 
-    pub fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
-        self.parser
-            .callbacks_mut()
-            .take_pending_terminal_responses()
-    }
-
     /// Get the master fd for polling.
     pub fn master_fd(&self) -> i32 {
         self.pty.master.as_raw_fd()
@@ -883,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn osc_color_queries_queue_daemon_responses() {
+    fn osc_color_queries_do_not_queue_daemon_responses() {
         let mut parser = vt100::Parser::new_with_callbacks(
             DEFAULT_TERMINAL_ROWS,
             DEFAULT_TERMINAL_COLS,
@@ -892,12 +816,10 @@ mod tests {
         );
         parser.process(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
 
-        let responses = parser.callbacks_mut().take_pending_terminal_responses();
-        let response_text = String::from_utf8_lossy(&responses.concat()).into_owned();
+        let snapshot = build_snapshot(parser.screen(), parser.callbacks());
+        let snapshot = String::from_utf8_lossy(&snapshot);
 
-        assert!(response_text.contains("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"));
-        assert!(response_text.contains("\x1b]11;rgb:0000/0000/0000\x1b\\"));
-        assert!(response_text.contains("\x1b]4;1;rgb:cdcd/0000/0000\x1b\\"));
+        assert!(!snapshot.contains("rgb:"));
     }
 
     #[test]
