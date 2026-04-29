@@ -280,6 +280,7 @@ impl Server {
         }
 
         let (pending_da1, pending_da2) = self.session.take_pending_da_queries();
+        let pending_terminal_responses = self.session.take_pending_terminal_responses();
         let total_pending_da = pending_da1 + pending_da2;
         if !self.clients.is_empty()
             && (total_pending_da > DA_QUERY_WARN_THRESHOLD
@@ -292,22 +293,43 @@ impl Server {
                 pending_da2
             );
         }
-        for _ in 0..pending_da1 {
-            if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
-                log::warn!("Failed to write DA1 response to PTY: {}", e);
-                break;
-            }
-        }
-        for _ in 0..pending_da2 {
-            if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
-                log::warn!("Failed to write DA2 response to PTY: {}", e);
-                break;
-            }
-        }
-        for response in self.session.take_pending_terminal_responses() {
-            if let Err(e) = self.session.write_pty(&response) {
-                log::warn!("Failed to write terminal query response to PTY: {}", e);
-                break;
+        if total_pending_da > 0 || !pending_terminal_responses.is_empty() {
+            match self.session.echo_enabled() {
+                Ok(false) => {
+                    for _ in 0..pending_da1 {
+                        if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
+                            log::warn!("Failed to write DA1 response to PTY: {}", e);
+                            break;
+                        }
+                    }
+                    for _ in 0..pending_da2 {
+                        if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
+                            log::warn!("Failed to write DA2 response to PTY: {}", e);
+                            break;
+                        }
+                    }
+                    for response in pending_terminal_responses {
+                        if let Err(e) = self.session.write_pty(&response) {
+                            log::warn!("Failed to write terminal query response to PTY: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Ok(true) => {
+                    log::debug!(
+                        "Dropping {} DA query response(s) and {} terminal query response(s) while PTY ECHO is enabled",
+                        total_pending_da,
+                        pending_terminal_responses.len()
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Dropping {} DA query response(s) and {} terminal query response(s) after failing to read PTY ECHO state: {}",
+                        total_pending_da,
+                        pending_terminal_responses.len(),
+                        e
+                    );
+                }
             }
         }
 
