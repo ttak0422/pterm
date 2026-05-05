@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-05-05
+
+### Bug Fixes
+
+- *(nvim)* Preserve global window option defaults
 ## [1.0.1] - 2026-04-29
 
 ### Miscellaneous Tasks
@@ -428,6 +433,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[1.0.2]: https://github.com/ttak0422/pterm/compare/v1.0.1..v1.0.2
 [1.0.1]: https://github.com/ttak0422/pterm/compare/v1.0.0..v1.0.1
 [1.0.0]: https://github.com/ttak0422/pterm/compare/v0.2.6..v1.0.0
 [0.2.6]: https://github.com/ttak0422/pterm/compare/v0.2.5..v0.2.6
