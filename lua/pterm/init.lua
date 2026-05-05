@@ -207,6 +207,23 @@ local function schedule_redraw(session_name, delay_ms)
 	)
 end
 
+local function with_preserved_global_options(option_names, callback)
+	local saved = {}
+	for _, name in ipairs(option_names) do
+		saved[name] = vim.go[name]
+	end
+
+	local ok, err = pcall(callback)
+
+	for _, name in ipairs(option_names) do
+		vim.go[name] = saved[name]
+	end
+
+	if not ok then
+		error(err)
+	end
+end
+
 --- Internal: create a terminal buffer and start a pterm bridge process.
 --- `cmd` is the full argv for jobstart (e.g. {"pterm","open","main"}).
 local function start_terminal(session_name, cmd)
@@ -227,9 +244,11 @@ local function start_terminal(session_name, cmd)
 	local win = vim.api.nvim_get_current_win()
 	vim.api.nvim_set_option_value("number", false, { win = win })
 	vim.api.nvim_set_option_value("relativenumber", false, { win = win })
-	vim.api.nvim_set_option_value("signcolumn", "no", { win = win })
-	vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
-	vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
+	with_preserved_global_options({ "signcolumn", "foldcolumn", "statuscolumn" }, function()
+		vim.api.nvim_set_option_value("signcolumn", "no", { win = win })
+		vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
+		vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
+	end)
 
 	-- Let the bridge read the actual PTY size via TIOCGWINSZ instead of
 	-- passing --cols/--rows from Lua.  jobstart({term=true}) creates a PTY

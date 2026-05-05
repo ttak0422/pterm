@@ -223,7 +223,7 @@ impl SessionCallbacks {
         // information. Replaying them from a snapshot would trigger a fresh
         // query against the client terminal, and its reply can then be
         // forwarded into the PTY as if it were user input.
-        !params.last().is_some_and(|param| *param == b"?")
+        params.last().is_none_or(|param| *param != b"?")
     }
 
     fn format_clipboard_copy(screen: &[u8], data: &[u8]) -> Vec<u8> {
@@ -644,7 +644,7 @@ impl TerminalOutputFilter {
         };
         let body = &seq[2..end];
         body.split(|&byte| byte == b';')
-            .last()
+            .next_back()
             .is_some_and(|param| param == b"?")
     }
 }
