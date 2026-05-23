@@ -455,6 +455,21 @@ function M.redraw(session_name)
 	end
 end
 
+--- Return a plain-text snapshot of the visible terminal screen.
+function M.snapshot_text(session_name)
+	if not session_name or session_name == "" then
+		return nil, "Session name required"
+	end
+
+	local bin = find_binary()
+	local output = vim.fn.system({ bin, "snapshot-text", session_name })
+	if vim.v.shell_error ~= 0 then
+		return nil, output
+	end
+
+	return (output:gsub("\n$", ""))
+end
+
 --- Setup function for lazy.nvim / packer etc.
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})

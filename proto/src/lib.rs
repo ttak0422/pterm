@@ -29,8 +29,11 @@ pub mod client {
     /// Request terminal redraw (no payload)
     pub const REDRAW: u8 = 0x04;
 
+    /// Request a plain-text snapshot of the visible terminal screen (no payload)
+    pub const SNAPSHOT_TEXT: u8 = 0x05;
+
     /// Request a diagnostic dump of the daemon-side terminal state (no payload)
-    pub const DUMP: u8 = 0x05;
+    pub const DUMP: u8 = 0x06;
 }
 
 /// Daemon → Client message types
@@ -47,9 +50,13 @@ pub mod server {
     /// Payload: escape sequences reproducing current terminal state
     pub const STATE_SYNC: u8 = 0x80;
 
+    /// Plain-text snapshot of the visible terminal screen
+    /// Payload: UTF-8 text rows separated by LF
+    pub const SNAPSHOT_TEXT: u8 = 0x81;
+
     /// Diagnostic dump of the daemon-side terminal state
     /// Payload: UTF-8 JSON
-    pub const DUMP: u8 = 0x81;
+    pub const DUMP: u8 = 0x82;
 }
 
 /// Encode a framed message into a Vec<u8>.
