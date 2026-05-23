@@ -28,6 +28,9 @@ pterm socket mysession
 # Redraw terminal (resend snapshot to all clients)
 pterm redraw mysession
 
+# Print diagnostic state dump as JSON
+pterm dump mysession
+
 # Kill a session
 pterm kill mysession
 ```
@@ -47,12 +50,13 @@ pterm kill parent          # kills parent and parent/child
 :Pterm dev zsh      " opens/creates session with custom command
 :PtermList          " list sessions
 :PtermRedraw dev    " redraw a session
+:PtermDump dev      " open diagnostic state dump as JSON
 :PtermKill dev      " kill a session
 ```
 
 `pterm` opens a terminal buffer backed by `jobstart({ "pterm", "attach", <name> }, { term = true })`.
 
-The Lua module also exports functions for programmatic use: `open`, `attach`, `detach`, `list`, `kill`, `redraw`.
+The Lua module also exports functions for programmatic use: `open`, `attach`, `detach`, `list`, `kill`, `redraw`, `dump`.
 
 ## Requirements
 

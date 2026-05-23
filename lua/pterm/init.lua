@@ -470,6 +470,38 @@ function M.snapshot_text(session_name)
 	return (output:gsub("\n$", ""))
 end
 
+--- Return a diagnostic state dump as JSON.
+function M.dump(session_name)
+	if not session_name or session_name == "" then
+		return nil, "Session name required"
+	end
+
+	local bin = find_binary()
+	local output = vim.fn.system({ bin, "dump", session_name })
+	if vim.v.shell_error ~= 0 then
+		return nil, output
+	end
+
+	return (output:gsub("\n$", ""))
+end
+
+local function open_dump_buffer(session_name, dump)
+	local buf_name = "pterm-dump://" .. session_name
+	local existing = vim.fn.bufnr(buf_name)
+	if existing ~= -1 then
+		pcall(vim.api.nvim_buf_delete, existing, { force = true })
+	end
+
+	local buf = vim.api.nvim_create_buf(true, true)
+	vim.api.nvim_buf_set_name(buf, buf_name)
+	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+	vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+	vim.api.nvim_set_option_value("filetype", "json", { buf = buf })
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(dump, "\n", { plain = true }))
+	vim.api.nvim_set_current_buf(buf)
+end
+
 --- Setup function for lazy.nvim / packer etc.
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
@@ -512,6 +544,24 @@ function M.setup(opts)
 		nargs = 1,
 		complete = complete_sessions,
 		desc = "Redraw a persistent terminal session",
+	})
+
+	vim.api.nvim_create_user_command("PtermDump", function(cmd_opts)
+		local session_name = cmd_opts.fargs[1]
+		local dump, err = M.dump(session_name)
+		if not dump then
+			vim.notify(
+				"Failed to dump session '" .. session_name .. "': " .. vim.trim(tostring(err or "")),
+				vim.log.levels.ERROR
+			)
+			return
+		end
+
+		open_dump_buffer(session_name, dump)
+	end, {
+		nargs = 1,
+		complete = complete_sessions,
+		desc = "Open a diagnostic dump for a persistent terminal session",
 	})
 
 	vim.api.nvim_create_user_command("PtermKill", function(cmd_opts)
