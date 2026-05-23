@@ -8,7 +8,7 @@ mod session;
 use crate::paths::{find_sessions, session_dir, session_socket_path, socket_dir, SOCKET_FILENAME};
 use server::Server;
 use session::Session;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,6 +26,7 @@ Usage:
   pterm list   [prefix]
   pterm kill   <session-name>
   pterm redraw <session-name>   # redraw terminal (resend snapshot)
+  pterm dump   <session-name>   # print diagnostic state dump as JSON
   pterm socket <session-name>   # print socket path
 
 Session names may contain '/' for hierarchical sessions:
@@ -306,6 +307,60 @@ fn cmd_redraw(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn cmd_dump(args: &[String]) -> io::Result<()> {
+    let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
+        eprintln!("Error: session name required");
+        std::process::exit(1);
+    });
+
+    let sock = session_socket_path(name);
+    if !sock.exists() {
+        eprintln!("Error: session '{}' not found", name);
+        std::process::exit(1);
+    }
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let msg = pterm_proto::encode(pterm_proto::client::DUMP, &[]);
+    stream.write_all(&msg)?;
+
+    let mut recv_buf = Vec::new();
+    let mut read_buf = vec![0u8; 65536];
+    loop {
+        match stream.read(&mut read_buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon closed connection before sending dump",
+                ));
+            }
+            Ok(n) => {
+                recv_buf.extend_from_slice(&read_buf[..n]);
+                for frame in pterm_proto::decode_frames(&mut recv_buf) {
+                    if frame.msg_type == pterm_proto::server::DUMP {
+                        let mut stdout = io::stdout().lock();
+                        stdout.write_all(&frame.payload)?;
+                        stdout.write_all(b"\n")?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for dump response",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn cmd_socket(args: &[String]) -> io::Result<()> {
     let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
         eprintln!("Error: session name required");
@@ -332,6 +387,7 @@ fn main() {
         "list" | "ls" => cmd_list(&args[2..]),
         "kill" => cmd_kill(&args[2..]),
         "redraw" => cmd_redraw(&args[2..]),
+        "dump" => cmd_dump(&args[2..]),
         "socket" => cmd_socket(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();

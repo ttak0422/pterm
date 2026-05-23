@@ -23,6 +23,8 @@ struct Client {
     large_send_buf_warned: bool,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
+    /// One-shot diagnostic clients should not receive normal terminal output.
+    diagnostic: bool,
 }
 
 pub struct Server {
@@ -192,6 +194,7 @@ impl Server {
                             send_buf: Vec::new(),
                             large_send_buf_warned: false,
                             pending_snapshot: true,
+                            diagnostic: false,
                         },
                     );
                 }
@@ -260,9 +263,18 @@ impl Server {
     }
 
     fn handle_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        // Drain all available PTY data (non-blocking) and flush immediately.
-        // No timer-based batching — the drain loop itself coalesces all bytes
-        // that are available at this instant.
+        self.drain_pty_output(buf)?;
+
+        if !self.pending_pty_output.is_empty() {
+            self.flush_pty_output();
+        }
+
+        Ok(())
+    }
+
+    fn drain_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        // Drain all available PTY data (non-blocking). No timer-based batching
+        // -- the drain loop itself coalesces all bytes available right now.
         loop {
             match self.session.read_pty(buf) {
                 Ok(0) => break,
@@ -324,10 +336,6 @@ impl Server {
             }
         }
 
-        if !self.pending_pty_output.is_empty() {
-            self.flush_pty_output();
-        }
-
         Ok(())
     }
 
@@ -349,7 +357,13 @@ impl Server {
         let snapshot_ids: Vec<usize> = self
             .clients
             .iter()
-            .filter_map(|(&id, c)| if c.pending_snapshot { Some(id) } else { None })
+            .filter_map(|(&id, c)| {
+                if c.pending_snapshot && !c.diagnostic {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
             .collect();
         for id in &snapshot_ids {
             log::info!("Client {} snapshot triggered by PTY output arrival", *id);
@@ -362,6 +376,9 @@ impl Server {
         let mut disconnected = Vec::new();
         let mut flush_ids = Vec::new();
         for (&id, client) in self.clients.iter_mut() {
+            if client.diagnostic {
+                continue;
+            }
             // Skip clients that just received a snapshot — they already have
             // the up-to-date screen state and must not get the raw bytes again.
             if snapshot_ids.contains(&id) {
@@ -523,6 +540,29 @@ impl Server {
                     redraw_data.extend_from_slice(&self.session.snapshot());
                     let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
                     for (_, client) in self.clients.iter_mut() {
+                        client.send_buf.extend_from_slice(&msg);
+                    }
+                    flush_all = true;
+                }
+                proto::client::DUMP => {
+                    log::info!("Dump requested by client {}", client_id);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.diagnostic = true;
+                        client.pending_snapshot = false;
+                        client.send_buf.clear();
+                    }
+
+                    let mut pty_buf = vec![0u8; 65536];
+                    self.drain_pty_output(&mut pty_buf)?;
+                    if !self.pending_pty_output.is_empty() {
+                        self.flush_pty_output();
+                    }
+
+                    let payload = serde_json::to_vec_pretty(&self.session.dump())
+                        .map_err(io::Error::other)?;
+                    let msg = proto::encode(proto::server::DUMP, &payload);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.send_buf.clear();
                         client.send_buf.extend_from_slice(&msg);
                     }
                     flush_all = true;

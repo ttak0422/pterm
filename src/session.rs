@@ -1,6 +1,7 @@
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::pty::Pty;
 use nix::sys::termios;
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
@@ -31,6 +32,118 @@ struct KittyKeyboardState {
 struct ScreenKittyKeyboardStates {
     main: KittyKeyboardState,
     alternate: KittyKeyboardState,
+}
+
+#[derive(Serialize)]
+pub struct SessionDump {
+    schema_version: u8,
+    session: String,
+    screen: ScreenDump,
+    tracked: TrackedStateDump,
+    snapshot: BytesDump,
+}
+
+#[derive(Serialize)]
+struct ScreenDump {
+    size: SizeDump,
+    cursor: CursorDump,
+    scrollback: usize,
+    modes: ScreenModesDump,
+    active_attrs: CellAttrsDump,
+    rows: Vec<RowDump>,
+}
+
+#[derive(Serialize)]
+struct SizeDump {
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Serialize)]
+struct CursorDump {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Serialize)]
+struct ScreenModesDump {
+    alternate_screen: bool,
+    application_keypad: bool,
+    application_cursor: bool,
+    hide_cursor: bool,
+    bracketed_paste: bool,
+    mouse_protocol_mode: String,
+    mouse_protocol_encoding: String,
+}
+
+#[derive(Serialize)]
+struct RowDump {
+    row: u16,
+    wrapped: bool,
+    text: String,
+    cells: Vec<CellDump>,
+}
+
+#[derive(Serialize)]
+struct CellDump {
+    col: u16,
+    text: String,
+    wide: bool,
+    wide_continuation: bool,
+    attrs: CellAttrsDump,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+struct CellAttrsDump {
+    fg: ColorDump,
+    bg: ColorDump,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum ColorDump {
+    Default,
+    Index(u8),
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+#[derive(Serialize)]
+struct TrackedStateDump {
+    window_title: Option<String>,
+    window_title_stack: Vec<String>,
+    pending_da1_queries: usize,
+    pending_da2_queries: usize,
+    cursor_shape: Option<u8>,
+    kitty_keyboard: ScreenKittyKeyboardStatesDump,
+    focus_tracking: bool,
+    synchronized_output: bool,
+    hyperlink_uri: Option<String>,
+    passthrough_sequences: Vec<BytesDump>,
+    passthrough_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct ScreenKittyKeyboardStatesDump {
+    main: KittyKeyboardStateDump,
+    alternate: KittyKeyboardStateDump,
+}
+
+#[derive(Serialize)]
+struct KittyKeyboardStateDump {
+    flags: u32,
+    stack: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct BytesDump {
+    len: usize,
+    escaped: String,
+    hex: String,
 }
 
 impl SessionCallbacks {
@@ -320,6 +433,184 @@ impl SessionCallbacks {
             self.hyperlink_uri = Some(String::from_utf8_lossy(params[2]).into_owned());
         }
         true
+    }
+
+    fn dump(&self) -> TrackedStateDump {
+        TrackedStateDump {
+            window_title: self.window_title.clone(),
+            window_title_stack: self.window_title_stack.clone(),
+            pending_da1_queries: self.pending_da1_queries,
+            pending_da2_queries: self.pending_da2_queries,
+            cursor_shape: self.cursor_shape,
+            kitty_keyboard: ScreenKittyKeyboardStatesDump {
+                main: self.kitty_keyboard_states.main.dump(),
+                alternate: self.kitty_keyboard_states.alternate.dump(),
+            },
+            focus_tracking: self.focus_tracking,
+            synchronized_output: self.synchronized_output,
+            hyperlink_uri: self.hyperlink_uri.clone(),
+            passthrough_sequences: self
+                .passthrough_sequences
+                .iter()
+                .map(|seq| BytesDump::new(seq))
+                .collect(),
+            passthrough_bytes: self.passthrough_bytes,
+        }
+    }
+}
+
+impl KittyKeyboardState {
+    fn dump(&self) -> KittyKeyboardStateDump {
+        KittyKeyboardStateDump {
+            flags: self.flags,
+            stack: self.stack.iter().copied().collect(),
+        }
+    }
+}
+
+impl BytesDump {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len(),
+            escaped: escape_bytes(bytes),
+            hex: format_bytes_hex(bytes),
+        }
+    }
+}
+
+impl ColorDump {
+    fn new(color: vt100::Color) -> Self {
+        match color {
+            vt100::Color::Default => Self::Default,
+            vt100::Color::Idx(idx) => Self::Index(idx),
+            vt100::Color::Rgb(r, g, b) => Self::Rgb { r, g, b },
+        }
+    }
+}
+
+impl CellAttrsDump {
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: ColorDump::new(cell.fgcolor()),
+            bg: ColorDump::new(cell.bgcolor()),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    fn from_screen(screen: &vt100::Screen) -> Self {
+        Self {
+            fg: ColorDump::new(screen.fgcolor()),
+            bg: ColorDump::new(screen.bgcolor()),
+            bold: screen.bold(),
+            dim: screen.dim(),
+            italic: screen.italic(),
+            underline: screen.underline(),
+            inverse: screen.inverse(),
+        }
+    }
+}
+
+impl Default for CellAttrsDump {
+    fn default() -> Self {
+        Self {
+            fg: ColorDump::Default,
+            bg: ColorDump::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }
+    }
+}
+
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\x1b' => escaped.push_str("\\e"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            b'\\' => escaped.push_str("\\\\"),
+            b'"' => escaped.push_str("\\\""),
+            0x20..=0x7e => escaped.push(byte as char),
+            _ => {
+                let _ = write!(&mut escaped, "\\x{byte:02x}");
+            }
+        }
+    }
+    escaped
+}
+
+fn format_bytes_hex(bytes: &[u8]) -> String {
+    let mut formatted = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(&mut formatted, "{byte:02x}");
+    }
+    formatted
+}
+
+fn dump_screen(screen: &vt100::Screen) -> ScreenDump {
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let default_attrs = CellAttrsDump::default();
+    let text_rows: Vec<String> = screen.rows(0, cols).collect();
+    let mut rows_dump = Vec::with_capacity(usize::from(rows));
+
+    for row in 0..rows {
+        let mut cells = Vec::new();
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            let attrs = CellAttrsDump::from_cell(cell);
+            if !cell.has_contents()
+                && !cell.is_wide()
+                && !cell.is_wide_continuation()
+                && attrs == default_attrs
+            {
+                continue;
+            }
+            cells.push(CellDump {
+                col,
+                text: cell.contents().to_string(),
+                wide: cell.is_wide(),
+                wide_continuation: cell.is_wide_continuation(),
+                attrs,
+            });
+        }
+
+        rows_dump.push(RowDump {
+            row,
+            wrapped: screen.row_wrapped(row),
+            text: text_rows.get(usize::from(row)).cloned().unwrap_or_default(),
+            cells,
+        });
+    }
+
+    ScreenDump {
+        size: SizeDump { rows, cols },
+        cursor: CursorDump {
+            row: cursor_row,
+            col: cursor_col,
+        },
+        scrollback: screen.scrollback(),
+        modes: ScreenModesDump {
+            alternate_screen: screen.alternate_screen(),
+            application_keypad: screen.application_keypad(),
+            application_cursor: screen.application_cursor(),
+            hide_cursor: screen.hide_cursor(),
+            bracketed_paste: screen.bracketed_paste(),
+            mouse_protocol_mode: format!("{:?}", screen.mouse_protocol_mode()),
+            mouse_protocol_encoding: format!("{:?}", screen.mouse_protocol_encoding()),
+        },
+        active_attrs: CellAttrsDump::from_screen(screen),
+        rows: rows_dump,
     }
 }
 
@@ -731,6 +1022,18 @@ impl Session {
         build_snapshot(self.parser.screen(), self.parser.callbacks())
     }
 
+    /// Build a structured diagnostic dump of the daemon-side terminal state.
+    pub fn dump(&self) -> SessionDump {
+        let snapshot = self.snapshot();
+        SessionDump {
+            schema_version: 1,
+            session: self.name.clone(),
+            screen: dump_screen(self.parser.screen()),
+            tracked: self.parser.callbacks().dump(),
+            snapshot: BytesDump::new(&snapshot),
+        }
+    }
+
     pub fn take_pending_da_queries(&mut self) -> (usize, usize) {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
@@ -765,9 +1068,39 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_snapshot, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter};
+    use super::{
+        build_snapshot, dump_screen, BytesDump, KittyKeyboardState, SessionCallbacks,
+        TerminalOutputFilter,
+    };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
+
+    #[test]
+    fn dump_screen_includes_rows_cells_and_attributes() {
+        let mut parser = vt100::Parser::new(DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS, 1000);
+        parser.process(b"plain \x1b[31mred");
+
+        let dump = dump_screen(parser.screen());
+        assert_eq!(dump.size.rows, DEFAULT_TERMINAL_ROWS);
+        assert_eq!(dump.size.cols, DEFAULT_TERMINAL_COLS);
+        assert!(dump.rows[0].text.contains("plain red"));
+
+        let red_cell = dump.rows[0]
+            .cells
+            .iter()
+            .find(|cell| cell.col == 6)
+            .expect("red cell should be present in dump");
+        assert_eq!(red_cell.text, "r");
+        assert!(matches!(red_cell.attrs.fg, super::ColorDump::Index(1)));
+    }
+
+    #[test]
+    fn bytes_dump_uses_debuggable_escape_and_hex_forms() {
+        let dump = BytesDump::new(b"\x1b[31m\r\n");
+        assert_eq!(dump.len, 7);
+        assert_eq!(dump.escaped, "\\e[31m\\r\\n");
+        assert_eq!(dump.hex, "1b5b33316d0d0a");
+    }
 
     #[test]
     fn snapshot_preserves_unhandled_osc_sequences() {
