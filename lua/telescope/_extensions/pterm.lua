@@ -6,7 +6,7 @@ local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
 local previewers = require("telescope.previewers")
 
-local function trim_left_to_width(line, width)
+local function trim_right_to_width(line, width)
 	if width <= 0 then
 		return ""
 	end
@@ -14,25 +14,25 @@ local function trim_left_to_width(line, width)
 		return line
 	end
 
-	local prefix = "..."
-	if width <= #prefix then
-		return prefix:sub(1, width)
+	local suffix = "..."
+	if width <= #suffix then
+		return suffix:sub(1, width)
 	end
 
-	local target_width = width - #prefix
+	local target_width = width - #suffix
 	local low = 0
 	local high = vim.fn.strchars(line)
 	while low < high do
-		local mid = math.floor((low + high) / 2)
-		local tail = vim.fn.strcharpart(line, mid)
-		if vim.fn.strdisplaywidth(tail) > target_width then
-			low = mid + 1
+		local mid = math.ceil((low + high) / 2)
+		local head = vim.fn.strcharpart(line, 0, mid)
+		if vim.fn.strdisplaywidth(head) <= target_width then
+			low = mid
 		else
-			high = mid
+			high = mid - 1
 		end
 	end
 
-	return prefix .. vim.fn.strcharpart(line, low)
+	return vim.fn.strcharpart(line, 0, low) .. suffix
 end
 
 local function tail_preview_lines(text, width, height)
@@ -47,7 +47,7 @@ local function tail_preview_lines(text, width, height)
 	local first = math.max(1, #lines - height + 1)
 	local preview = {}
 	for i = first, #lines do
-		table.insert(preview, trim_left_to_width(lines[i], width))
+		table.insert(preview, trim_right_to_width(lines[i], width))
 	end
 	return preview
 end
