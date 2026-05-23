@@ -544,6 +544,29 @@ impl Server {
                     }
                     flush_all = true;
                 }
+                proto::client::DUMP => {
+                    log::info!("Dump requested by client {}", client_id);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.diagnostic = true;
+                        client.pending_snapshot = false;
+                        client.send_buf.clear();
+                    }
+
+                    let mut pty_buf = vec![0u8; 65536];
+                    self.drain_pty_output(&mut pty_buf)?;
+                    if !self.pending_pty_output.is_empty() {
+                        self.flush_pty_output();
+                    }
+
+                    let payload = serde_json::to_vec_pretty(&self.session.dump())
+                        .map_err(io::Error::other)?;
+                    let msg = proto::encode(proto::server::DUMP, &payload);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.send_buf.clear();
+                        client.send_buf.extend_from_slice(&msg);
+                    }
+                    flush_all = true;
+                }
                 proto::client::SNAPSHOT_TEXT => {
                     log::info!("Snapshot text requested by client {}", client_id);
                     if let Some(client) = self.clients.get_mut(&client_id) {
