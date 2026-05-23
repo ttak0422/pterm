@@ -384,6 +384,11 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
     snapshot
 }
 
+fn build_snapshot_text(screen: &vt100::Screen) -> String {
+    let (_, cols) = screen.size();
+    screen.rows(0, cols).collect::<Vec<_>>().join("\n")
+}
+
 impl KittyKeyboardState {
     const MAX_STACK_DEPTH: usize = 64;
 
@@ -731,6 +736,11 @@ impl Session {
         build_snapshot(self.parser.screen(), self.parser.callbacks())
     }
 
+    /// Generate a plain-text snapshot of the visible terminal screen.
+    pub fn snapshot_text(&self) -> String {
+        build_snapshot_text(self.parser.screen())
+    }
+
     pub fn take_pending_da_queries(&mut self) -> (usize, usize) {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
@@ -765,7 +775,10 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_snapshot, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter};
+    use super::{
+        build_snapshot, build_snapshot_text, KittyKeyboardState, SessionCallbacks,
+        TerminalOutputFilter,
+    };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
 
@@ -1305,5 +1318,13 @@ mod tests {
             has_esc_before,
             "state_formatted() sequences should appear before DECSCUSR in snapshot"
         );
+    }
+
+    #[test]
+    fn snapshot_text_rows_include_visible_screen_contents() {
+        let mut parser = vt100::Parser::new_with_callbacks(3, 8, 1000, SessionCallbacks::default());
+        parser.process(b"hello\r\nworld");
+
+        assert_eq!(build_snapshot_text(parser.screen()), "hello\nworld\n");
     }
 }
