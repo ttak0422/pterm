@@ -4,6 +4,87 @@ local finders = require("telescope.finders")
 local conf = require("telescope.config").values
 local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
+local previewers = require("telescope.previewers")
+
+local function trim_left_to_width(line, width)
+	if width <= 0 then
+		return ""
+	end
+	if vim.fn.strdisplaywidth(line) <= width then
+		return line
+	end
+
+	local prefix = "..."
+	if width <= #prefix then
+		return prefix:sub(1, width)
+	end
+
+	local target_width = width - #prefix
+	local low = 0
+	local high = vim.fn.strchars(line)
+	while low < high do
+		local mid = math.floor((low + high) / 2)
+		local tail = vim.fn.strcharpart(line, mid)
+		if vim.fn.strdisplaywidth(tail) > target_width then
+			low = mid + 1
+		else
+			high = mid
+		end
+	end
+
+	return prefix .. vim.fn.strcharpart(line, low)
+end
+
+local function tail_preview_lines(text, width, height)
+	local lines = vim.split(text or "", "\n", { plain = true })
+	while #lines > 0 and lines[#lines] == "" do
+		table.remove(lines)
+	end
+	if #lines == 0 then
+		return { "(empty)" }
+	end
+
+	local first = math.max(1, #lines - height + 1)
+	local preview = {}
+	for i = first, #lines do
+		table.insert(preview, trim_left_to_width(lines[i], width))
+	end
+	return preview
+end
+
+local function make_previewer(pterm)
+	return previewers.new_buffer_previewer({
+		title = "pterm preview",
+		define_preview = function(self, entry, status)
+			status = status or {}
+			local session_name = entry and entry.value
+			if not session_name then
+				return
+			end
+
+			local width = 80
+			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
+				width = vim.api.nvim_win_get_width(status.preview_win)
+			end
+			local height = 20
+			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
+				height = vim.api.nvim_win_get_height(status.preview_win)
+			end
+
+			local text, err = pterm.snapshot_text(session_name)
+			local lines
+			if text then
+				lines = tail_preview_lines(text, width, height)
+			else
+				lines = { "Failed to load preview", vim.trim(tostring(err or "")) }
+			end
+
+			vim.api.nvim_set_option_value("modifiable", true, { buf = self.state.bufnr })
+			vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
+			vim.api.nvim_set_option_value("modifiable", false, { buf = self.state.bufnr })
+		end,
+	})
+end
 
 local function session_exists(pterm, session_name)
 	for _, name in ipairs(pterm.list()) do
@@ -35,6 +116,11 @@ local function sessions(opts)
 		})
 	end
 
+	local previewer = opts.previewer
+	if previewer == nil then
+		previewer = make_previewer(pterm)
+	end
+
 	pickers
 		.new(opts, {
 			prompt_title = "pterm sessions",
@@ -49,6 +135,7 @@ local function sessions(opts)
 				end,
 			}),
 			sorter = conf.generic_sorter(opts),
+			previewer = previewer,
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
 					actions.close(prompt_bufnr)
