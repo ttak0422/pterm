@@ -470,6 +470,54 @@ function M.snapshot_text(session_name)
 	return (output:gsub("\n$", ""))
 end
 
+--- Asynchronously return a plain-text snapshot of the visible terminal screen.
+function M.snapshot_text_async(session_name, callback)
+	if type(callback) ~= "function" then
+		error("callback required")
+	end
+
+	if not session_name or session_name == "" then
+		vim.schedule(function()
+			callback(nil, "Session name required")
+		end)
+		return nil
+	end
+
+	local ok, bin = pcall(find_binary)
+	if not ok then
+		vim.schedule(function()
+			callback(nil, bin)
+		end)
+		return nil
+	end
+
+	local system_ok, job = pcall(
+		vim.system,
+		{ bin, "snapshot-text", session_name },
+		{ text = true },
+		vim.schedule_wrap(function(result)
+			if result.code == 0 then
+				callback((result.stdout or ""):gsub("\n$", ""))
+				return
+			end
+
+			local err = result.stderr or result.stdout or ""
+			if err == "" then
+				err = "pterm snapshot-text exited with code " .. tostring(result.code)
+			end
+			callback(nil, err)
+		end)
+	)
+	if not system_ok then
+		vim.schedule(function()
+			callback(nil, job)
+		end)
+		return nil
+	end
+
+	return job
+end
+
 --- Return a diagnostic state dump as JSON.
 function M.dump(session_name)
 	if not session_name or session_name == "" then

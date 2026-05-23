@@ -52,15 +52,41 @@ local function tail_preview_lines(text, width, height)
 	return preview
 end
 
+local function set_preview_lines(bufnr, lines)
+	if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	local ok = pcall(function()
+		vim.api.nvim_set_option_value("modifiable", true, { buf = bufnr })
+		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+		vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
+	end)
+	if not ok and vim.api.nvim_buf_is_valid(bufnr) then
+		pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = bufnr })
+	end
+end
+
 local function make_previewer(pterm)
 	return previewers.new_buffer_previewer({
 		title = "pterm preview",
 		define_preview = function(self, entry, status)
 			status = status or {}
+			self.state = self.state or {}
+
 			local session_name = entry and entry.value
 			if not session_name then
 				return
 			end
+
+			local request_id = (self.state.pterm_preview_request_id or 0) + 1
+			self.state.pterm_preview_request_id = request_id
+
+			local previous_job = self.state.pterm_preview_job
+			if previous_job and previous_job.kill then
+				pcall(previous_job.kill, previous_job, 15)
+			end
+			self.state.pterm_preview_job = nil
 
 			local width = 80
 			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
@@ -71,17 +97,24 @@ local function make_previewer(pterm)
 				height = vim.api.nvim_win_get_height(status.preview_win)
 			end
 
-			local text, err = pterm.snapshot_text(session_name)
-			local lines
-			if text then
-				lines = tail_preview_lines(text, width, height)
-			else
-				lines = { "Failed to load preview", vim.trim(tostring(err or "")) }
-			end
+			local bufnr = self.state.bufnr
+			set_preview_lines(bufnr, { "Loading preview..." })
 
-			vim.api.nvim_set_option_value("modifiable", true, { buf = self.state.bufnr })
-			vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
-			vim.api.nvim_set_option_value("modifiable", false, { buf = self.state.bufnr })
+			self.state.pterm_preview_job = pterm.snapshot_text_async(session_name, function(text, err)
+				if not self.state or self.state.pterm_preview_request_id ~= request_id then
+					return
+				end
+				self.state.pterm_preview_job = nil
+
+				local lines
+				if text then
+					lines = tail_preview_lines(text, width, height)
+				else
+					lines = { "Failed to load preview", vim.trim(tostring(err or "")) }
+				end
+
+				set_preview_lines(bufnr, lines)
+			end)
 		end,
 	})
 end
