@@ -114,8 +114,9 @@ function M.list()
 	return sessions
 end
 
---- Return the working directory a session was created from, or nil if unknown.
---- The daemon records this in `<socket_dir>/<name>/cwd` at creation time.
+--- Return the session shell's current working directory, or nil if unknown.
+--- The daemon records this in `<socket_dir>/<name>/cwd` and refreshes it as the
+--- shell changes directory.
 function M.session_cwd(session_name)
 	if not session_name or session_name == "" then
 		return nil

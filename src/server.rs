@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LISTENER: Token = Token(0);
 const PTY_BASE: Token = Token(0x1000_0000);
@@ -15,6 +15,9 @@ const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
 const DA_QUERY_WARN_THRESHOLD: usize = 2;
 const LARGE_SEND_BUF_WARN_BYTES: usize = 64 * 1024;
+/// How often the daemon re-reads the child shell's working directory and
+/// refreshes the `cwd` file so session lists can follow `cd`.
+const CWD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 struct Client {
     stream: UnixStream,
@@ -38,6 +41,12 @@ pub struct Server {
     pending_pty_output: Vec<u8>,
     /// `true` after the EXIT message has been broadcast to clients.
     exit_sent: bool,
+    /// Path of the `cwd` file recording the session's working directory.
+    cwd_path: PathBuf,
+    /// Last cwd written to `cwd_path`, to skip redundant writes.
+    last_cwd: Option<String>,
+    /// When the cwd was last refreshed from the child process.
+    last_cwd_refresh: Instant,
 }
 
 impl Server {
@@ -48,6 +57,11 @@ impl Server {
         std::fs::create_dir_all(session_dir)?;
 
         let socket_path = session_dir.join("socket");
+        let cwd_path = session_dir.join(crate::paths::CWD_FILENAME);
+        let last_cwd = std::fs::read_to_string(&cwd_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         if socket_path.exists() {
             std::fs::remove_file(&socket_path)?;
@@ -79,6 +93,9 @@ impl Server {
             next_client_id: 0,
             pending_pty_output: Vec::new(),
             exit_sent: false,
+            cwd_path,
+            last_cwd,
+            last_cwd_refresh: Instant::now(),
         })
     }
 
@@ -110,6 +127,8 @@ impl Server {
 
             self.poll
                 .poll(&mut events, Some(Duration::from_millis(100)))?;
+
+            self.refresh_cwd();
 
             for event in events.iter() {
                 match event.token() {
@@ -170,6 +189,28 @@ impl Server {
         let _ = std::fs::remove_file(&self.socket_path);
         log::info!("Server shut down for session '{}'", self.session.name);
         Ok(())
+    }
+
+    /// Re-read the child shell's working directory and update the `cwd` file
+    /// when it changes, so session lists reflect `cd` inside the session.
+    /// Throttled to `CWD_REFRESH_INTERVAL`.
+    fn refresh_cwd(&mut self) {
+        if self.last_cwd_refresh.elapsed() < CWD_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_cwd_refresh = Instant::now();
+
+        let pid = self.session.pty.child_pid.as_raw();
+        let cwd = match crate::paths::process_cwd(pid) {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => return,
+        };
+        if self.last_cwd.as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+        if std::fs::write(&self.cwd_path, cwd.as_bytes()).is_ok() {
+            self.last_cwd = Some(cwd);
+        }
     }
 
     fn accept_client(&mut self) -> io::Result<()> {

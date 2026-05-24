@@ -116,7 +116,8 @@ require("telescope").load_extension("pterm")
 ```
 
 Each session is shown as `<name> (<directory>)`, where the directory is the
-basename of the working directory the session was created from. Connected
+basename of the session shell's current working directory. The daemon tracks
+`cd` inside the session and refreshes it periodically. Connected
 sessions are marked with a `✔` prefix.
 The preview pane shows the tail of each session's current terminal screen,
 trimmed to the preview width.

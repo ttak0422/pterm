@@ -102,8 +102,9 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     // Create session directory (including parent directories for hierarchical names)
     std::fs::create_dir_all(&sess_dir)?;
 
-    // Record the working directory so clients can show which directory a
-    // session belongs to (e.g. distinguishing git worktrees that share names).
+    // Record the initial working directory so clients can show which directory
+    // a session belongs to (e.g. distinguishing git worktrees that share names).
+    // The daemon refreshes this as the shell changes directory.
     if let Ok(cwd) = std::env::current_dir() {
         let _ = std::fs::write(
             sess_dir.join(CWD_FILENAME),
