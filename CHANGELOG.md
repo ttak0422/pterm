@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-05-24
+
+### Features
+
+- Show session directory basename in session lists
+Record the working directory a session was created from in
+  `<socket_dir>/<name>/cwd`, and surface its basename alongside the
+  session name in the Telescope picker and `:PtermList`. This makes
+  directory-agnostic names (e.g. git worktrees) easier to identify.
+
+  Also replace the wide `[connected]` marker with a compact check mark.
+- Track session cwd live instead of creation-time only
+The daemon now re-reads the session shell's working directory on a 2s
+  interval and refreshes `<socket_dir>/<name>/cwd` when it changes, so
+  session lists follow `cd` inside the session rather than showing the
+  directory the session was created from.
+
+  Add `paths::process_cwd(pid)` using `/proc/<pid>/cwd` on Linux and
+  `proc_pidinfo(PROC_PIDVNODEPATHINFO)` via libc on macOS, avoiding extra
+  dependencies.
+
+### Documentation
+
+- Document session directory display and check-mark marker
 ## [1.1.0] - 2026-05-23
 
 ### Features
@@ -439,6 +463,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[1.2.0]: https://github.com/ttak0422/pterm/compare/v1.1.0..v1.2.0
 [1.1.0]: https://github.com/ttak0422/pterm/compare/v1.0.2..v1.1.0
 [1.0.2]: https://github.com/ttak0422/pterm/compare/v1.0.1..v1.0.2
 [1.0.1]: https://github.com/ttak0422/pterm/compare/v1.0.0..v1.0.1
