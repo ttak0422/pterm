@@ -142,10 +142,11 @@ local function sessions(opts)
 	local entries = {}
 	for _, name in ipairs(session_names) do
 		local connected = pterm.is_connected(name)
+		local label = pterm.display_name(name)
 		table.insert(entries, {
 			value = name,
 			ordinal = name,
-			display = connected and ("[connected] " .. name) or name,
+			display = connected and ("✔ " .. label) or ("  " .. label),
 		})
 	end
 

@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 /// Socket file name within a session directory.
 pub const SOCKET_FILENAME: &str = "socket";
 
+/// File name within a session directory recording the working directory the
+/// session was created from.
+pub const CWD_FILENAME: &str = "cwd";
+
 pub fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("PTERM_SOCKET_DIR") {
         return PathBuf::from(dir);
