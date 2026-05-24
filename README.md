@@ -115,7 +115,10 @@ require("telescope").load_extension("pterm")
 :Telescope pterm sessions
 ```
 
-Connected sessions are shown with a `[connected]` prefix.
+Each session is shown as `<name> (<directory>)`, where the directory is the
+basename of the session shell's current working directory. The daemon tracks
+`cd` inside the session and refreshes it periodically. Connected
+sessions are marked with a `✔` prefix.
 The preview pane shows the tail of each session's current terminal screen,
 trimmed to the preview width.
 If no existing session matches the current Telescope query, pressing `Enter`

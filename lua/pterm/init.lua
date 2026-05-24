@@ -114,6 +114,45 @@ function M.list()
 	return sessions
 end
 
+--- Return the session shell's current working directory, or nil if unknown.
+--- The daemon records this in `<socket_dir>/<name>/cwd` and refreshes it as the
+--- shell changes directory.
+function M.session_cwd(session_name)
+	if not session_name or session_name == "" then
+		return nil
+	end
+	local path = socket_dir() .. "/" .. session_name .. "/cwd"
+	local fd = io.open(path, "r")
+	if not fd then
+		return nil
+	end
+	local content = fd:read("*a")
+	fd:close()
+	if not content then
+		return nil
+	end
+	content = vim.trim(content)
+	if content == "" then
+		return nil
+	end
+	return content
+end
+
+--- Format a session name with its directory basename appended, e.g.
+--- "session_name (pterm)". Falls back to the bare name when the directory
+--- is unknown.
+function M.display_name(session_name)
+	local cwd = M.session_cwd(session_name)
+	if not cwd then
+		return session_name
+	end
+	local tail = vim.fn.fnamemodify(cwd, ":t")
+	if tail == "" then
+		return session_name
+	end
+	return session_name .. " (" .. tail .. ")"
+end
+
 function M.is_connected(session_name)
 	return connections[session_name] ~= nil
 end
@@ -581,7 +620,7 @@ function M.setup(opts)
 			vim.notify("No active pterm sessions", vim.log.levels.INFO)
 		else
 			for _, name in ipairs(sessions) do
-				vim.notify(name, vim.log.levels.INFO)
+				vim.notify(M.display_name(name), vim.log.levels.INFO)
 			end
 		end
 	end, { desc = "List active pterm sessions" })

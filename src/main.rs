@@ -5,7 +5,9 @@ mod pty;
 mod server;
 mod session;
 
-use crate::paths::{find_sessions, session_dir, session_socket_path, socket_dir, SOCKET_FILENAME};
+use crate::paths::{
+    find_sessions, session_dir, session_socket_path, socket_dir, CWD_FILENAME, SOCKET_FILENAME,
+};
 use server::Server;
 use session::Session;
 use std::io::{self, Read, Write};
@@ -99,6 +101,16 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
 
     // Create session directory (including parent directories for hierarchical names)
     std::fs::create_dir_all(&sess_dir)?;
+
+    // Record the initial working directory so clients can show which directory
+    // a session belongs to (e.g. distinguishing git worktrees that share names).
+    // The daemon refreshes this as the shell changes directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = std::fs::write(
+            sess_dir.join(CWD_FILENAME),
+            cwd.to_string_lossy().as_bytes(),
+        );
+    }
 
     // Daemonize: fork into background
     match unsafe { nix::unistd::fork() } {
