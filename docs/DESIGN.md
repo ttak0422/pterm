@@ -15,7 +15,7 @@ This architecture keeps process/session persistence in Rust while letting libvte
 ```text
 ┌─ Neovim ───────────────────────────────────────────┐
 │ Lua plugin                                         │
-│ ├─ :Pterm creates/fetches session                  │
+│ ├─ :Pterm new creates/fetches session              │
 │ └─ jobstart({"pterm","open",name},{term=true})     │
 └───────────────────┬────────────────────────────────┘
                     │ terminal PTY (owned by Neovim)
@@ -57,7 +57,7 @@ Responsibilities:
 
 Key behavior:
 
-- `:Pterm <name>`:
+- `:Pterm new <name> [cmd...]`:
 1. if the session is already connected in the current Neovim instance, jump to its buffer
 2. otherwise run `pterm open <name>` in a terminal buffer
 3. `pterm open` attaches if the session exists, or creates it and then attaches in one process
@@ -141,7 +141,7 @@ Hierarchical sessions are represented by directories:
 ## Lifecycle and Deletion Rules
 
 - Detach (buffer close / job stop) does not delete session.
-- Session deletion is explicit via `pterm kill` / `:PtermKill`, or by removing the session socket file externally.
+- Session deletion is explicit via `pterm kill` / `:Pterm kill`, or by removing the session socket file externally.
 - plugin code should not remove socket files automatically.
 - `pterm kill <parent>` removes the parent session directory recursively, so hierarchical children under that prefix are deleted too.
 

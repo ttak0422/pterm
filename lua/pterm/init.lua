@@ -593,28 +593,54 @@ end
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
+	local pterm_subcommands = { "new", "list", "redraw", "dump", "kill" }
+
+	local function complete_values(values, arg_lead)
+		if not arg_lead or arg_lead == "" then
+			return values
+		end
+		return vim.tbl_filter(function(value)
+			return value:find(arg_lead, 1, true) == 1
+		end, values)
+	end
+
 	local function complete_sessions(arg_lead)
 		local ok, sessions = pcall(M.list)
 		if not ok then
 			return {}
 		end
-		if not arg_lead or arg_lead == "" then
-			return sessions
-		end
-		return vim.tbl_filter(function(s)
-			return s:find(arg_lead, 1, true) == 1
-		end, sessions)
+		return complete_values(sessions, arg_lead)
 	end
 
-	vim.api.nvim_create_user_command("Pterm", function(cmd_opts)
-		M.open(cmd_opts.fargs[1], cmd_opts.fargs)
-	end, {
-		nargs = "*",
-		complete = complete_sessions,
-		desc = "Open or attach to a persistent terminal session",
-	})
+	local function complete_pterm(arg_lead, cmd_line, cursor_pos)
+		local before_cursor = cmd_line:sub(1, cursor_pos)
+		local words = vim.split(vim.trim(before_cursor), "%s+", { trimempty = true })
+		if words[1] == "Pterm" then
+			table.remove(words, 1)
+		end
 
-	vim.api.nvim_create_user_command("PtermList", function()
+		local arg_index = #words
+		if before_cursor:match("%s$") then
+			arg_index = arg_index + 1
+		end
+
+		if arg_index <= 1 then
+			return complete_values(pterm_subcommands, arg_lead)
+		end
+
+		local subcommand = words[1]
+		local session_subcommand = subcommand == "new"
+			or subcommand == "redraw"
+			or subcommand == "dump"
+			or subcommand == "kill"
+		if arg_index == 2 and session_subcommand then
+			return complete_sessions(arg_lead)
+		end
+
+		return {}
+	end
+
+	local function list_sessions()
 		local sessions = M.list()
 		if #sessions == 0 then
 			vim.notify("No active pterm sessions", vim.log.levels.INFO)
@@ -623,18 +649,9 @@ function M.setup(opts)
 				vim.notify(M.display_name(name), vim.log.levels.INFO)
 			end
 		end
-	end, { desc = "List active pterm sessions" })
+	end
 
-	vim.api.nvim_create_user_command("PtermRedraw", function(cmd_opts)
-		M.redraw(cmd_opts.fargs[1])
-	end, {
-		nargs = 1,
-		complete = complete_sessions,
-		desc = "Redraw a persistent terminal session",
-	})
-
-	vim.api.nvim_create_user_command("PtermDump", function(cmd_opts)
-		local session_name = cmd_opts.fargs[1]
+	local function dump_session(session_name)
 		local dump, err = M.dump(session_name)
 		if not dump then
 			vim.notify(
@@ -645,18 +662,53 @@ function M.setup(opts)
 		end
 
 		open_dump_buffer(session_name, dump)
-	end, {
-		nargs = 1,
-		complete = complete_sessions,
-		desc = "Open a diagnostic dump for a persistent terminal session",
-	})
+	end
 
-	vim.api.nvim_create_user_command("PtermKill", function(cmd_opts)
-		M.kill(cmd_opts.fargs[1])
+	local function require_session(subcommand, session_name)
+		if session_name and session_name ~= "" then
+			return true
+		end
+		vim.notify("Usage: :Pterm " .. subcommand .. " <session>", vim.log.levels.ERROR)
+		return false
+	end
+
+	vim.api.nvim_create_user_command("Pterm", function(cmd_opts)
+		local subcommand = cmd_opts.fargs[1]
+		if not subcommand or subcommand == "" then
+			vim.notify("Usage: :Pterm <new|list|redraw|dump|kill> ...", vim.log.levels.ERROR)
+			return
+		end
+
+		if subcommand == "new" then
+			local session_name = cmd_opts.fargs[2]
+			if not require_session("new", session_name) then
+				return
+			end
+			M.open(session_name, vim.list_slice(cmd_opts.fargs, 2))
+		elseif subcommand == "list" then
+			list_sessions()
+		elseif subcommand == "redraw" then
+			local session_name = cmd_opts.fargs[2]
+			if require_session("redraw", session_name) then
+				M.redraw(session_name)
+			end
+		elseif subcommand == "dump" then
+			local session_name = cmd_opts.fargs[2]
+			if require_session("dump", session_name) then
+				dump_session(session_name)
+			end
+		elseif subcommand == "kill" then
+			local session_name = cmd_opts.fargs[2]
+			if require_session("kill", session_name) then
+				M.kill(session_name)
+			end
+		else
+			vim.notify("Unknown Pterm subcommand: " .. subcommand, vim.log.levels.ERROR)
+		end
 	end, {
-		nargs = 1,
-		complete = complete_sessions,
-		desc = "Kill a persistent terminal session",
+		nargs = "*",
+		complete = complete_pterm,
+		desc = "Manage persistent terminal sessions",
 	})
 end
 
