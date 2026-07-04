@@ -965,19 +965,19 @@ impl Session {
         })
     }
 
-    /// Read available data from pty, feed to VT parser, return what was read.
+    /// Read available data from pty, feed to VT parser, and append the
+    /// filtered output to `filtered`. Returns the raw byte count read
+    /// (0 = EOF). The filtered output can exceed the raw count when the
+    /// filter flushes a control sequence carried over from earlier reads,
+    /// which is why it goes to a growable Vec instead of back into `buf`.
     /// Returns `Err(WouldBlock)` when the non-blocking fd has no more data.
-    pub fn read_pty(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn read_pty(&mut self, buf: &mut [u8], filtered: &mut Vec<u8>) -> io::Result<usize> {
         let fd = self.pty.master.as_raw_fd();
         match nix::unistd::read(fd, buf) {
             Ok(n) => {
                 if n > 0 {
                     self.parser.process(&buf[..n]);
-                    let mut filtered = Vec::with_capacity(n);
-                    self.output_filter.filter(&buf[..n], &mut filtered);
-                    let filtered_len = filtered.len();
-                    buf[..filtered_len].copy_from_slice(&filtered);
-                    return Ok(filtered_len);
+                    self.output_filter.filter(&buf[..n], filtered);
                 }
                 Ok(n)
             }
@@ -1191,6 +1191,26 @@ mod tests {
 
         filter.filter(b">cb", &mut output);
         assert_eq!(output, b"abb");
+    }
+
+    #[test]
+    fn terminal_output_filter_output_can_exceed_input_chunk() {
+        // A non-query OSC carried over from an earlier read flushes together
+        // with the chunk that terminates it, so a single filter() call can
+        // emit more bytes than it consumed. read_pty() must therefore append
+        // to a growable Vec instead of writing back into the fixed read
+        // buffer (doing the latter panicked on e.g. large OSC 52 payloads).
+        let mut filter = TerminalOutputFilter::default();
+        let mut output = Vec::new();
+
+        let carryover = [b"\x1b]52;c;".as_slice(), &[b'A'; 128]].concat();
+        filter.filter(&carryover, &mut output);
+        assert!(output.is_empty());
+
+        let tail = b"\x07x";
+        filter.filter(tail, &mut output);
+        assert!(output.len() > tail.len());
+        assert_eq!(output, [carryover.as_slice(), tail].concat());
     }
 
     #[test]
