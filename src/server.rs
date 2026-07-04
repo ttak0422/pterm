@@ -2,7 +2,7 @@ use crate::session::Session;
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 use pterm_proto::{self as proto};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -22,12 +22,74 @@ const CWD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 struct Client {
     stream: UnixStream,
     recv_buf: Vec<u8>,
-    send_buf: Vec<u8>,
+    send_buf: SendQueue,
     large_send_buf_warned: bool,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
     /// One-shot diagnostic clients should not receive normal terminal output.
     diagnostic: bool,
+}
+
+/// Outbound frame queue for a client.
+///
+/// The front frame may already be partially written to the socket. Discarding
+/// its unwritten remainder would leave a truncated frame on the wire and
+/// permanently desync the client's decoder, so queue replacement
+/// (`clear_unsent`) always preserves it.
+#[derive(Default)]
+struct SendQueue {
+    frames: VecDeque<Vec<u8>>,
+    /// Bytes of the front frame already written to the socket.
+    front_written: usize,
+}
+
+impl SendQueue {
+    fn push(&mut self, frame: &[u8]) {
+        self.frames.push_back(frame.to_vec());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Total bytes still waiting to go out on the wire.
+    fn pending_bytes(&self) -> usize {
+        self.frames.iter().map(Vec::len).sum::<usize>() - self.front_written
+    }
+
+    /// Drop every queued frame that has not started going out on the wire.
+    /// The partially written front frame is kept so framing stays intact.
+    fn clear_unsent(&mut self) {
+        if self.front_written > 0 {
+            self.frames.truncate(1);
+        } else {
+            self.frames.clear();
+        }
+    }
+
+    /// Write as much as the stream accepts, stopping on `WouldBlock`.
+    fn write_to(&mut self, stream: &mut UnixStream) -> io::Result<()> {
+        while let Some(front) = self.frames.front() {
+            match stream.write(&front[self.front_written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "client stream closed",
+                    ));
+                }
+                Ok(n) => {
+                    self.front_written += n;
+                    if self.front_written == front.len() {
+                        self.frames.pop_front();
+                        self.front_written = 0;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Server {
@@ -170,7 +232,7 @@ impl Server {
 
                     let msg = proto::encode(proto::server::EXIT, &exit_code.to_le_bytes());
                     for client in self.clients.values_mut() {
-                        client.send_buf.extend_from_slice(&msg);
+                        client.send_buf.push(&msg);
                     }
                     self.flush_all_clients();
                     self.exit_sent = true;
@@ -232,7 +294,7 @@ impl Server {
                         Client {
                             stream,
                             recv_buf: Vec::new(),
-                            send_buf: Vec::new(),
+                            send_buf: SendQueue::default(),
                             large_send_buf_warned: false,
                             pending_snapshot: true,
                             diagnostic: false,
@@ -280,11 +342,11 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
             if replace_send_buf {
-                client.send_buf.clear();
+                client.send_buf.clear_unsent();
             }
             if !snapshot.is_empty() {
                 let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
-                client.send_buf.extend_from_slice(&msg);
+                client.send_buf.push(&msg);
             }
         }
         if let Err(e) = self.flush_client_send_buf(client_id) {
@@ -425,7 +487,7 @@ impl Server {
             if snapshot_ids.contains(&id) {
                 continue;
             }
-            client.send_buf.extend_from_slice(&msg);
+            client.send_buf.push(&msg);
             flush_ids.push(id);
         }
         for id in flush_ids {
@@ -463,28 +525,15 @@ impl Server {
                 None => return Ok(()),
             };
 
-            while !client.send_buf.is_empty() {
-                match client.stream.write(&client.send_buf) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "client stream closed",
-                        ));
-                    }
-                    Ok(n) => {
-                        client.send_buf.drain(..n);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
-                }
-            }
+            client.send_buf.write_to(&mut client.stream)?;
 
-            if client.send_buf.len() >= LARGE_SEND_BUF_WARN_BYTES {
+            let pending_bytes = client.send_buf.pending_bytes();
+            if pending_bytes >= LARGE_SEND_BUF_WARN_BYTES {
                 if !client.large_send_buf_warned {
                     log::warn!(
                         "Client {} send buffer backlog reached {} bytes",
                         client_id,
-                        client.send_buf.len()
+                        pending_bytes
                     );
                     client.large_send_buf_warned = true;
                 }
@@ -581,7 +630,7 @@ impl Server {
                     redraw_data.extend_from_slice(&self.session.snapshot());
                     let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
                     for (_, client) in self.clients.iter_mut() {
-                        client.send_buf.extend_from_slice(&msg);
+                        client.send_buf.push(&msg);
                     }
                     flush_all = true;
                 }
@@ -590,7 +639,7 @@ impl Server {
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.diagnostic = true;
                         client.pending_snapshot = false;
-                        client.send_buf.clear();
+                        client.send_buf.clear_unsent();
                     }
 
                     let mut pty_buf = vec![0u8; 65536];
@@ -603,8 +652,8 @@ impl Server {
                         .map_err(io::Error::other)?;
                     let msg = proto::encode(proto::server::DUMP, &payload);
                     if let Some(client) = self.clients.get_mut(&client_id) {
-                        client.send_buf.clear();
-                        client.send_buf.extend_from_slice(&msg);
+                        client.send_buf.clear_unsent();
+                        client.send_buf.push(&msg);
                     }
                     flush_all = true;
                 }
@@ -613,7 +662,7 @@ impl Server {
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.diagnostic = true;
                         client.pending_snapshot = false;
-                        client.send_buf.clear();
+                        client.send_buf.clear_unsent();
                     }
 
                     let mut pty_buf = vec![0u8; 65536];
@@ -625,8 +674,8 @@ impl Server {
                     let payload = self.session.snapshot_text();
                     let msg = proto::encode(proto::server::SNAPSHOT_TEXT, payload.as_bytes());
                     if let Some(client) = self.clients.get_mut(&client_id) {
-                        client.send_buf.clear();
-                        client.send_buf.extend_from_slice(&msg);
+                        client.send_buf.clear_unsent();
+                        client.send_buf.push(&msg);
                     }
                     flush_all = true;
                 }
@@ -643,5 +692,119 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Session;
+
+    /// Regression test: a RESIZE arriving while a client's outbound frame is
+    /// only partially written to the socket must not corrupt the frame stream.
+    ///
+    /// The daemon replaces each client's send queue on RESIZE so stale-size
+    /// frames don't precede the fresh snapshot. If that replacement discards
+    /// the unwritten remainder of a frame whose header is already on the wire,
+    /// the client-side decoder desyncs permanently and the terminal freezes
+    /// (observed as "scrolling stops working after splitting the window").
+    #[test]
+    fn resize_during_output_backlog_keeps_frame_stream_valid() {
+        let dir = std::env::temp_dir().join(format!("pterm-server-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Emit ~2MiB quickly, then idle. 'A' (0x41) is not a valid frame type,
+        // so any decoder misalignment is detected below.
+        let session = Session::new(
+            "corruption-test".to_string(),
+            "/bin/sh",
+            &[
+                "sh",
+                "-c",
+                "dd if=/dev/zero bs=1024 count=2048 2>/dev/null | tr '\\0' 'A'; sleep 30",
+            ],
+        )
+        .expect("failed to spawn test session");
+
+        let mut server = Server::new(&dir, session).expect("failed to create server");
+        let socket_path = dir.join("socket");
+        let server_thread = std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("failed to connect to daemon socket");
+        let resize =
+            |cols, rows| proto::encode(proto::client::RESIZE, &proto::encode_resize(cols, rows));
+        client.write_all(&resize(80, 24)).unwrap();
+
+        // Do not read: the socket send buffer fills and the daemon is left
+        // with a partially written OUTPUT frame at the front of its queue.
+        std::thread::sleep(Duration::from_millis(300));
+        client.write_all(&resize(100, 30)).unwrap();
+
+        // Drain and validate the whole stream.
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut stream_bytes = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut consecutive_timeouts = 0;
+        while Instant::now() < deadline && consecutive_timeouts < 2 {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    stream_bytes.extend_from_slice(&chunk[..n]);
+                    consecutive_timeouts = 0;
+                }
+                Err(_) => consecutive_timeouts += 1,
+            }
+        }
+
+        // Walk the byte stream frame by frame. Every complete header must
+        // carry a known server frame type; anything else means the stream
+        // desynced.
+        let mut offset = 0;
+        let mut state_syncs = 0;
+        while offset + proto::HEADER_SIZE <= stream_bytes.len() {
+            let header: [u8; proto::HEADER_SIZE] = stream_bytes
+                [offset..offset + proto::HEADER_SIZE]
+                .try_into()
+                .unwrap();
+            let (msg_type, payload_len) = proto::decode_header(&header);
+            assert!(
+                matches!(
+                    msg_type,
+                    proto::server::OUTPUT | proto::server::EXIT | proto::server::STATE_SYNC
+                ),
+                "frame stream corrupted: unknown frame type 0x{:02x} at offset {} of {} bytes",
+                msg_type,
+                offset,
+                stream_bytes.len()
+            );
+            if msg_type == proto::server::STATE_SYNC {
+                state_syncs += 1;
+            }
+            let end = offset + proto::HEADER_SIZE + payload_len as usize;
+            if end > stream_bytes.len() {
+                break; // trailing partial frame is fine
+            }
+            offset = end;
+        }
+
+        // The second RESIZE must yield a decodable snapshot. If the resize
+        // snapshot was swallowed by a truncated frame, only the initial
+        // snapshot is observed.
+        assert!(
+            state_syncs >= 2,
+            "expected snapshots for both resizes, decoded {} STATE_SYNC frame(s)",
+            state_syncs
+        );
+
+        // Removing the socket makes the server loop shut down.
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
