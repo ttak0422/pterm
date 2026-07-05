@@ -209,8 +209,13 @@ pub fn run(
         (c, r)
     };
     {
+        // HELLO must precede RESIZE in a single write so the daemon records
+        // the handshake before queueing the initial snapshot.
+        let hello_payload =
+            proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::REQUEST_HISTORY);
+        let mut msg = proto::encode(proto::client::HELLO, &hello_payload);
         let resize_payload = proto::encode_resize(cols, rows);
-        let msg = proto::encode(proto::client::RESIZE, &resize_payload);
+        msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
         socket.write_all(&msg)?;
     }
 
@@ -219,6 +224,11 @@ pub fn run(
     let mut sock_buf = [0u8; 65536];
     let mut recv_buf: Vec<u8> = Vec::new();
     let mut exit_code: i32 = 0;
+    // None until a HELLO_ACK arrives. A daemon that predates the handshake
+    // never sends one, so the first STATE_SYNC is the detection anchor:
+    // no ACK by then means protocol v0.
+    let mut daemon_proto: Option<u32> = None;
+    let mut proto_checked = false;
     'main: loop {
         match poll.poll(&mut events, None) {
             Ok(()) => {}
@@ -286,7 +296,46 @@ pub fn run(
                             proto::server::OUTPUT => {
                                 output_batch.extend_from_slice(&frame.payload);
                             }
+                            proto::server::HELLO_ACK => {
+                                match proto::parse_hello_ack(&frame.payload) {
+                                    Ok((version, pkg_version)) => {
+                                        log::info!(
+                                            "Daemon hello ack: proto v{}, pterm {}",
+                                            version,
+                                            pkg_version
+                                        );
+                                        daemon_proto = Some(version);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Invalid hello ack payload: {}", e);
+                                    }
+                                }
+                            }
+                            proto::server::HISTORY => {
+                                // Scrollback replay: written to the terminal
+                                // like OUTPUT so it accumulates in the client
+                                // terminal's own scrollback. The daemon sends
+                                // it just before the initial STATE_SYNC.
+                                output_batch.extend_from_slice(&frame.payload);
+                            }
                             proto::server::STATE_SYNC => {
+                                if !proto_checked {
+                                    proto_checked = true;
+                                    let version = daemon_proto.unwrap_or(0);
+                                    if version != proto::PROTO_VERSION {
+                                        log::warn!(
+                                            "Daemon protocol v{} differs from client v{}",
+                                            version,
+                                            proto::PROTO_VERSION
+                                        );
+                                        let notice = format!(
+                                            "[pterm: daemon protocol v{} / client v{} — restart the session to upgrade]\r\n",
+                                            version,
+                                            proto::PROTO_VERSION
+                                        );
+                                        output_batch.extend_from_slice(notice.as_bytes());
+                                    }
+                                }
                                 if !state_sync_cleanup_queued {
                                     output_batch
                                         .extend_from_slice(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES);

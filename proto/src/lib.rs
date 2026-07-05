@@ -13,6 +13,9 @@
 
 use std::fmt;
 
+/// Wire protocol version. Bump on incompatible changes.
+pub const PROTO_VERSION: u32 = 1;
+
 /// Client → Daemon message types
 pub mod client {
     /// Forward keyboard input to pty
@@ -34,6 +37,15 @@ pub mod client {
 
     /// Request a diagnostic dump of the daemon-side terminal state (no payload)
     pub const DUMP: u8 = 0x06;
+
+    /// Handshake. Payload: [proto_version: u32 LE] [flags: u32 LE]
+    pub const HELLO: u8 = 0x07;
+}
+
+/// Flags carried in the client HELLO payload.
+pub mod hello_flags {
+    /// Client wants scrollback history replay on attach.
+    pub const REQUEST_HISTORY: u32 = 1 << 0;
 }
 
 /// Daemon → Client message types
@@ -57,6 +69,15 @@ pub mod server {
     /// Diagnostic dump of the daemon-side terminal state
     /// Payload: UTF-8 JSON
     pub const DUMP: u8 = 0x82;
+
+    /// Handshake reply. Payload:
+    /// [proto_version: u32 LE] [pkg_version: UTF-8 (rest of payload)]
+    pub const HELLO_ACK: u8 = 0x83;
+
+    /// Scrollback history replay, sent once before the initial STATE_SYNC to
+    /// clients that requested it via `hello_flags::REQUEST_HISTORY`.
+    /// Payload: raw escape sequences, written to stdout like OUTPUT.
+    pub const HISTORY: u8 = 0x84;
 }
 
 /// Encode a framed message into a Vec<u8>.
@@ -73,6 +94,9 @@ pub fn encode(msg_type: u8, payload: &[u8]) -> Vec<u8> {
 pub const HEADER_SIZE: usize = 5;
 pub const RESIZE_PAYLOAD_SIZE: usize = 4;
 pub const EXIT_PAYLOAD_SIZE: usize = 4;
+pub const HELLO_PAYLOAD_SIZE: usize = 8;
+/// HELLO_ACK payload starts with the protocol version.
+pub const HELLO_ACK_MIN_PAYLOAD_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -84,6 +108,8 @@ pub struct Frame {
 pub enum DecodeError {
     InvalidResizePayloadLen(usize),
     InvalidExitPayloadLen(usize),
+    InvalidHelloPayloadLen(usize),
+    InvalidHelloAckPayloadLen(usize),
 }
 
 impl fmt::Display for DecodeError {
@@ -101,6 +127,20 @@ impl fmt::Display for DecodeError {
                     f,
                     "invalid exit payload length: expected {} bytes, got {}",
                     EXIT_PAYLOAD_SIZE, len
+                )
+            }
+            Self::InvalidHelloPayloadLen(len) => {
+                write!(
+                    f,
+                    "invalid hello payload length: expected {} bytes, got {}",
+                    HELLO_PAYLOAD_SIZE, len
+                )
+            }
+            Self::InvalidHelloAckPayloadLen(len) => {
+                write!(
+                    f,
+                    "invalid hello ack payload length: expected at least {} bytes, got {}",
+                    HELLO_ACK_MIN_PAYLOAD_SIZE, len
                 )
             }
         }
@@ -169,6 +209,42 @@ pub fn parse_resize(payload: &[u8]) -> Result<(u16, u16), DecodeError> {
     Ok(decode_resize(payload))
 }
 
+/// Encode a hello payload.
+pub fn encode_hello(version: u32, flags: u32) -> [u8; HELLO_PAYLOAD_SIZE] {
+    let mut buf = [0u8; HELLO_PAYLOAD_SIZE];
+    buf[0..4].copy_from_slice(&version.to_le_bytes());
+    buf[4..8].copy_from_slice(&flags.to_le_bytes());
+    buf
+}
+
+/// Parse a hello payload. Returns (proto_version, flags).
+pub fn parse_hello(payload: &[u8]) -> Result<(u32, u32), DecodeError> {
+    let payload: &[u8; HELLO_PAYLOAD_SIZE] = payload
+        .try_into()
+        .map_err(|_| DecodeError::InvalidHelloPayloadLen(payload.len()))?;
+    let version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let flags = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    Ok((version, flags))
+}
+
+/// Encode a hello ack payload.
+pub fn encode_hello_ack(version: u32, pkg_version: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(HELLO_ACK_MIN_PAYLOAD_SIZE + pkg_version.len());
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.extend_from_slice(pkg_version.as_bytes());
+    buf
+}
+
+/// Parse a hello ack payload. Returns (proto_version, pkg_version).
+pub fn parse_hello_ack(payload: &[u8]) -> Result<(u32, String), DecodeError> {
+    if payload.len() < HELLO_ACK_MIN_PAYLOAD_SIZE {
+        return Err(DecodeError::InvalidHelloAckPayloadLen(payload.len()));
+    }
+    let version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let pkg_version = String::from_utf8_lossy(&payload[4..]).into_owned();
+    Ok((version, pkg_version))
+}
+
 pub fn encode_exit(exit_code: i32) -> [u8; 4] {
     exit_code.to_le_bytes()
 }
@@ -232,5 +308,33 @@ mod tests {
         let payload = encode_exit(42);
         let exit_code = parse_exit(&payload).unwrap();
         assert_eq!(exit_code, 42);
+    }
+
+    #[test]
+    fn hello_roundtrip() {
+        let payload = encode_hello(PROTO_VERSION, hello_flags::REQUEST_HISTORY);
+        let (version, flags) = parse_hello(&payload).unwrap();
+        assert_eq!(version, PROTO_VERSION);
+        assert_eq!(flags, hello_flags::REQUEST_HISTORY);
+    }
+
+    #[test]
+    fn parse_hello_rejects_invalid_lengths() {
+        let err = parse_hello(&[1, 2, 3]).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidHelloPayloadLen(3));
+    }
+
+    #[test]
+    fn hello_ack_roundtrip() {
+        let payload = encode_hello_ack(PROTO_VERSION, "1.2.3");
+        let (version, pkg_version) = parse_hello_ack(&payload).unwrap();
+        assert_eq!(version, PROTO_VERSION);
+        assert_eq!(pkg_version, "1.2.3");
+    }
+
+    #[test]
+    fn parse_hello_ack_rejects_invalid_lengths() {
+        let err = parse_hello_ack(&[1, 2]).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidHelloAckPayloadLen(2));
     }
 }

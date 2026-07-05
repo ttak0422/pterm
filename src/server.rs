@@ -28,6 +28,16 @@ struct Client {
     pending_snapshot: bool,
     /// One-shot diagnostic clients should not receive normal terminal output.
     diagnostic: bool,
+    /// Protocol version from the client HELLO. 0 = no HELLO received
+    /// (pre-handshake client), which keeps the legacy behavior.
+    proto: u32,
+    /// Client requested scrollback history replay (HELLO flag). History is
+    /// sent once, alongside the initial snapshot.
+    wants_history: bool,
+    /// HELLO received but HELLO_ACK not queued yet. The ACK is queued ahead
+    /// of the first STATE_SYNC so the bridge can use STATE_SYNC arrival as
+    /// the "no ACK means old daemon" anchor.
+    hello_ack_pending: bool,
 }
 
 /// Outbound frame queue for a client.
@@ -298,6 +308,9 @@ impl Server {
                             large_send_buf_warned: false,
                             pending_snapshot: true,
                             diagnostic: false,
+                            proto: 0,
+                            wants_history: false,
+                            hello_ack_pending: false,
                         },
                     );
                 }
@@ -338,11 +351,36 @@ impl Server {
             );
         }
 
+        // History replay happens once, on the initial snapshot only. REDRAW
+        // and later RESIZE re-snapshots must not repeat it: auto_redraw runs
+        // on every BufEnter, and repeating history would duplicate it in the
+        // client's scrollback without bound.
+        let send_history = self.clients.get(&client_id).is_some_and(|client| {
+            client.pending_snapshot && client.wants_history && !client.diagnostic
+        });
+        let history = if send_history {
+            self.session.history_formatted(history_replay_limit())
+        } else {
+            Vec::new()
+        };
+
         let snapshot = self.session.snapshot();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.pending_snapshot = false;
             if replace_send_buf {
                 client.send_buf.clear_unsent();
+            }
+            // (Re-)queue the HELLO_ACK ahead of the STATE_SYNC. On
+            // replace_send_buf a previously queued but unsent ACK may just
+            // have been dropped, so re-send for any handshaked client;
+            // duplicate ACKs are idempotent on the bridge side.
+            if client.hello_ack_pending || (replace_send_buf && client.proto != 0) {
+                client.send_buf.push(&hello_ack_message());
+                client.hello_ack_pending = false;
+            }
+            if !history.is_empty() {
+                let msg = proto::encode(proto::server::HISTORY, &history);
+                client.send_buf.push(&msg);
             }
             if !snapshot.is_empty() {
                 let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
@@ -603,6 +641,32 @@ impl Server {
         let mut flush_all = false;
         for frame in proto::decode_frames(&mut recv_buf) {
             match frame.msg_type {
+                proto::client::HELLO => match proto::parse_hello(&frame.payload) {
+                    Ok((version, flags)) => {
+                        log::info!(
+                            "Client {} hello: proto v{}, flags 0x{:x}",
+                            client_id,
+                            version,
+                            flags
+                        );
+                        if version != proto::PROTO_VERSION {
+                            log::warn!(
+                                "Client {} protocol v{} differs from daemon v{}",
+                                client_id,
+                                version,
+                                proto::PROTO_VERSION
+                            );
+                        }
+                        if let Some(client) = self.clients.get_mut(&client_id) {
+                            client.proto = version;
+                            client.wants_history = flags & proto::hello_flags::REQUEST_HISTORY != 0;
+                            client.hello_ack_pending = true;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Client {} sent invalid hello payload: {}", client_id, e);
+                    }
+                },
                 proto::client::INPUT => {
                     self.session.write_pty(&frame.payload)?;
                 }
@@ -628,6 +692,12 @@ impl Server {
                     redraw_data.extend_from_slice(&self.session.snapshot());
                     let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
                     for (_, client) in self.clients.iter_mut() {
+                        // The bridge anchors "old daemon" detection on the
+                        // first STATE_SYNC, so a pending ACK must precede it.
+                        if client.hello_ack_pending {
+                            client.send_buf.push(&hello_ack_message());
+                            client.hello_ack_pending = false;
+                        }
                         client.send_buf.push(&msg);
                     }
                     flush_all = true;
@@ -685,6 +755,22 @@ impl Server {
         }
         Ok(flush_all)
     }
+}
+
+fn hello_ack_message() -> Vec<u8> {
+    proto::encode(
+        proto::server::HELLO_ACK,
+        &proto::encode_hello_ack(proto::PROTO_VERSION, env!("CARGO_PKG_VERSION")),
+    )
+}
+
+/// Maximum number of scrollback lines replayed on attach. Defaults to
+/// unlimited (bounded in practice by the parser's scrollback capacity).
+fn history_replay_limit() -> usize {
+    std::env::var("PTERM_HISTORY_REPLAY_LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
 }
 
 impl Drop for Server {
@@ -801,6 +887,162 @@ mod tests {
         );
 
         // Removing the socket makes the server loop shut down.
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read frames from `client` until one matches `stop` (or a timeout
+    /// expires), returning everything received.
+    fn read_frames_until(
+        client: &mut std::os::unix::net::UnixStream,
+        recv: &mut Vec<u8>,
+        stop: impl Fn(&proto::Frame) -> bool,
+    ) -> Vec<proto::Frame> {
+        let mut frames = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for frame in proto::decode_frames(recv) {
+                let done = stop(&frame);
+                frames.push(frame);
+                if done {
+                    return frames;
+                }
+            }
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => recv.extend_from_slice(&chunk[..n]),
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn history_replay_sent_once_before_initial_snapshot() {
+        let dir = std::env::temp_dir().join(format!("pterm-history-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 200 lines on the default 80x24 screen leave ~176 lines of scrollback.
+        let session = Session::new(
+            "history-test".to_string(),
+            "/bin/sh",
+            &["sh", "-c", "seq 1 200; sleep 30"],
+        )
+        .expect("failed to spawn test session");
+
+        let mut server = Server::new(&dir, session).expect("failed to create server");
+        let socket_path = dir.join("socket");
+        let server_thread = std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        // Let the daemon drain the child's output into the VT parser before
+        // any client attaches.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("failed to connect to daemon socket");
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let hello = proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::REQUEST_HISTORY);
+        let mut msg = proto::encode(proto::client::HELLO, &hello);
+        msg.extend_from_slice(&proto::encode(
+            proto::client::RESIZE,
+            &proto::encode_resize(80, 24),
+        ));
+        client.write_all(&msg).unwrap();
+
+        let mut recv = Vec::new();
+        let frames = read_frames_until(&mut client, &mut recv, |f| {
+            f.msg_type == proto::server::STATE_SYNC
+        });
+
+        let type_order: Vec<u8> = frames.iter().map(|f| f.msg_type).collect();
+        let ack_pos = type_order
+            .iter()
+            .position(|&t| t == proto::server::HELLO_ACK)
+            .expect("HELLO_ACK should arrive before the first STATE_SYNC");
+        let history_pos = type_order
+            .iter()
+            .position(|&t| t == proto::server::HISTORY)
+            .expect("HISTORY should arrive before the first STATE_SYNC");
+        let sync_pos = type_order
+            .iter()
+            .position(|&t| t == proto::server::STATE_SYNC)
+            .expect("STATE_SYNC should arrive");
+        assert!(ack_pos < sync_pos, "HELLO_ACK must precede STATE_SYNC");
+        assert!(history_pos < sync_pos, "HISTORY must precede STATE_SYNC");
+
+        let history = &frames[history_pos].payload;
+        let history_str = String::from_utf8_lossy(history);
+        assert!(
+            history_str.contains("100"),
+            "history should contain scrolled-off line 100"
+        );
+
+        // REDRAW and a later RESIZE must not repeat the history.
+        client
+            .write_all(&proto::encode(proto::client::REDRAW, &[]))
+            .unwrap();
+        let frames = read_frames_until(&mut client, &mut recv, |f| {
+            f.msg_type == proto::server::STATE_SYNC
+        });
+        assert!(
+            frames.iter().all(|f| f.msg_type != proto::server::HISTORY),
+            "REDRAW must not resend history"
+        );
+
+        client
+            .write_all(&proto::encode(
+                proto::client::RESIZE,
+                &proto::encode_resize(100, 30),
+            ))
+            .unwrap();
+        let frames = read_frames_until(&mut client, &mut recv, |f| {
+            f.msg_type == proto::server::STATE_SYNC
+        });
+        assert!(
+            frames.iter().all(|f| f.msg_type != proto::server::HISTORY),
+            "RESIZE must not resend history"
+        );
+
+        // A client that never sends HELLO gets neither ACK nor history.
+        let mut legacy = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("failed to connect legacy client");
+        legacy
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        legacy
+            .write_all(&proto::encode(
+                proto::client::RESIZE,
+                &proto::encode_resize(80, 24),
+            ))
+            .unwrap();
+        let mut legacy_recv = Vec::new();
+        let frames = read_frames_until(&mut legacy, &mut legacy_recv, |f| {
+            f.msg_type == proto::server::STATE_SYNC
+        });
+        assert!(frames
+            .iter()
+            .any(|f| f.msg_type == proto::server::STATE_SYNC));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.msg_type != proto::server::HISTORY
+                    && f.msg_type != proto::server::HELLO_ACK),
+            "legacy client must not receive HISTORY or HELLO_ACK"
+        );
+
         let _ = std::fs::remove_file(&socket_path);
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&dir);
