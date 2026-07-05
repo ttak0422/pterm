@@ -379,11 +379,9 @@ impl Server {
         // Drain all available PTY data (non-blocking). No timer-based batching
         // -- the drain loop itself coalesces all bytes available right now.
         loop {
-            match self.session.read_pty(buf) {
+            match self.session.read_pty(buf, &mut self.pending_pty_output) {
                 Ok(0) => break,
-                Ok(n) => {
-                    self.pending_pty_output.extend_from_slice(&buf[..n]);
-                }
+                Ok(_) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     if self.pending_pty_output.is_empty() {
