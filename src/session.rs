@@ -680,6 +680,56 @@ fn build_snapshot_text(screen: &vt100::Screen) -> String {
     screen.rows(0, cols).collect::<Vec<_>>().join("\n")
 }
 
+/// Render the scrollback history (everything above the live screen) as a raw
+/// escape-sequence stream suitable for sequential replay into a terminal.
+///
+/// Pages through the scrollback by moving the visible window from the oldest
+/// offset toward the live screen, emitting each history line once. Rows that
+/// wrap are emitted without a trailing `\r\n` so a long wrapped line is
+/// re-joined into a single logical line on the client. Ends with one
+/// viewport's worth of `\r\n` padding so the replayed history is pushed above
+/// the region the following STATE_SYNC redraw overwrites.
+///
+/// Leaves the screen's scrollback offset at 0 (the daemon always operates on
+/// the live screen). Returns an empty Vec while the alternate screen is
+/// active: vt100's scrollback belongs to the main screen, and replaying it
+/// under an altscreen application would corrupt the display.
+fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
+    if screen.alternate_screen() {
+        return Vec::new();
+    }
+    let (rows, cols) = screen.size();
+
+    screen.set_scrollback(usize::MAX);
+    let total = screen.scrollback();
+    if total == 0 {
+        screen.set_scrollback(0);
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    // Skip the oldest lines when a replay limit is set.
+    let mut emitted = total.saturating_sub(max_lines);
+    while emitted < total {
+        // Window starts at history line `emitted`; never emit past `total`,
+        // where the live screen begins (STATE_SYNC covers it).
+        screen.set_scrollback(total - emitted);
+        let take = usize::from(rows).min(total - emitted);
+        for (i, row) in screen.rows_formatted(0, cols).take(take).enumerate() {
+            out.extend_from_slice(&row);
+            out.extend_from_slice(b"\x1b[0m");
+            if !screen.row_wrapped(i as u16) {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        emitted += take;
+    }
+    screen.set_scrollback(0);
+
+    out.extend_from_slice("\r\n".repeat(usize::from(rows)).as_bytes());
+    out
+}
+
 impl KittyKeyboardState {
     const MAX_STACK_DEPTH: usize = 64;
 
@@ -1027,6 +1077,13 @@ impl Session {
         build_snapshot(self.parser.screen(), self.parser.callbacks())
     }
 
+    /// Generate an escape-sequence stream replaying the scrollback history
+    /// (see `build_history`). At most the newest `max_lines` lines are
+    /// included. Empty while the alternate screen is active.
+    pub fn history_formatted(&mut self, max_lines: usize) -> Vec<u8> {
+        build_history(self.parser.screen_mut(), max_lines)
+    }
+
     /// Build a structured diagnostic dump of the daemon-side terminal state.
     pub fn dump(&self) -> SessionDump {
         let snapshot = self.snapshot();
@@ -1079,11 +1136,95 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_snapshot, build_snapshot_text, dump_screen, BytesDump, KittyKeyboardState,
-        SessionCallbacks, TerminalOutputFilter,
+        build_history, build_snapshot, build_snapshot_text, dump_screen, BytesDump,
+        KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
+
+    /// Replay `bytes` into a fresh parser and return the visible plain text,
+    /// so history streams are verified by their effect on a real terminal.
+    fn replay_contents(bytes: &[u8], rows: u16, cols: u16) -> String {
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        parser.process(bytes);
+        parser.screen().contents()
+    }
+
+    #[test]
+    fn history_contains_scrolled_off_lines_but_not_visible_screen() {
+        let rows = 5u16;
+        let cols = 20u16;
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        for i in 1..=30 {
+            parser.process(format!("line-{}\r\n", i).as_bytes());
+        }
+
+        let history = build_history(parser.screen_mut(), usize::MAX);
+        let history_str = String::from_utf8_lossy(&history);
+
+        // 30 newlines on a 5-row screen: lines 1..=26 scrolled off.
+        assert!(history_str.contains("line-1\x1b[0m\r\n"));
+        assert!(history_str.contains("line-26"));
+        // The live screen (line-27..=30 + prompt row) must not be duplicated.
+        assert!(!history_str.contains("line-27"));
+        // Offset is restored so later snapshots see the live screen.
+        assert_eq!(parser.screen().scrollback(), 0);
+        // Viewport padding pushes the history above the STATE_SYNC redraw area.
+        assert!(history_str.ends_with(&"\r\n".repeat(usize::from(rows))));
+    }
+
+    #[test]
+    fn history_max_lines_keeps_only_newest_lines() {
+        let rows = 5u16;
+        let cols = 20u16;
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        for i in 1..=30 {
+            parser.process(format!("line-{}\r\n", i).as_bytes());
+        }
+
+        let history = build_history(parser.screen_mut(), 3);
+        let history_str = String::from_utf8_lossy(&history);
+
+        assert!(!history_str.contains("line-23"));
+        assert!(history_str.contains("line-24"));
+        assert!(history_str.contains("line-26"));
+        assert!(!history_str.contains("line-27"));
+    }
+
+    #[test]
+    fn history_rejoins_wrapped_lines_without_crlf() {
+        let rows = 4u16;
+        let cols = 10u16;
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        // One 25-char line wraps across three rows, then enough lines to
+        // push it fully into the scrollback.
+        parser.process(b"abcdefghijklmnopqrstuvwxy\r\n");
+        for i in 1..=10 {
+            parser.process(format!("l{}\r\n", i).as_bytes());
+        }
+
+        let history = build_history(parser.screen_mut(), usize::MAX);
+
+        // Replaying into a wide terminal keeps the wrapped line whole, which
+        // is what makes search work across the original wrap points.
+        let replayed = replay_contents(&history, 40, 40);
+        assert!(replayed.contains("abcdefghijklmnopqrstuvwxy"));
+    }
+
+    #[test]
+    fn history_is_empty_on_alternate_screen_and_without_scrollback() {
+        let mut parser = vt100::Parser::new(5, 20, 10_000);
+        parser.process(b"just one line\r\n");
+        assert!(build_history(parser.screen_mut(), usize::MAX).is_empty());
+
+        for i in 1..=30 {
+            parser.process(format!("line-{}\r\n", i).as_bytes());
+        }
+        parser.process(b"\x1b[?1049h");
+        assert!(parser.screen().alternate_screen());
+        assert!(build_history(parser.screen_mut(), usize::MAX).is_empty());
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
 
     #[test]
     fn dump_screen_includes_rows_cells_and_attributes() {
