@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-07-05
+
+### Bug Fixes
+
+- Preserve partially sent frames when replacing client send queue
+Replacing a client's outbound queue on RESIZE (and DUMP/SNAPSHOT_TEXT)
+  used send_buf.clear(), which could discard the unwritten remainder of a
+  frame whose header was already written to the socket. The client-side
+  frame decoder then consumed the following STATE_SYNC as payload of the
+  truncated frame and desynced permanently, freezing the terminal display
+  (observed as scrolling stopping after splitting the Neovim window while
+  the session was producing output).
+
+  Make the send queue frame-aware: queue replacement keeps the partially
+  written front frame so wire framing stays intact, and only drops frames
+  that have not started going out.
+- Prevent panic when filtered PTY output exceeds read buffer
+TerminalOutputFilter carries partial control sequences across reads, so
+  a single filter() call can emit more bytes than the chunk it consumed
+  (carried-over pending + current chunk). read_pty() copied the filtered
+  bytes back into the fixed 64KiB read buffer, which panics in
+  copy_from_slice when a large sequence (e.g. an OSC 52 clipboard payload
+  larger than the buffer) flushes on a full read.
+
+  Append filtered output to a caller-provided Vec instead of writing back
+  into the read buffer, and return the raw byte count so EOF detection is
+  unchanged.
 ## [1.2.0] - 2026-05-24
 
 ### Features
@@ -463,6 +490,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[1.3.0]: https://github.com/ttak0422/pterm/compare/v1.2.0..v1.3.0
 [1.2.0]: https://github.com/ttak0422/pterm/compare/v1.1.0..v1.2.0
 [1.1.0]: https://github.com/ttak0422/pterm/compare/v1.0.2..v1.1.0
 [1.0.2]: https://github.com/ttak0422/pterm/compare/v1.0.1..v1.0.2
