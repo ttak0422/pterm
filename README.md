@@ -124,6 +124,20 @@ trimmed to the preview width.
 If no existing session matches the current Telescope query, pressing `Enter`
 creates or opens a session using the prompt text as the session name.
 
+For full-text search across every session's contents — scrollback history
+included — use:
+
+```vim
+:Telescope pterm grep
+```
+
+Each non-empty line is shown as `<session>: <line>`; pressing `Enter` opens
+the session containing the selected line. Lines that wrapped in the terminal
+are re-joined before matching, so text spanning a wrap point stays
+searchable. Sessions currently showing a full-screen TUI (the alternate
+screen, e.g. `less` or `htop`) contribute only their visible screen, not
+their shell scrollback.
+
 ## License
 
 MIT

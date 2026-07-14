@@ -329,6 +329,18 @@ impl Server {
     /// snapshot or stale OUTPUT frame cannot remain queued ahead of the fresh
     /// snapshot for the client's new dimensions.
     fn send_snapshot_to_client(&mut self, client_id: usize, replace_send_buf: bool) {
+        // Diagnostic query clients (dump/snapshot-text/full-text) await
+        // exactly one response frame; a snapshot would only add noise, and
+        // with replace_send_buf a RESIZE from another client would drop
+        // their still-unsent response outright.
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.diagnostic)
+        {
+            return;
+        }
+
         let buffered_pty_bytes = self.pending_pty_output.len();
         let other_pending_snapshots = self
             .clients
@@ -747,6 +759,28 @@ impl Server {
                     }
                     flush_all = true;
                 }
+                proto::client::FULL_TEXT => {
+                    log::info!("Full text requested by client {}", client_id);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.diagnostic = true;
+                        client.pending_snapshot = false;
+                        client.send_buf.clear_unsent();
+                    }
+
+                    let mut pty_buf = vec![0u8; 65536];
+                    self.drain_pty_output(&mut pty_buf)?;
+                    if !self.pending_pty_output.is_empty() {
+                        self.flush_pty_output();
+                    }
+
+                    let payload = self.session.full_text();
+                    let msg = proto::encode(proto::server::FULL_TEXT, payload.as_bytes());
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.send_buf.clear_unsent();
+                        client.send_buf.push(&msg);
+                    }
+                    flush_all = true;
+                }
                 _ => log::warn!("Unknown message type: 0x{:02x}", frame.msg_type),
             }
         }
@@ -887,6 +921,77 @@ mod tests {
         );
 
         // Removing the socket makes the server loop shut down.
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a RESIZE from an attached client must not clear a
+    /// diagnostic client's queued-but-unsent query response.
+    ///
+    /// send_snapshot_to_all_clients(true) replaces every client's send queue;
+    /// without the diagnostic filter it also dropped a FULL_TEXT/DUMP/
+    /// SNAPSHOT_TEXT response still queued behind an output backlog, so the
+    /// querying CLI timed out and the session silently vanished from
+    /// `:Telescope pterm grep` results.
+    #[test]
+    fn resize_does_not_drop_queued_diagnostic_response() {
+        let dir =
+            std::env::temp_dir().join(format!("pterm-diag-resize-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Emit ~2MiB quickly so the query client accumulates an unread
+        // OUTPUT backlog between connecting and its request being processed.
+        let session = Session::new(
+            "diag-resize-test".to_string(),
+            "/bin/sh",
+            &[
+                "sh",
+                "-c",
+                "dd if=/dev/zero bs=1024 count=2048 2>/dev/null | tr '\\0' 'A'; sleep 30",
+            ],
+        )
+        .expect("failed to spawn test session");
+
+        let mut server = Server::new(&dir, session).expect("failed to create server");
+        let socket_path = dir.join("socket");
+        let server_thread = std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        let mut attached = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("failed to connect attached client");
+        let resize =
+            |cols, rows| proto::encode(proto::client::RESIZE, &proto::encode_resize(cols, rows));
+        attached.write_all(&resize(80, 24)).unwrap();
+
+        let mut query = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("failed to connect query client");
+        query
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Let OUTPUT frames pile up unread in the query client's socket
+        // buffer, request the full text, then resize from the attached
+        // client while the response is still queued behind the backlog.
+        std::thread::sleep(Duration::from_millis(300));
+        query
+            .write_all(&proto::encode(proto::client::FULL_TEXT, &[]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        attached.write_all(&resize(100, 30)).unwrap();
+
+        let mut recv = Vec::new();
+        let frames = read_frames_until(&mut query, &mut recv, |f| {
+            f.msg_type == proto::server::FULL_TEXT
+        });
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.msg_type == proto::server::FULL_TEXT),
+            "queued FULL_TEXT response was dropped by RESIZE"
+        );
+
         let _ = std::fs::remove_file(&socket_path);
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&dir);
