@@ -40,6 +40,9 @@ pub mod client {
 
     /// Handshake. Payload: [proto_version: u32 LE] [flags: u32 LE]
     pub const HELLO: u8 = 0x07;
+
+    /// Request an ANSI-colored snapshot of the visible terminal screen (no payload)
+    pub const SNAPSHOT_ANSI: u8 = 0x08;
 }
 
 /// Flags carried in the client HELLO payload.
@@ -78,6 +81,10 @@ pub mod server {
     /// clients that requested it via `hello_flags::REQUEST_HISTORY`.
     /// Payload: raw escape sequences, written to stdout like OUTPUT.
     pub const HISTORY: u8 = 0x84;
+
+    /// ANSI-colored snapshot of the visible terminal screen.
+    /// Payload: UTF-8 text rows with SGR escape sequences, separated by LF
+    pub const SNAPSHOT_ANSI: u8 = 0x85;
 }
 
 /// Encode a framed message into a Vec<u8>.

@@ -5,52 +5,7 @@ local conf = require("telescope.config").values
 local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
 local previewers = require("telescope.previewers")
-
-local function trim_right_to_width(line, width)
-	if width <= 0 then
-		return ""
-	end
-	if vim.fn.strdisplaywidth(line) <= width then
-		return line
-	end
-
-	local suffix = "..."
-	if width <= #suffix then
-		return suffix:sub(1, width)
-	end
-
-	local target_width = width - #suffix
-	local low = 0
-	local high = vim.fn.strchars(line)
-	while low < high do
-		local mid = math.ceil((low + high) / 2)
-		local head = vim.fn.strcharpart(line, 0, mid)
-		if vim.fn.strdisplaywidth(head) <= target_width then
-			low = mid
-		else
-			high = mid - 1
-		end
-	end
-
-	return vim.fn.strcharpart(line, 0, low) .. suffix
-end
-
-local function tail_preview_lines(text, width, height)
-	local lines = vim.split(text or "", "\n", { plain = true })
-	while #lines > 0 and lines[#lines] == "" do
-		table.remove(lines)
-	end
-	if #lines == 0 then
-		return { "(empty)" }
-	end
-
-	local first = math.max(1, #lines - height + 1)
-	local preview = {}
-	for i = first, #lines do
-		table.insert(preview, trim_right_to_width(lines[i], width))
-	end
-	return preview
-end
+local ansi = require("pterm.ansi")
 
 local function set_preview_lines(bufnr, lines)
 	if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
@@ -67,7 +22,26 @@ local function set_preview_lines(bufnr, lines)
 	end
 end
 
+local function apply_highlights(bufnr, ns, preview)
+	vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+	for i, item in ipairs(preview) do
+		local col = 0
+		for _, run in ipairs(item.runs) do
+			local group = ansi.hl_group(run.attrs)
+			local len = #run.text
+			if group and len > 0 then
+				pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, i - 1, col, {
+					end_col = col + len,
+					hl_group = group,
+				})
+			end
+			col = col + len
+		end
+	end
+end
+
 local function make_previewer(pterm)
+	local ns = vim.api.nvim_create_namespace("pterm_preview")
 	return previewers.new_buffer_previewer({
 		title = "pterm preview",
 		define_preview = function(self, entry, status)
@@ -100,20 +74,34 @@ local function make_previewer(pterm)
 			local bufnr = self.state.bufnr
 			set_preview_lines(bufnr, { "Loading preview..." })
 
-			self.state.pterm_preview_job = pterm.snapshot_text_async(session_name, function(text, err)
+			self.state.pterm_preview_job = pterm.snapshot_ansi_async(session_name, function(text, err)
 				if not self.state or self.state.pterm_preview_request_id ~= request_id then
 					return
 				end
 				self.state.pterm_preview_job = nil
 
-				local lines
+				local preview
 				if text then
-					lines = tail_preview_lines(text, width, height)
+					preview = ansi.preview_lines(text, width, height)
 				else
-					lines = { "Failed to load preview", vim.trim(tostring(err or "")) }
+					preview = {
+						{
+							text = "Failed to load preview",
+							runs = {},
+						},
+						{
+							text = vim.trim(tostring(err or "")),
+							runs = {},
+						},
+					}
 				end
 
+				local lines = {}
+				for _, item in ipairs(preview) do
+					lines[#lines + 1] = item.text
+				end
 				set_preview_lines(bufnr, lines)
+				apply_highlights(bufnr, ns, preview)
 			end)
 		end,
 	})

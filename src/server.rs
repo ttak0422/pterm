@@ -747,6 +747,28 @@ impl Server {
                     }
                     flush_all = true;
                 }
+                proto::client::SNAPSHOT_ANSI => {
+                    log::info!("Snapshot ANSI requested by client {}", client_id);
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.diagnostic = true;
+                        client.pending_snapshot = false;
+                        client.send_buf.clear_unsent();
+                    }
+
+                    let mut pty_buf = vec![0u8; 65536];
+                    self.drain_pty_output(&mut pty_buf)?;
+                    if !self.pending_pty_output.is_empty() {
+                        self.flush_pty_output();
+                    }
+
+                    let payload = self.session.snapshot_ansi();
+                    let msg = proto::encode(proto::server::SNAPSHOT_ANSI, payload.as_bytes());
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.send_buf.clear_unsent();
+                        client.send_buf.push(&msg);
+                    }
+                    flush_all = true;
+                }
                 _ => log::warn!("Unknown message type: 0x{:02x}", frame.msg_type),
             }
         }

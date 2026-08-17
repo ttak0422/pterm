@@ -31,6 +31,12 @@ pterm redraw mysession
 # Print diagnostic state dump as JSON
 pterm dump mysession
 
+# Print the visible screen as plain text
+pterm snapshot-text mysession
+
+# Print the visible screen with ANSI colors/attributes preserved
+pterm snapshot-ansi mysession
+
 # Kill a session
 pterm kill mysession
 ```
@@ -120,7 +126,8 @@ basename of the session shell's current working directory. The daemon tracks
 `cd` inside the session and refreshes it periodically. Connected
 sessions are marked with a `✔` prefix.
 The preview pane shows the tail of each session's current terminal screen,
-trimmed to the preview width.
+trimmed to the preview width, with colors and attributes preserved as
+highlighting.
 If no existing session matches the current Telescope query, pressing `Enter`
 creates or opens a session using the prompt text as the session name.
 

@@ -31,6 +31,8 @@ Usage:
   pterm dump   <session-name>   # print diagnostic state dump as JSON
   pterm snapshot-text <session-name>
                # print plain-text snapshot of current screen
+  pterm snapshot-ansi <session-name>
+               # print snapshot of current screen with ANSI colors/attributes
   pterm socket <session-name>   # print socket path
 
 Session names may contain '/' for hierarchical sessions:
@@ -416,6 +418,33 @@ fn cmd_snapshot_text(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn cmd_snapshot_ansi(args: &[String]) -> io::Result<()> {
+    let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
+        eprintln!("Error: session name required");
+        std::process::exit(1);
+    });
+
+    let sock = session_socket_path(name);
+    if !sock.exists() {
+        eprintln!("Error: session '{}' not found", name);
+        std::process::exit(1);
+    }
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+    let msg = pterm_proto::encode(pterm_proto::client::SNAPSHOT_ANSI, &[]);
+    stream.write_all(&msg)?;
+
+    let payload = read_single_response(
+        &mut stream,
+        pterm_proto::server::SNAPSHOT_ANSI,
+        Duration::from_secs(3),
+    )?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&payload)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
 fn cmd_socket(args: &[String]) -> io::Result<()> {
     let name = args.first().map(|s| s.as_str()).unwrap_or_else(|| {
         eprintln!("Error: session name required");
@@ -444,6 +473,7 @@ fn main() {
         "redraw" => cmd_redraw(&args[2..]),
         "dump" => cmd_dump(&args[2..]),
         "snapshot-text" => cmd_snapshot_text(&args[2..]),
+        "snapshot-ansi" => cmd_snapshot_ansi(&args[2..]),
         "socket" => cmd_socket(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
