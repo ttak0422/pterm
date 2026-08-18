@@ -52,12 +52,12 @@ pterm kill parent          # kills parent and parent/child
 ## Neovim Usage
 
 ```vim
-:Pterm dev          " opens/creates named session
-:Pterm dev zsh      " opens/creates session with custom command
-:PtermList          " list sessions
-:PtermRedraw dev    " redraw a session
-:PtermDump dev      " open diagnostic state dump as JSON
-:PtermKill dev      " kill a session
+:Pterm new dev      " opens/creates named session
+:Pterm new dev zsh  " opens/creates session with custom command
+:Pterm list         " list sessions
+:Pterm redraw dev   " redraw a session
+:Pterm dump dev     " open diagnostic state dump as JSON
+:Pterm kill dev     " kill a session
 ```
 
 `pterm` opens a terminal buffer backed by `jobstart({ "pterm", "attach", <name> }, { term = true })`.
