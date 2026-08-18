@@ -2,6 +2,94 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-08-18
+
+### Features
+
+- Replay scrollback history on attach
+Attaching to a session only rebuilt the visible screen via STATE_SYNC,
+  so after a Neovim restart the terminal buffer had no scrollback and
+  normal-mode scrolling/search found nothing above the viewport.
+
+  Add a HELLO/HELLO_ACK protocol version handshake (proposal 0001) and a
+  HISTORY frame (proposal 0002): clients that set REQUEST_HISTORY in
+  HELLO receive the daemon's vt100 scrollback as a raw escape-sequence
+  stream once, just before the initial STATE_SYNC. Wrapped rows are
+  re-joined so search works across wrap points, and viewport padding
+  keeps the STATE_SYNC redraw from overwriting the history tail. REDRAW
+  and later RESIZE re-snapshots never resend history, so auto_redraw
+  cannot duplicate it. Clients and daemons without HELLO keep the legacy
+  behavior, so mixed-version setups stay compatible.
+
+  The replay length is capped by PTERM_HISTORY_REPLAY_LINES (default:
+  unlimited).
+- Render telescope preview with terminal colors
+Add a snapshot-ansi command that extracts the visible screen with SGR
+  escape sequences so colors and attributes survive extraction from the
+  terminal, and render them as extmarks in the telescope preview buffer.
+
+  The daemon emits per-cell SGR diffs (16/256-color and truecolor,
+  bold/dim/italic/underline/inverse) and the Lua side parses them into
+  styled runs that map to cached highlight groups, trimmed to the preview
+  width.
+- Add full-text session search via telescope grep picker
+Add a `:Telescope pterm grep` picker that searches every session's
+  contents line by line and opens the session containing the selected
+  line. The existing `sessions` picker remains the title (name) search.
+
+  The daemon previously exposed only the visible screen (snapshot-text),
+  so full-text search needed a new query:
+
+  - proto: FULL_TEXT message pair (client 0x08 / server 0x85)
+  - daemon: build_full_text() renders scrollback + visible screen as
+    plain text, re-joining wrapped rows so text spanning a wrap point
+    stays searchable; skips scrollback while the alternate screen is
+    active (same policy as history replay)
+  - CLI: `pterm full-text <session>`; dump/snapshot-text/full-text now
+    share one cmd_query() helper
+  - lua: M.full_text(), with snapshot_text/dump refactored onto a shared
+    run_text_command() helper
+
+  Hardening found during review:
+
+  - read_single_response() now enforces an overall deadline instead of a
+    per-read timeout that reset on every frame: a pre-upgrade daemon that
+    ignores FULL_TEXT but keeps streaming OUTPUT frames caused an
+    unbounded hang (reproduced); now it fails within 3s
+  - send_snapshot_to_client() skips diagnostic query clients: a RESIZE
+    arriving while a dump/snapshot-text/full-text response was queued but
+    unsent dropped the response permanently (reproduced; latent for the
+    existing queries, far more exposed with full-text's larger payloads).
+    Regression test added
+  - wrap-rejoin test strengthened to cover wraps straddling a scrollback
+    paging-window boundary and the scrollback->live-screen seam, the two
+    paths where mutation testing showed regressions escaping the old test
+
+### Bug Fixes
+
+- Preserve partially sent frames when replacing client send queue
+Replacing a client's outbound queue on RESIZE (and DUMP/SNAPSHOT_TEXT)
+  used send_buf.clear(), which could discard the unwritten remainder of a
+  frame whose header was already written to the socket. The client-side
+  frame decoder then consumed the following STATE_SYNC as payload of the
+  truncated frame and desynced permanently, freezing the terminal display
+  (observed as scrolling stopping after splitting the Neovim window while
+  the session was producing output).
+
+  Make the send queue frame-aware: queue replacement keeps the partially
+  written front frame so wire framing stays intact, and only drops frames
+  that have not started going out.
+- Prevent panic when filtered PTY output exceeds read buffer
+TerminalOutputFilter carries partial control sequences across reads, so
+  a single filter() call can emit more bytes than the chunk it consumed
+  (carried-over pending + current chunk). read_pty() copied the filtered
+  bytes back into the fixed 64KiB read buffer, which panics in
+  copy_from_slice when a large sequence (e.g. an OSC 52 clipboard payload
+  larger than the buffer) flushes on a full read.
+
+  Append filtered output to a caller-provided Vec instead of writing back
+  into the read buffer, and return the raw byte count so EOF detection is
+  unchanged.
 ## [1.2.0] - 2026-05-24
 
 ### Features
@@ -463,6 +551,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.0.0]: https://github.com/ttak0422/pterm/compare/v1.2.0..v2.0.0
 [1.2.0]: https://github.com/ttak0422/pterm/compare/v1.1.0..v1.2.0
 [1.1.0]: https://github.com/ttak0422/pterm/compare/v1.0.2..v1.1.0
 [1.0.2]: https://github.com/ttak0422/pterm/compare/v1.0.1..v1.0.2
