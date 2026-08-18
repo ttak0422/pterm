@@ -88,12 +88,24 @@ do
 	end
 end
 
+--- Prefer the colorscheme's terminal colors for the 16 ANSI slots so previews
+--- match what the terminal actually renders; fall back to the xterm defaults.
+local function palette_hex(n)
+	if n <= 15 then
+		local c = vim.g["terminal_color_" .. n]
+		if type(c) == "string" and c:match("^#%x%x%x%x%x%x$") then
+			return c
+		end
+	end
+	return palette[n]
+end
+
 local function color_hex(color)
 	if color == nil then
 		return nil
 	end
 	if color.mode == "idx" then
-		return palette[color.n]
+		return palette_hex(color.n)
 	end
 	if color.mode == "rgb" then
 		return string.format("#%02x%02x%02x", color.r, color.g, color.b)
@@ -123,6 +135,14 @@ end
 
 local hl_cache = {}
 local hl_seq = 0
+
+-- `:colorscheme` clears the groups defined below and can redefine
+-- `g:terminal_color_*`, so cached names would point at nothing.
+vim.api.nvim_create_autocmd("ColorScheme", {
+	callback = function()
+		hl_cache = {}
+	end,
+})
 
 --- Resolve a run's attributes to a Neovim highlight group name.
 --- Returns nil for fully-default runs (caller should skip them).
