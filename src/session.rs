@@ -730,6 +730,49 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
     out
 }
 
+/// Render the full session contents (scrollback history + visible screen)
+/// as plain text, one logical line per LF. Rows that wrap are re-joined so
+/// text spanning a wrap point stays searchable.
+///
+/// Pages through the scrollback like `build_history` and likewise leaves the
+/// scrollback offset at 0. While the alternate screen is active only the
+/// visible screen is rendered (vt100's scrollback belongs to the main screen).
+fn build_full_text(screen: &mut vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let mut lines: Vec<String> = Vec::new();
+    let mut pending = String::new();
+
+    if !screen.alternate_screen() {
+        screen.set_scrollback(usize::MAX);
+        let total = screen.scrollback();
+        let mut emitted = 0;
+        while emitted < total {
+            screen.set_scrollback(total - emitted);
+            let take = usize::from(rows).min(total - emitted);
+            for (i, row) in screen.rows(0, cols).take(take).enumerate() {
+                pending.push_str(&row);
+                if !screen.row_wrapped(i as u16) {
+                    lines.push(std::mem::take(&mut pending));
+                }
+            }
+            emitted += take;
+        }
+        screen.set_scrollback(0);
+    }
+
+    for (i, row) in screen.rows(0, cols).enumerate() {
+        pending.push_str(&row);
+        if !screen.row_wrapped(i as u16) {
+            lines.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        lines.push(pending);
+    }
+
+    lines.join("\n")
+}
+
 impl KittyKeyboardState {
     const MAX_STACK_DEPTH: usize = 64;
 
@@ -1101,6 +1144,12 @@ impl Session {
         build_snapshot_text(self.parser.screen())
     }
 
+    /// Generate a plain-text rendering of the full session contents
+    /// (scrollback history + visible screen).
+    pub fn full_text(&mut self) -> String {
+        build_full_text(self.parser.screen_mut())
+    }
+
     pub fn take_pending_da_queries(&mut self) -> (usize, usize) {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
@@ -1136,8 +1185,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_history, build_snapshot, build_snapshot_text, dump_screen, BytesDump,
-        KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
+        build_full_text, build_history, build_snapshot, build_snapshot_text, dump_screen,
+        BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
@@ -1223,6 +1272,84 @@ mod tests {
         parser.process(b"\x1b[?1049h");
         assert!(parser.screen().alternate_screen());
         assert!(build_history(parser.screen_mut(), usize::MAX).is_empty());
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn full_text_contains_scrollback_and_visible_screen_once() {
+        let rows = 5u16;
+        let cols = 20u16;
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        for i in 1..=30 {
+            parser.process(format!("line-{}\r\n", i).as_bytes());
+        }
+
+        let text = build_full_text(parser.screen_mut());
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        // 30 newlines on a 5-row screen: lines 1..=26 scrolled off,
+        // 27..=30 remain on the live screen. All must appear exactly once.
+        assert_eq!(lines[0], "line-1");
+        for i in 1..=30 {
+            let needle = format!("line-{}", i);
+            assert_eq!(
+                lines.iter().filter(|l| **l == needle).count(),
+                1,
+                "{} should appear exactly once",
+                needle
+            );
+        }
+        // Offset is restored so later snapshots see the live screen.
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn full_text_rejoins_wrapped_lines_across_window_and_screen_boundaries() {
+        // 4x10 screen. Two 15-char lines wrap across two rows each,
+        // positioned so the first straddles a scrollback paging-window
+        // boundary (scrollback rows 3-4) and the second straddles the
+        // scrollback -> live-screen seam (last scrollback row -> live row 0).
+        // Both exercise the `pending` handoff that a wrap contained in a
+        // single window never reaches.
+        let mut parser = vt100::Parser::new(4, 10, 10_000);
+        for i in 1..=3 {
+            parser.process(format!("s{}\r\n", i).as_bytes());
+        }
+        parser.process(b"ABCDEFGHIJKLMNO\r\n");
+        for i in 1..=5 {
+            parser.process(format!("f{}\r\n", i).as_bytes());
+        }
+        parser.process(b"PQRSTUVWXYZ1234\r\n");
+        parser.process(b"g1\r\ng2\r\n");
+
+        let text = build_full_text(parser.screen_mut());
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        for needle in ["ABCDEFGHIJKLMNO", "PQRSTUVWXYZ1234"] {
+            assert_eq!(
+                lines.iter().filter(|l| **l == needle).count(),
+                1,
+                "wrapped line {} should be rejoined exactly once",
+                needle
+            );
+        }
+        // No split fragments left behind.
+        assert!(!lines.contains(&"ABCDEFGHIJ"));
+        assert!(!lines.contains(&"PQRSTUVWXY"));
+    }
+
+    #[test]
+    fn full_text_on_alternate_screen_omits_scrollback() {
+        let mut parser = vt100::Parser::new(5, 20, 10_000);
+        for i in 1..=30 {
+            parser.process(format!("line-{}\r\n", i).as_bytes());
+        }
+        parser.process(b"\x1b[?1049h");
+        parser.process(b"alt-content");
+
+        let text = build_full_text(parser.screen_mut());
+        assert!(text.contains("alt-content"));
+        assert!(!text.contains("line-1"));
         assert_eq!(parser.screen().scrollback(), 0);
     }
 

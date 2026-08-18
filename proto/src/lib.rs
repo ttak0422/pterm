@@ -40,6 +40,10 @@ pub mod client {
 
     /// Handshake. Payload: [proto_version: u32 LE] [flags: u32 LE]
     pub const HELLO: u8 = 0x07;
+
+    /// Request the full plain-text contents (scrollback + visible screen,
+    /// no payload)
+    pub const FULL_TEXT: u8 = 0x08;
 }
 
 /// Flags carried in the client HELLO payload.
@@ -78,6 +82,10 @@ pub mod server {
     /// clients that requested it via `hello_flags::REQUEST_HISTORY`.
     /// Payload: raw escape sequences, written to stdout like OUTPUT.
     pub const HISTORY: u8 = 0x84;
+
+    /// Full plain-text contents (scrollback + visible screen)
+    /// Payload: UTF-8 text lines separated by LF
+    pub const FULL_TEXT: u8 = 0x85;
 }
 
 /// Encode a framed message into a Vec<u8>.
