@@ -44,6 +44,9 @@ pub mod client {
     /// Request the full plain-text contents (scrollback + visible screen,
     /// no payload)
     pub const FULL_TEXT: u8 = 0x08;
+
+    /// Request an ANSI-colored snapshot of the visible terminal screen (no payload)
+    pub const SNAPSHOT_ANSI: u8 = 0x09;
 }
 
 /// Flags carried in the client HELLO payload.
@@ -86,6 +89,10 @@ pub mod server {
     /// Full plain-text contents (scrollback + visible screen)
     /// Payload: UTF-8 text lines separated by LF
     pub const FULL_TEXT: u8 = 0x85;
+
+    /// ANSI-colored snapshot of the visible terminal screen.
+    /// Payload: UTF-8 text rows with SGR escape sequences, separated by LF
+    pub const SNAPSHOT_ANSI: u8 = 0x86;
 }
 
 /// Encode a framed message into a Vec<u8>.

@@ -680,6 +680,150 @@ fn build_snapshot_text(screen: &vt100::Screen) -> String {
     screen.rows(0, cols).collect::<Vec<_>>().join("\n")
 }
 
+/// Desired SGR (Select Graphic Rendition) state for a terminal cell.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct SgrState {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl SgrState {
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+}
+
+fn push_sgr_diff(out: &mut String, from: &SgrState, to: &SgrState) {
+    if from == to {
+        return;
+    }
+    if to == &SgrState::default() {
+        out.push_str("\x1b[0m");
+        return;
+    }
+
+    let mut params: Vec<String> = Vec::new();
+
+    let push_color = |params: &mut Vec<String>, color: vt100::Color, prefix: u8| match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(n) if n < 8 => params.push((prefix + n).to_string()),
+        vt100::Color::Idx(n) if n < 16 => {
+            params.push((prefix + 60 + (n - 8)).to_string());
+        }
+        vt100::Color::Idx(n) => {
+            params.push(format!("{};5;{n}", prefix + 8));
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            params.push(format!("{};2;{r};{g};{b}", prefix + 8));
+        }
+    };
+
+    if to.fg != from.fg {
+        match to.fg {
+            vt100::Color::Default => params.push("39".into()),
+            _ => push_color(&mut params, to.fg, 30),
+        }
+    }
+    if to.bg != from.bg {
+        match to.bg {
+            vt100::Color::Default => params.push("49".into()),
+            _ => push_color(&mut params, to.bg, 40),
+        }
+    }
+    if to.bold != from.bold {
+        params.push(if to.bold { "1".into() } else { "22".into() });
+    }
+    if to.dim != from.dim {
+        params.push(if to.dim { "2".into() } else { "22".into() });
+    }
+    if to.italic != from.italic {
+        params.push(if to.italic { "3".into() } else { "23".into() });
+    }
+    if to.underline != from.underline {
+        params.push(if to.underline {
+            "4".into()
+        } else {
+            "24".into()
+        });
+    }
+    if to.inverse != from.inverse {
+        params.push(if to.inverse { "7".into() } else { "27".into() });
+    }
+
+    out.push_str("\x1b[");
+    out.push_str(&params.join(";"));
+    out.push('m');
+}
+
+/// Render the visible screen as text rows with SGR escape sequences, so the
+/// output carries the same colors/attributes a real terminal would show.
+/// Each row is a complete sequence stream starting from the reset state;
+/// trailing blank cells are trimmed like `build_snapshot_text`.
+fn build_snapshot_ansi(screen: &vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let mut out = String::new();
+
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        let mut prev_col: u16 = 0;
+        let mut prev_was_wide = false;
+        let mut current = SgrState::default();
+
+        for col in 0..cols {
+            if prev_was_wide {
+                prev_was_wide = false;
+                continue;
+            }
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            prev_was_wide = cell.is_wide();
+
+            let has_contents = cell.has_contents();
+            let state = SgrState::from_cell(cell);
+            if !has_contents && state == SgrState::default() {
+                continue;
+            }
+
+            // Pad to this cell's column with default-styled spaces.
+            for _ in 0..(col.saturating_sub(prev_col)) {
+                out.push(' ');
+            }
+
+            push_sgr_diff(&mut out, &current, &state);
+            current = state;
+
+            if has_contents {
+                out.push_str(cell.contents());
+            } else {
+                out.push(' ');
+            }
+            prev_col = col + if cell.is_wide() { 2 } else { 1 };
+        }
+
+        if current != SgrState::default() {
+            out.push_str("\x1b[0m");
+        }
+    }
+
+    out
+}
+
 /// Render the scrollback history (everything above the live screen) as a raw
 /// escape-sequence stream suitable for sequential replay into a terminal.
 ///
@@ -1144,6 +1288,13 @@ impl Session {
         build_snapshot_text(self.parser.screen())
     }
 
+    /// Generate an ANSI-colored snapshot of the visible terminal screen.
+    /// Rows carry SGR escape sequences so colors and attributes survive
+    /// extraction from the terminal.
+    pub fn snapshot_ansi(&self) -> String {
+        build_snapshot_ansi(self.parser.screen())
+    }
+
     /// Generate a plain-text rendering of the full session contents
     /// (scrollback history + visible screen).
     pub fn full_text(&mut self) -> String {
@@ -1185,8 +1336,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_text, build_history, build_snapshot, build_snapshot_text, dump_screen,
-        BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
+        build_full_text, build_history, build_snapshot, build_snapshot_ansi, build_snapshot_text,
+        dump_screen, BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
@@ -1944,5 +2095,94 @@ mod tests {
         parser.process(b"hello\r\nworld");
 
         assert_eq!(build_snapshot_text(parser.screen()), "hello\nworld\n");
+    }
+
+    #[test]
+    fn snapshot_ansi_plain_text_matches_plain_snapshot() {
+        let mut parser = vt100::Parser::new_with_callbacks(3, 8, 1000, SessionCallbacks::default());
+        parser.process(b"hello\r\nworld");
+
+        let ansi = build_snapshot_ansi(parser.screen());
+        // No escape sequences for unstyled text: output is identical to plain.
+        assert_eq!(ansi, "hello\nworld\n");
+    }
+
+    #[test]
+    fn snapshot_ansi_preserves_colors_and_attributes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(4, 24, 1000, SessionCallbacks::default());
+
+        parser.process(b"\x1b[31mred");
+        parser.process(b"\x1b[1mbold");
+        parser.process(b"\x1b[38;2;10;20;30m true");
+        parser.process(b"\x1b[48;5;42mcolor");
+        parser.process(b"\x1b[0mplain");
+        parser.process(b"\r\n\x1b[36mcyan");
+
+        let ansi = build_snapshot_ansi(parser.screen());
+        let lines: Vec<&str> = ansi.lines().collect();
+
+        let line0 = lines[0];
+        assert!(line0.contains("\x1b[31mred"));
+        // Bold inherits the active red foreground.
+        assert!(line0.contains("\x1b[1mbold"));
+        // Truecolor foreground.
+        assert!(line0.contains("\x1b[38;2;10;20;30m"));
+        // Indexed background.
+        assert!(line0.contains("\x1b[48;5;42m"));
+        // Reset back to plain.
+        assert!(line0.contains("plain"));
+        assert!(line0.ends_with("plain") || line0.contains("\x1b[0m"));
+
+        let line1 = lines[1];
+        assert!(line1.contains("\x1b[36mcyan"));
+
+        // Plain-text extraction (stripping SGR codes) must equal the plain snapshot.
+        let stripped = strip_sgr(&ansi);
+        assert_eq!(stripped, build_snapshot_text(parser.screen()));
+    }
+
+    #[test]
+    fn snapshot_ansi_emits_diff_only_when_state_changes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(2, 20, 1000, SessionCallbacks::default());
+        parser.process(b"\x1b[32maaaa\x1b[32mbbbb");
+
+        let ansi = build_snapshot_ansi(parser.screen());
+        // One SGR sequence for the whole run, not one per cell.
+        let count = ansi.matches("\x1b[32m").count();
+        assert_eq!(count, 1);
+        assert_eq!(strip_sgr(&ansi), "aaaabbbb\n");
+    }
+
+    #[test]
+    fn snapshot_ansi_pads_to_styled_background_width() {
+        let mut parser = vt100::Parser::new_with_callbacks(2, 6, 1000, SessionCallbacks::default());
+        // A background-colored region extending to the full row width.
+        parser.process(b"\x1b[41m\x1b[K");
+
+        let ansi = build_snapshot_ansi(parser.screen());
+        assert_eq!(strip_sgr(&ansi), "      \n");
+    }
+
+    /// Remove SGR escape sequences from an ANSI snapshot, returning the plain text.
+    fn strip_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }

@@ -33,6 +33,8 @@ Usage:
                # print plain-text snapshot of current screen
   pterm full-text <session-name>
                # print plain-text scrollback + screen contents
+  pterm snapshot-ansi <session-name>
+               # print snapshot of current screen with ANSI colors/attributes
   pterm socket <session-name>   # print socket path
 
 Session names may contain '/' for hierarchical sessions:
@@ -442,6 +444,11 @@ fn main() {
             &args[2..],
             pterm_proto::client::FULL_TEXT,
             pterm_proto::server::FULL_TEXT,
+        ),
+        "snapshot-ansi" => cmd_query(
+            &args[2..],
+            pterm_proto::client::SNAPSHOT_ANSI,
+            pterm_proto::server::SNAPSHOT_ANSI,
         ),
         "socket" => cmd_socket(&args[2..]),
         "-h" | "--help" | "help" => {
