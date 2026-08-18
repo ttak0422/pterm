@@ -122,6 +122,7 @@ local function hl_color(attr)
 end
 
 local hl_cache = {}
+local hl_seq = 0
 
 --- Resolve a run's attributes to a Neovim highlight group name.
 --- Returns nil for fully-default runs (caller should skip them).
@@ -186,7 +187,10 @@ function M.hl_group(attrs)
 		end
 	end
 
-	local name = "PtermHl" .. key
+	-- The cache key contains ':', '|' and ';', which are invalid in a highlight
+	-- group name, so groups are numbered instead.
+	hl_seq = hl_seq + 1
+	local name = "PtermHl" .. hl_seq
 	vim.api.nvim_set_hl(0, name, spec)
 	hl_cache[key] = name
 	return name
