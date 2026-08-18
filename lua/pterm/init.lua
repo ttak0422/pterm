@@ -494,14 +494,14 @@ function M.redraw(session_name)
 	end
 end
 
---- Return a plain-text snapshot of the visible terminal screen.
-function M.snapshot_text(session_name)
+--- Run a pterm subcommand that prints text for a session.
+local function run_text_command(subcommand, session_name)
 	if not session_name or session_name == "" then
 		return nil, "Session name required"
 	end
 
 	local bin = find_binary()
-	local output = vim.fn.system({ bin, "snapshot-text", session_name })
+	local output = vim.fn.system({ bin, subcommand, session_name })
 	if vim.v.shell_error ~= 0 then
 		return nil, output
 	end
@@ -509,20 +509,21 @@ function M.snapshot_text(session_name)
 	return (output:gsub("\n$", ""))
 end
 
+--- Return a plain-text snapshot of the visible terminal screen.
+function M.snapshot_text(session_name)
+	return run_text_command("snapshot-text", session_name)
+end
+
+--- Return the full plain-text contents of a session
+--- (scrollback history + visible screen).
+function M.full_text(session_name)
+	return run_text_command("full-text", session_name)
+end
+
 --- Return an ANSI-colored snapshot of the visible terminal screen.
 --- Rows carry SGR escape sequences so colors/attributes survive extraction.
 function M.snapshot_ansi(session_name)
-	if not session_name or session_name == "" then
-		return nil, "Session name required"
-	end
-
-	local bin = find_binary()
-	local output = vim.fn.system({ bin, "snapshot-ansi", session_name })
-	if vim.v.shell_error ~= 0 then
-		return nil, output
-	end
-
-	return (output:gsub("\n$", ""))
+	return run_text_command("snapshot-ansi", session_name)
 end
 
 --- Asynchronously return a plain-text snapshot of the visible terminal screen.
@@ -623,17 +624,7 @@ end
 
 --- Return a diagnostic state dump as JSON.
 function M.dump(session_name)
-	if not session_name or session_name == "" then
-		return nil, "Session name required"
-	end
-
-	local bin = find_binary()
-	local output = vim.fn.system({ bin, "dump", session_name })
-	if vim.v.shell_error ~= 0 then
-		return nil, output
-	end
-
-	return (output:gsub("\n$", ""))
+	return run_text_command("dump", session_name)
 end
 
 local function open_dump_buffer(session_name, dump)
