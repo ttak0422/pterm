@@ -107,6 +107,81 @@ local function make_previewer(pterm)
 	})
 end
 
+--- Preview the matched line in context. `session_lines` is the same
+--- `full_text` split that produced the entries, so no extra process runs here.
+local function make_grep_previewer(session_lines)
+	local ns = vim.api.nvim_create_namespace("pterm_grep_preview")
+	return previewers.new_buffer_previewer({
+		title = "pterm grep preview",
+		define_preview = function(self, entry, status)
+			status = status or {}
+			self.state = self.state or {}
+
+			local all_lines = entry and session_lines[entry.value]
+			local match_index = entry and entry.lnum
+			if not all_lines or not match_index then
+				return
+			end
+
+			local height = 20
+			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
+				height = vim.api.nvim_win_get_height(status.preview_win)
+			end
+			local context = math.max(0, math.floor((height - 1) / 2))
+			local first = math.max(1, match_index - context)
+			local last = math.min(#all_lines, match_index + context)
+			local cursor_row = match_index - first + 1
+
+			local bufnr = self.state.bufnr
+			set_preview_lines(bufnr, vim.list_slice(all_lines, first, last))
+			if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+				return
+			end
+
+			vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+			pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, cursor_row - 1, 0, {
+				end_row = cursor_row,
+				hl_group = "Search",
+				hl_eol = true,
+			})
+			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
+				pcall(vim.api.nvim_win_set_cursor, status.preview_win, { cursor_row, 0 })
+			end
+		end,
+	})
+end
+
+--- Move the cursor onto the matched line inside the session's terminal buffer.
+--- The buffer is filled by an asynchronous history replay, so the lookup is
+--- retried for a short while before giving up.
+local function jump_to_grep_line(session_name, match_line, attempts)
+	if not match_line or match_line == "" then
+		return
+	end
+
+	attempts = attempts or 10
+	vim.defer_fn(function()
+		local bufnr = vim.api.nvim_get_current_buf()
+		if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= "pterm://" .. session_name then
+			return
+		end
+
+		for i, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+			if line == match_line or line:find(match_line, 1, true) then
+				-- terminal-mode pins the cursor to the PTY: normal mode is the only
+				-- mode where the window cursor can be moved into the scrollback.
+				vim.cmd("stopinsert")
+				pcall(vim.api.nvim_win_set_cursor, 0, { i, 0 })
+				return
+			end
+		end
+
+		if attempts > 1 then
+			jump_to_grep_line(session_name, match_line, attempts - 1)
+		end
+	end, 50)
+end
+
 local function session_exists(pterm, session_name)
 	for _, name in ipairs(pterm.list()) do
 		if name == session_name then
@@ -214,12 +289,15 @@ local function grep(opts)
 	end
 
 	local results = {}
+	local session_lines = {}
 	for _, name in ipairs(pterm.list()) do
 		local text = pterm.full_text(name)
 		if text then
-			for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
+			local lines = vim.split(text, "\n", { plain = true })
+			session_lines[name] = lines
+			for lnum, line in ipairs(lines) do
 				if vim.trim(line) ~= "" then
-					table.insert(results, { session = name, line = line })
+					table.insert(results, { session = name, line = line, lnum = lnum })
 				end
 			end
 		end
@@ -227,7 +305,7 @@ local function grep(opts)
 
 	local previewer = opts.previewer
 	if previewer == nil then
-		previewer = make_previewer(pterm)
+		previewer = make_grep_previewer(session_lines)
 	end
 
 	pickers
@@ -239,6 +317,8 @@ local function grep(opts)
 					local text = entry.session .. ": " .. entry.line
 					return {
 						value = entry.session,
+						grep_line = entry.line,
+						lnum = entry.lnum,
 						ordinal = text,
 						display = text,
 					}
@@ -256,6 +336,7 @@ local function grep(opts)
 					end
 
 					local session_name = selection.value
+					local match_line = selection.grep_line
 					if not session_exists(pterm, session_name) then
 						vim.notify("Session '" .. session_name .. "' not found", vim.log.levels.ERROR)
 						return
@@ -267,6 +348,8 @@ local function grep(opts)
 							"Failed to open session '" .. session_name .. "': " .. tostring(err),
 							vim.log.levels.ERROR
 						)
+					else
+						jump_to_grep_line(session_name, match_line)
 					end
 				end)
 				return true
