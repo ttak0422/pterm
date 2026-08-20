@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-08-20
+
+### Bug Fixes
+
+- *(ansi)* Use sequential highlight group names
+The cache key embeds ':', '|' and ';' separators, which are invalid
+  characters in a highlight group name, so nvim_set_hl raised E5248 for
+  any non-default run (e.g. 'PtermHlidx:4|d'). Number the groups instead
+  and keep the key for the cache lookup only.
+- *(ansi)* Resolve ANSI colors via the colorscheme's terminal palette
+The 16 ANSI slots were hardcoded to the xterm defaults, so previews
+  rendered vivid primaries (#008000, #808000) while the real terminal used
+  the user's theme colors. Prefer `g:terminal_color_0..15` when set and
+  fall back to the xterm values otherwise.
+
+  Also clear the highlight cache on ColorScheme: `:colorscheme` wipes the
+  `PtermHl*` groups, and the stale cache kept them from being redefined.
+- *(telescope)* Preview the matched grep line and jump to it on select
+The grep picker reused the sessions previewer, which renders only the
+  visible screen (`snapshot-ansi`), while its entries come from `full-text`
+  (scrollback + screen). Matches living in the scrollback were therefore
+  never visible in the preview. Entries also carried nothing but the session
+  name, so selecting one just opened the session at wherever the PTY happened
+  to be.
+
+  Entries now keep the match's line number, and the grep previewer reuses the
+  `full_text` split collected while building them - no extra process per
+  preview - rendering the match in context with the cursor on it. On select,
+  the matched line text is searched inside the terminal buffer and the cursor
+  is moved there; terminal-mode is left first, since it pins the cursor to the
+  PTY. The lookup is retried briefly because the history replay is
+  asynchronous, and falls back to plain open when the line is not found.
 ## [2.0.0] - 2026-08-18
 
 ### Features
@@ -551,6 +583,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.0.1]: https://github.com/ttak0422/pterm/compare/v2.0.0..v2.0.1
 [2.0.0]: https://github.com/ttak0422/pterm/compare/v1.2.0..v2.0.0
 [1.2.0]: https://github.com/ttak0422/pterm/compare/v1.1.0..v1.2.0
 [1.1.0]: https://github.com/ttak0422/pterm/compare/v1.0.2..v1.1.0
