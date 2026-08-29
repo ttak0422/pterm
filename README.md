@@ -143,7 +143,8 @@ the session containing the selected line. Lines that wrapped in the terminal
 are re-joined before matching, so text spanning a wrap point stays
 searchable. Sessions currently showing a full-screen TUI (the alternate
 screen, e.g. `less` or `htop`) contribute only their visible screen, not
-their shell scrollback.
+their shell scrollback. Matching words are highlighted in the result list and
+preview.
 
 ## License
 

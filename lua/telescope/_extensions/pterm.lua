@@ -7,6 +7,44 @@ local action_state = require("telescope.actions.state")
 local previewers = require("telescope.previewers")
 local ansi = require("pterm.ansi")
 
+local function grep_highlighter(_, prompt, display)
+	local highlights = {}
+	if prompt == "" then
+		return highlights
+	end
+
+	local haystack = display:lower()
+	for term in prompt:gmatch("%S+") do
+		local needle = term:lower()
+		local start = 1
+		while true do
+			local match_start, match_end = haystack:find(needle, start, true)
+			if not match_start then
+				break
+			end
+			highlights[#highlights + 1] = {
+				start = match_start,
+				finish = match_end,
+				highlight = "TelescopeMatching",
+			}
+			start = match_end + 1
+		end
+	end
+	return highlights
+end
+
+local function apply_grep_highlights(bufnr, ns, lines, prompt)
+	for i, line in ipairs(lines) do
+		for _, highlight in ipairs(grep_highlighter(nil, prompt, line)) do
+			pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, i - 1, highlight.start - 1, {
+				end_col = highlight.finish,
+				hl_group = highlight.highlight,
+				priority = 110,
+			})
+		end
+	end
+end
+
 local function set_preview_lines(bufnr, lines)
 	if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
 		return
@@ -144,6 +182,11 @@ local function make_grep_previewer(session_lines)
 				hl_group = "Search",
 				hl_eol = true,
 			})
+			local prompt = ""
+			if status.picker then
+				prompt = status.picker:_get_prompt()
+			end
+			apply_grep_highlights(bufnr, ns, vim.list_slice(all_lines, first, last), prompt)
 			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
 				pcall(vim.api.nvim_win_set_cursor, status.preview_win, { cursor_row, 0 })
 			end
@@ -324,7 +367,9 @@ local function grep(opts)
 					}
 				end,
 			}),
-			sorter = conf.generic_sorter(opts),
+			sorter = conf.generic_sorter(
+				opts.highlighter and opts or vim.tbl_extend("force", {}, opts, { highlighter = grep_highlighter })
+			),
 			previewer = previewer,
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
