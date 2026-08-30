@@ -24,3 +24,24 @@ jobs:
 
       - name: Build with Nix
         run: nix build
+
+  build-darwin:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = arm64
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: ttak0422-pterm
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
+      - name: Build with Nix
+        run: nix build
