@@ -842,7 +842,7 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
     if screen.alternate_screen() {
         return Vec::new();
     }
-    let (rows, cols) = screen.size();
+    let (rows, _) = screen.size();
 
     screen.set_scrollback(usize::MAX);
     let total = screen.scrollback();
@@ -859,7 +859,9 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
         // where the live screen begins (STATE_SYNC covers it).
         screen.set_scrollback(total - emitted);
         let take = usize::from(rows).min(total - emitted);
-        for (i, row) in screen.rows_formatted(0, cols).take(take).enumerate() {
+        // Scrollback rows retain their original width after a resize.
+        // Read the entire stored row, including columns outside the current viewport.
+        for (i, row) in screen.rows_formatted(0, u16::MAX).take(take).enumerate() {
             out.extend_from_slice(&row);
             out.extend_from_slice(b"\x1b[0m");
             if !screen.row_wrapped(i as u16) {
@@ -893,7 +895,8 @@ fn build_full_text(screen: &mut vt100::Screen) -> String {
         while emitted < total {
             screen.set_scrollback(total - emitted);
             let take = usize::from(rows).min(total - emitted);
-            for (i, row) in screen.rows(0, cols).take(take).enumerate() {
+            // Like history replay, search must include the original row width.
+            for (i, row) in screen.rows(0, u16::MAX).take(take).enumerate() {
                 pending.push_str(&row);
                 if !screen.row_wrapped(i as u16) {
                     lines.push(std::mem::take(&mut pending));
@@ -1408,6 +1411,27 @@ mod tests {
         // is what makes search work across the original wrap points.
         let replayed = replay_contents(&history, 40, 40);
         assert!(replayed.contains("abcdefghijklmnopqrstuvwxy"));
+    }
+
+    #[test]
+    fn history_preserves_lines_after_narrow_resize() {
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        let line = "abcdefghijklmnopqrstuvwx日本語";
+        parser.process(format!("\x1b[31m{line}\x1b[0m\r\n\r\n\r\n\r\n\r\n").as_bytes());
+        for cols in [10, 30, 8] {
+            parser.screen_mut().set_size(4, cols);
+            let history = build_history(parser.screen_mut(), usize::MAX);
+            let mut client = vt100::Parser::new(40, cols, 100);
+            client.process(&history);
+            let replayed = build_full_text(client.screen_mut());
+            assert!(replayed.contains(line), "cols={cols}: {replayed:?}");
+            assert!(build_full_text(parser.screen_mut()).contains(line));
+            assert_eq!(
+                client.screen().cell(0, 0).unwrap().fgcolor(),
+                vt100::Color::Idx(1)
+            );
+            assert_eq!(parser.screen().scrollback(), 0);
+        }
     }
 
     #[test]
