@@ -5,25 +5,20 @@
 }:
 
 let
-  mkNeovimApp = cfg: {
-    type = "app";
-    program = "${
-      with pkgs; wrapNeovimUnstable neovim-unwrapped (neovimUtils.makeNeovimConfig cfg)
-    }/bin/nvim";
-  };
-  readLua = path: ''
-    lua << EOF
-    ${builtins.readFile path}
-    EOF
-  '';
-in
-{
-  test-nvim = mkNeovimApp {
+  neovim = pkgs.wrapNeovimUnstable pkgs.neovim-unwrapped {
     plugins = [
       {
         plugin = self'.packages.pterm;
-        config = readLua ./nvim/pterm.lua;
+        type = "lua";
+        config = builtins.readFile ./nvim/pterm.lua;
       }
     ];
+  };
+in
+{
+  test-nvim = {
+    type = "app";
+    program = "${neovim}/bin/nvim";
+    meta.description = "Neovim with pterm configured";
   };
 }

@@ -10,7 +10,10 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
     naersk = {
       url = "github:nix-community/naersk";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -39,11 +42,16 @@
         }:
         let
           naersk' = pkgs.callPackage inputs.naersk { };
-          darwinInputs = lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
-          pterm-daemon = naersk'.buildPackage {
-            src = ./.;
-            buildInputs = darwinInputs;
-          };
+          buildPackage =
+            args:
+            naersk'.buildPackage (
+              {
+                src = ./.;
+                buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+              }
+              // args
+            );
+          pterm-daemon = buildPackage { };
           inherit (lib) fileset;
           nixFiles = fileset.fileFilter (file: file.hasExt "nix") ./.;
           rustFiles = fileset.unions [
@@ -84,16 +92,12 @@
                 rustfmt.enable = true;
               };
             };
-            cargo-check = naersk'.buildPackage {
-              src = ./.;
-              mode = "check";
-              buildInputs = darwinInputs;
+            cargo-check = buildPackage { mode = "check"; };
+            cargo-test = buildPackage {
+              doCheck = true;
+              cargoTestOptions = opts: opts ++ [ "--workspace" ];
             };
-            clippy = naersk'.buildPackage {
-              src = ./.;
-              mode = "clippy";
-              buildInputs = darwinInputs;
-            };
+            clippy = buildPackage { mode = "clippy"; };
           };
 
           apps = import ./nix/apps {

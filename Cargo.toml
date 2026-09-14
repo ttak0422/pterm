@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 pterm-proto = { path = "./proto" }
-nix = { version = "0.29", features = ["process", "signal", "term", "fs", "user"] }
+nix = { version = "0.31", features = ["process", "signal", "term", "fs", "user"] }
 mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
 log = "0.4"
 env_logger = "0.11"

@@ -140,9 +140,9 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
 
             // Close stdin/stdout/stderr
             let devnull = std::fs::File::open("/dev/null").unwrap();
-            nix::unistd::dup2(devnull.as_raw_fd(), 0).ok();
-            nix::unistd::dup2(devnull.as_raw_fd(), 1).ok();
-            nix::unistd::dup2(devnull.as_raw_fd(), 2).ok();
+            nix::unistd::dup2_stdin(&devnull).ok();
+            nix::unistd::dup2_stdout(&devnull).ok();
+            nix::unistd::dup2_stderr(&devnull).ok();
         }
         Err(e) => {
             eprintln!("Fork failed: {}", e);
@@ -151,8 +151,6 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
     }
 
     // Now running as daemon
-    use std::os::fd::AsRawFd;
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
         .init();

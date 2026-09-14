@@ -703,7 +703,7 @@ impl Server {
                     let mut redraw_data = b"\x1b[2J\x1b[H".to_vec();
                     redraw_data.extend_from_slice(&self.session.snapshot());
                     let msg = proto::encode(proto::server::STATE_SYNC, &redraw_data);
-                    for (_, client) in self.clients.iter_mut() {
+                    for client in self.clients.values_mut() {
                         // The bridge anchors "old daemon" detection on the
                         // first STATE_SYNC, so a pending ACK must precede it.
                         if client.hello_ack_pending {
@@ -857,7 +857,7 @@ mod tests {
         // so any decoder misalignment is detected below.
         let session = Session::new(
             "corruption-test".to_string(),
-            "/bin/sh",
+            "sh",
             &[
                 "sh",
                 "-c",
@@ -966,7 +966,7 @@ mod tests {
         // OUTPUT backlog between connecting and its request being processed.
         let session = Session::new(
             "diag-resize-test".to_string(),
-            "/bin/sh",
+            "sh",
             &[
                 "sh",
                 "-c",
@@ -1060,7 +1060,7 @@ mod tests {
         // 200 lines on the default 80x24 screen leave ~176 lines of scrollback.
         let session = Session::new(
             "history-test".to_string(),
-            "/bin/sh",
+            "sh",
             &["sh", "-c", "seq 1 200; sleep 30"],
         )
         .expect("failed to spawn test session");

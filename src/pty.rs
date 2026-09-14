@@ -1,6 +1,7 @@
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
-use nix::unistd::{dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout, execvp, fork, setsid, ForkResult, Pid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -24,10 +25,12 @@ impl Pty {
 
         // Set master fd to non-blocking so the daemon can drain all available
         // data in a loop without blocking on the last read.
-        unsafe {
-            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
-            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+        let flags = fcntl(&master, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+        fcntl(
+            &master,
+            FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+        )
+        .map_err(io::Error::from)?;
 
         // Fork
         match unsafe { fork() }.map_err(io::Error::other)? {
@@ -51,9 +54,9 @@ impl Pty {
                 }
 
                 // Redirect stdin/stdout/stderr to slave
-                dup2(slave.as_raw_fd(), libc::STDIN_FILENO).ok();
-                dup2(slave.as_raw_fd(), libc::STDOUT_FILENO).ok();
-                dup2(slave.as_raw_fd(), libc::STDERR_FILENO).ok();
+                dup2_stdin(&slave).ok();
+                dup2_stdout(&slave).ok();
+                dup2_stderr(&slave).ok();
 
                 if slave.as_raw_fd() > 2 {
                     drop(slave);
