@@ -1209,8 +1209,7 @@ impl Session {
     /// which is why it goes to a growable Vec instead of back into `buf`.
     /// Returns `Err(WouldBlock)` when the non-blocking fd has no more data.
     pub fn read_pty(&mut self, buf: &mut [u8], filtered: &mut Vec<u8>) -> io::Result<usize> {
-        let fd = self.pty.master.as_raw_fd();
-        match nix::unistd::read(fd, buf) {
+        match nix::unistd::read(&self.pty.master, buf) {
             Ok(n) => {
                 if n > 0 {
                     self.parser.process(&buf[..n]);

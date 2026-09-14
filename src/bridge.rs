@@ -8,11 +8,12 @@ use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use mio::net::UnixStream;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use nix::sys::termios;
 use pterm_proto as proto;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,26 +62,24 @@ const STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES: &[u8] = b"\x1b[<u\x1b[=0u";
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard that restores terminal settings on drop.
-struct RawModeGuard {
-    fd: RawFd,
+struct RawModeGuard<'fd> {
+    fd: BorrowedFd<'fd>,
     original: termios::Termios,
 }
 
-impl RawModeGuard {
-    fn enter(fd: RawFd) -> io::Result<Self> {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let original = termios::tcgetattr(borrowed).map_err(io::Error::other)?;
+impl<'fd> RawModeGuard<'fd> {
+    fn enter(fd: BorrowedFd<'fd>) -> io::Result<Self> {
+        let original = termios::tcgetattr(fd).map_err(io::Error::other)?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(borrowed, termios::SetArg::TCSANOW, &raw).map_err(io::Error::other)?;
+        termios::tcsetattr(fd, termios::SetArg::TCSANOW, &raw).map_err(io::Error::other)?;
         Ok(Self { fd, original })
     }
 }
 
-impl Drop for RawModeGuard {
+impl Drop for RawModeGuard<'_> {
     fn drop(&mut self) {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(borrowed, termios::SetArg::TCSANOW, &self.original);
+        let _ = termios::tcsetattr(self.fd, termios::SetArg::TCSANOW, &self.original);
     }
 }
 
@@ -97,17 +96,17 @@ fn get_winsize(fd: RawFd) -> io::Result<(u16, u16)> {
 
 /// Create a pipe and return (read_fd, write_fd) as OwnedFd.
 fn make_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    let (read, write) = nix::unistd::pipe().map_err(io::Error::from)?;
     // Set non-blocking on both ends
-    for &fd in &fds {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    for fd in [&read, &write] {
+        let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+        fcntl(
+            fd,
+            FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+        )
+        .map_err(io::Error::from)?;
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    Ok((read, write))
 }
 
 /// Global write end of the self-pipe for signal handler.
@@ -120,12 +119,11 @@ extern "C" fn sigwinch_handler(_sig: libc::c_int) {
     }
 }
 
-/// Write all bytes to a raw fd, retrying on EAGAIN.
-fn write_all_raw(fd: RawFd, data: &[u8]) -> io::Result<()> {
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+/// Write all bytes to a file descriptor, retrying on EAGAIN.
+fn write_all_raw(fd: impl AsFd, data: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < data.len() {
-        match nix::unistd::write(borrowed, &data[written..]) {
+        match nix::unistd::write(&fd, &data[written..]) {
             Ok(n) => written += n,
             Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
                 continue
@@ -147,12 +145,14 @@ pub fn run(
     initial_cols: Option<u16>,
     initial_rows: Option<u16>,
 ) -> io::Result<i32> {
-    let stdin_fd = libc::STDIN_FILENO;
-    let stdout_fd = libc::STDOUT_FILENO;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stdin_fd = stdin.as_raw_fd();
+    let stdout_fd = stdout.as_raw_fd();
 
     // Enter raw mode on stdin (if it's a terminal)
-    let _raw_guard = if unsafe { libc::isatty(stdin_fd) } == 1 {
-        Some(RawModeGuard::enter(stdin_fd)?)
+    let _raw_guard = if stdin.is_terminal() {
+        Some(RawModeGuard::enter(stdin.as_fd())?)
     } else {
         None
     };
@@ -166,7 +166,7 @@ pub fn run(
     // Install SIGWINCH handler
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigwinch_handler as usize;
+        sa.sa_sigaction = sigwinch_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
@@ -178,10 +178,12 @@ pub fn run(
     let mut socket = UnixStream::from_std(std_stream);
 
     // Set stdin to non-blocking
-    unsafe {
-        let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
-        libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    let flags = fcntl(&stdin, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+    fcntl(
+        &stdin,
+        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(io::Error::from)?;
 
     // Set up mio poll
     let mut poll = Poll::new()?;
@@ -241,7 +243,7 @@ pub fn run(
                 TOKEN_STDIN => {
                     // Read from stdin, send as INPUT to daemon
                     loop {
-                        match nix::unistd::read(stdin_fd, &mut stdin_buf) {
+                        match nix::unistd::read(&stdin, &mut stdin_buf) {
                             Ok(0) => {
                                 // stdin EOF: detach and exit
                                 let msg = proto::encode(proto::client::DETACH, &[]);
@@ -349,7 +351,7 @@ pub fn run(
                                 }
                                 // Flush any batched output before exiting
                                 if !output_batch.is_empty() {
-                                    let _ = write_all_raw(stdout_fd, &output_batch);
+                                    let _ = write_all_raw(&stdout, &output_batch);
                                 }
                                 break 'main;
                             }
@@ -357,8 +359,7 @@ pub fn run(
                         }
                     }
 
-                    if !output_batch.is_empty() && write_all_raw(stdout_fd, &output_batch).is_err()
-                    {
+                    if !output_batch.is_empty() && write_all_raw(&stdout, &output_batch).is_err() {
                         break 'main;
                     }
                 }
@@ -367,7 +368,7 @@ pub fn run(
                     // Drain wake pipe
                     let mut drain = [0u8; 64];
                     loop {
-                        match nix::unistd::read(wake_read_fd, &mut drain) {
+                        match nix::unistd::read(&wake_read, &mut drain) {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {}
                         }
@@ -391,14 +392,60 @@ pub fn run(
     // Send DETACH before exiting
     let msg = proto::encode(proto::client::DETACH, &[]);
     let _ = socket.write_all(&msg);
-    let _ = write_all_raw(stdout_fd, DETACH_CLEANUP_SEQUENCES);
+    let _ = write_all_raw(&stdout, DETACH_CLEANUP_SEQUENCES);
 
     Ok(exit_code)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DETACH_CLEANUP_SEQUENCES, STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES};
+    use super::{
+        make_pipe, write_all_raw, RawModeGuard, DETACH_CLEANUP_SEQUENCES,
+        STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES,
+    };
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::sys::termios;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn wake_pipe_is_nonblocking_and_transfers_bytes() {
+        let (read, write) = make_pipe().unwrap();
+        for fd in [&read, &write] {
+            let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap());
+            assert!(flags.contains(OFlag::O_NONBLOCK));
+        }
+        let mut buf = [0; 4];
+        assert_eq!(
+            nix::unistd::read(&read, &mut buf),
+            Err(nix::errno::Errno::EAGAIN)
+        );
+        write_all_raw(&write, b"wake").unwrap();
+        assert_eq!(nix::unistd::read(&read, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"wake");
+    }
+
+    #[test]
+    fn raw_mode_guard_restores_terminal_settings() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let original = termios::tcgetattr(&pty.slave).unwrap();
+        {
+            let _guard = RawModeGuard::enter(pty.slave.as_fd()).unwrap();
+            let raw = termios::tcgetattr(&pty.slave).unwrap();
+            assert!(!raw
+                .local_flags
+                .intersects(termios::LocalFlags::ICANON | termios::LocalFlags::ECHO));
+        }
+        let restored = termios::tcgetattr(&pty.slave).unwrap();
+        assert_eq!(restored.input_flags, original.input_flags);
+        assert_eq!(restored.output_flags, original.output_flags);
+        assert_eq!(restored.control_flags, original.control_flags);
+        // macOS may set PENDIN when canonical mode is restored.
+        assert_eq!(
+            restored.local_flags & !termios::LocalFlags::PENDIN,
+            original.local_flags & !termios::LocalFlags::PENDIN
+        );
+        assert_eq!(restored.control_chars, original.control_chars);
+    }
 
     #[test]
     fn detach_cleanup_resets_keyboard_protocols() {

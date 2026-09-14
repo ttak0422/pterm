@@ -25,6 +25,9 @@ jobs:
       - name: Build with Nix
         run: nix build
 
+      - name: Check with Nix
+        run: nix flake check
+
   build-darwin:
     runs-on: macos-15
     steps:
@@ -45,3 +48,6 @@ jobs:
 
       - name: Build with Nix
         run: nix build
+
+      - name: Check with Nix
+        run: nix flake check
