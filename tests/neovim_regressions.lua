@@ -7,9 +7,12 @@ local stopped_jobs = {}
 local expected_socket_dir
 local expected_shell
 local last_command
+-- Selene allowances below cover deliberate Neovim function mocks and restoration.
+-- selene: allow(incorrect_standard_library_use)
 vim.fn.executable = function()
 	return 1
 end
+-- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstart = function(cmd, opts)
 	last_command = cmd
 	if expected_socket_dir then
@@ -19,6 +22,7 @@ vim.fn.jobstart = function(cmd, opts)
 	next_job = next_job + 1
 	return next_job
 end
+-- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstop = function(job)
 	stopped_jobs[job] = true
 	return 1
@@ -79,6 +83,7 @@ check("configured socket directory and shell reach every subprocess", function()
 	-- Run real child processes that report their environment instead of a daemon.
 	local system = vim.system
 	local calls = 0
+	-- selene: allow(incorrect_standard_library_use)
 	vim.system = function(_, opts, callback)
 		calls = calls + 1
 		assert(opts.env and opts.env.PTERM_SOCKET_DIR == socket_root, "command uses the wrong socket directory")
@@ -129,6 +134,7 @@ vim.wait(10)
 local notify = vim.notify
 check("failed kills preserve the live connection and report failure", function()
 	local result = { code = 1, stdout = "", stderr = "permission denied" }
+	-- selene: allow(incorrect_standard_library_use)
 	vim.system = function()
 		return {
 			wait = function()
@@ -137,6 +143,7 @@ check("failed kills preserve the live connection and report failure", function()
 		}
 	end
 	local notices = {}
+	-- selene: allow(incorrect_standard_library_use)
 	vim.notify = function(message, level)
 		notices[#notices + 1] = { message = message, level = level }
 	end
@@ -154,6 +161,7 @@ check("failed kills preserve the live connection and report failure", function()
 	assert(not pterm.is_connected("kill-failure"), "successful kill left a connection active")
 	assert(notices[2].level == vim.log.levels.INFO, "successful kill did not report success")
 end)
+-- selene: allow(incorrect_standard_library_use)
 vim.notify = notify
 pterm.detach("kill-failure")
 vim.wait(10)

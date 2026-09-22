@@ -122,7 +122,7 @@ local function blend(hex1, hex2, t)
 	local function mix(a, b)
 		return math.floor(a + (b - a) * t)
 	end
-	return string.format("#%02x%02x%02x", mix(r1, r2, t), mix(g1, g2, t), mix(b1, b2, t))
+	return string.format("#%02x%02x%02x", mix(r1, r2), mix(g1, g2), mix(b1, b2))
 end
 
 local function hl_color(attr)

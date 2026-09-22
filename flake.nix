@@ -90,6 +90,7 @@
                 nixfmt.enable = true;
                 statix.enable = true;
                 stylua.enable = true;
+                selene.enable = true;
                 rustfmt.enable = true;
               };
             };
@@ -119,6 +120,7 @@
           devShells.default = pkgs.mkShell {
             inherit (self'.checks.pre-commit-check) shellHook;
             inputsFrom = [ pterm-daemon ];
+            packages = [ pkgs.selene ];
           };
         };
     };

@@ -148,6 +148,19 @@ screen, e.g. `less` or `htop`) contribute only their visible screen, not
 their shell scrollback. Matching words are highlighted in the result list and
 preview.
 
+## Development
+
+Run the Lua linter from the repository root with the pinned Nix toolchain:
+
+```sh
+nix develop -c selene lua tests/neovim_regressions.lua nix/apps/nvim
+nix flake check
+```
+
+`vim.yml` defines the Neovim APIs used here, including argument checks. Extend it
+when adding API calls. Selene also runs in the pre-commit check; `nix flake check`
+includes that check and the headless Neovim regressions.
+
 ## License
 
 MIT
