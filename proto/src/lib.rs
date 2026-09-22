@@ -15,6 +15,11 @@ use std::fmt;
 
 /// Wire protocol version. Bump on incompatible changes.
 pub const PROTO_VERSION: u32 = 1;
+/// Per-frame payload limits. Framing and protocol version remain unchanged.
+// ponytail: fixed caps cover measured colored histories; stream/chunk replies
+// if larger individual responses must be supported.
+pub const MAX_CLIENT_PAYLOAD: usize = 1024 * 1024;
+pub const MAX_SERVER_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// Client → Daemon message types
 pub mod client {
@@ -121,6 +126,7 @@ pub struct Frame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    FrameTooLarge { length: usize, limit: usize },
     InvalidResizePayloadLen(usize),
     InvalidExitPayloadLen(usize),
     InvalidHelloPayloadLen(usize),
@@ -130,6 +136,9 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FrameTooLarge { length, limit } => {
+                write!(f, "frame payload length {length} exceeds limit {limit}")
+            }
             Self::InvalidResizePayloadLen(len) => {
                 write!(
                     f,
@@ -172,8 +181,13 @@ pub fn decode_header(header: &[u8; HEADER_SIZE]) -> (u8, u32) {
 }
 
 /// Decode all complete frames from `recv_buf`, leaving any trailing partial
-/// frame bytes in place for the next read.
-pub fn decode_frames(recv_buf: &mut Vec<u8>) -> Vec<Frame> {
+/// frame bytes in place for the next read. Call after each bounded socket read
+/// so a peer cannot accumulate multiple unprocessed frames in memory.
+/// Oversized lengths are rejected as soon as their header is complete.
+pub fn decode_frames(
+    recv_buf: &mut Vec<u8>,
+    max_payload: usize,
+) -> Result<Vec<Frame>, DecodeError> {
     let mut frames = Vec::new();
     let mut offset = 0;
 
@@ -183,8 +197,14 @@ pub fn decode_frames(recv_buf: &mut Vec<u8>) -> Vec<Frame> {
             .expect("header slice length should match HEADER_SIZE");
         let (msg_type, payload_len) = decode_header(&header);
         let payload_len = payload_len as usize;
+        if payload_len > max_payload {
+            return Err(DecodeError::FrameTooLarge {
+                length: payload_len,
+                limit: max_payload,
+            });
+        }
 
-        if offset + HEADER_SIZE + payload_len > recv_buf.len() {
+        if payload_len > recv_buf.len() - offset - HEADER_SIZE {
             break;
         }
 
@@ -199,7 +219,7 @@ pub fn decode_frames(recv_buf: &mut Vec<u8>) -> Vec<Frame> {
         recv_buf.drain(..offset);
     }
 
-    frames
+    Ok(frames)
 }
 
 /// Encode a resize payload.
@@ -305,11 +325,60 @@ mod tests {
         recv_buf.extend_from_slice(&frame_a);
         recv_buf.extend_from_slice(&frame_b[..HEADER_SIZE + 1]);
 
-        let frames = decode_frames(&mut recv_buf);
+        let frames = decode_frames(&mut recv_buf, MAX_SERVER_PAYLOAD).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].msg_type, server::OUTPUT);
         assert_eq!(frames[0].payload, b"abc");
         assert_eq!(recv_buf, frame_b[..HEADER_SIZE + 1]);
+    }
+
+    #[test]
+    fn oversized_headers_are_rejected_without_waiting_for_payload() {
+        for limit in [MAX_CLIENT_PAYLOAD, MAX_SERVER_PAYLOAD] {
+            let mut header = vec![client::INPUT];
+            header.extend_from_slice(&((limit + 1) as u32).to_le_bytes());
+            let mut recv = header[..HEADER_SIZE - 1].to_vec();
+            assert!(decode_frames(&mut recv, limit).unwrap().is_empty());
+            recv.push(header[HEADER_SIZE - 1]);
+            assert_eq!(
+                decode_frames(&mut recv, limit),
+                Err(DecodeError::FrameTooLarge {
+                    length: limit + 1,
+                    limit,
+                })
+            );
+            assert_eq!(recv.len(), HEADER_SIZE);
+        }
+        let mut header = vec![server::OUTPUT];
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_frames(&mut header, MAX_SERVER_PAYLOAD).is_err());
+    }
+
+    #[test]
+    fn fragmented_frames_at_the_limit_and_following_frames_decode_in_order() {
+        let mut wire = encode(server::HISTORY, &[b'x'; 128]);
+        wire.extend(encode(server::STATE_SYNC, b"screen"));
+        let mut recv = Vec::new();
+        let mut frames = Vec::new();
+        for chunk in wire.chunks(3) {
+            recv.extend_from_slice(chunk);
+            frames.extend(decode_frames(&mut recv, 128).unwrap());
+            assert!(recv.len() <= HEADER_SIZE + 128);
+        }
+        assert_eq!(
+            frames,
+            vec![
+                Frame {
+                    msg_type: server::HISTORY,
+                    payload: vec![b'x'; 128]
+                },
+                Frame {
+                    msg_type: server::STATE_SYNC,
+                    payload: b"screen".to_vec()
+                }
+            ]
+        );
+        assert!(recv.is_empty());
     }
 
     #[test]

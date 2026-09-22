@@ -1,2 +1,5 @@
 pub const DEFAULT_TERMINAL_COLS: u16 = 80;
 pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
+pub const MAX_TERMINAL_COLS: u16 = 512;
+pub const MAX_TERMINAL_ROWS: u16 = 256;
+pub const MAX_TERMINAL_CELLS: usize = 65_536;

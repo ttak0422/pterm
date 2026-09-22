@@ -307,13 +307,10 @@ pub fn run(
 
                 TOKEN_SOCKET => {
                     // Read from socket, parse protocol frames
-                    let mut socket_closed = false;
                     loop {
                         match socket.read(&mut sock_buf) {
                             Ok(0) => {
-                                // Process already-read OUTPUT/EXIT frames before leaving.
-                                socket_closed = true;
-                                break;
+                                break 'main;
                             }
                             Ok(n) => {
                                 recv_buf.extend_from_slice(&sock_buf[..n]);
@@ -326,83 +323,86 @@ pub fn run(
                                 break 'main;
                             }
                         }
-                    }
 
-                    // Process complete frames, batching output payloads into
-                    // a single write to avoid incremental rendering.
-                    let mut output_batch: Vec<u8> = Vec::new();
-                    let mut state_sync_cleanup_queued = false;
-                    for frame in proto::decode_frames(&mut recv_buf) {
-                        match frame.msg_type {
-                            proto::server::OUTPUT => {
-                                output_batch.extend_from_slice(&frame.payload);
-                            }
-                            proto::server::HELLO_ACK => {
-                                match proto::parse_hello_ack(&frame.payload) {
-                                    Ok((version, pkg_version)) => {
-                                        log::info!(
-                                            "Daemon hello ack: proto v{}, pterm {}",
-                                            version,
-                                            pkg_version
-                                        );
-                                        daemon_proto = Some(version);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Invalid hello ack payload: {}", e);
+                        // Decode after every read to bound the partial-frame buffer.
+                        // Process complete frames, batching output payloads into
+                        // a single write to avoid incremental rendering.
+                        let mut output_batch: Vec<u8> = Vec::new();
+                        let mut state_sync_cleanup_queued = false;
+                        for frame in proto::decode_frames(&mut recv_buf, proto::MAX_SERVER_PAYLOAD)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                        {
+                            match frame.msg_type {
+                                proto::server::OUTPUT => {
+                                    output_batch.extend_from_slice(&frame.payload);
+                                }
+                                proto::server::HELLO_ACK => {
+                                    match proto::parse_hello_ack(&frame.payload) {
+                                        Ok((version, pkg_version)) => {
+                                            log::info!(
+                                                "Daemon hello ack: proto v{}, pterm {}",
+                                                version,
+                                                pkg_version
+                                            );
+                                            daemon_proto = Some(version);
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Invalid hello ack payload: {}", e);
+                                        }
                                     }
                                 }
-                            }
-                            proto::server::HISTORY => {
-                                // Scrollback replay: written to the terminal
-                                // like OUTPUT so it accumulates in the client
-                                // terminal's own scrollback. The daemon sends
-                                // it just before the initial STATE_SYNC.
-                                output_batch.extend_from_slice(&frame.payload);
-                            }
-                            proto::server::STATE_SYNC => {
-                                if !proto_checked {
-                                    proto_checked = true;
-                                    let version = daemon_proto.unwrap_or(0);
-                                    if version != proto::PROTO_VERSION {
-                                        log::warn!(
-                                            "Daemon protocol v{} differs from client v{}",
-                                            version,
-                                            proto::PROTO_VERSION
-                                        );
-                                        let notice = format!(
+                                proto::server::HISTORY => {
+                                    // Scrollback replay: written to the terminal
+                                    // like OUTPUT so it accumulates in the client
+                                    // terminal's own scrollback. The daemon sends
+                                    // it just before the initial STATE_SYNC.
+                                    output_batch.extend_from_slice(&frame.payload);
+                                }
+                                proto::server::STATE_SYNC => {
+                                    if !proto_checked {
+                                        proto_checked = true;
+                                        let version = daemon_proto.unwrap_or(0);
+                                        if version != proto::PROTO_VERSION {
+                                            log::warn!(
+                                                "Daemon protocol v{} differs from client v{}",
+                                                version,
+                                                proto::PROTO_VERSION
+                                            );
+                                            let notice = format!(
                                             "[pterm: daemon protocol v{} / client v{} — restart the session to upgrade]\r\n",
                                             version,
                                             proto::PROTO_VERSION
                                         );
-                                        output_batch.extend_from_slice(notice.as_bytes());
+                                            output_batch.extend_from_slice(notice.as_bytes());
+                                        }
                                     }
+                                    if !state_sync_cleanup_queued {
+                                        output_batch.extend_from_slice(
+                                            STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES,
+                                        );
+                                        state_sync_cleanup_queued = true;
+                                    }
+                                    output_batch.extend_from_slice(&frame.payload);
                                 }
-                                if !state_sync_cleanup_queued {
-                                    output_batch
-                                        .extend_from_slice(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES);
-                                    state_sync_cleanup_queued = true;
+                                proto::server::EXIT => {
+                                    if let Ok(code) = proto::parse_exit(&frame.payload) {
+                                        exit_code = code;
+                                    }
+                                    // Flush any batched output before exiting
+                                    if !output_batch.is_empty() {
+                                        let _ = write_all_raw(&stdout, &output_batch);
+                                    }
+                                    break 'main;
                                 }
-                                output_batch.extend_from_slice(&frame.payload);
+                                _ => {}
                             }
-                            proto::server::EXIT => {
-                                if let Ok(code) = proto::parse_exit(&frame.payload) {
-                                    exit_code = code;
-                                }
-                                // Flush any batched output before exiting
-                                if !output_batch.is_empty() {
-                                    let _ = write_all_raw(&stdout, &output_batch);
-                                }
-                                break 'main;
-                            }
-                            _ => {}
                         }
-                    }
 
-                    if !output_batch.is_empty() && write_all_raw(&stdout, &output_batch).is_err() {
-                        break 'main;
-                    }
-                    if socket_closed {
-                        break 'main;
+                        if !output_batch.is_empty()
+                            && write_all_raw(&stdout, &output_batch).is_err()
+                        {
+                            break 'main;
+                        }
                     }
                 }
 

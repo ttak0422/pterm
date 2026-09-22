@@ -15,6 +15,8 @@ const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
 const DA_QUERY_WARN_THRESHOLD: usize = 2;
 const LARGE_SEND_BUF_WARN_BYTES: usize = 64 * 1024;
+// Allow one maximum-sized history and snapshot together, plus framing/ACKs.
+const MAX_CLIENT_SEND_BYTES: usize = 2 * proto::MAX_SERVER_PAYLOAD + 64 * 1024;
 // ponytail: one shared 1 MiB input budget; use per-client queues if fair
 // scheduling between simultaneous writers becomes necessary.
 const MAX_PENDING_PTY_INPUT_BYTES: usize = 1024 * 1024;
@@ -27,6 +29,7 @@ struct Client {
     recv_buf: Vec<u8>,
     send_buf: SendQueue,
     large_send_buf_warned: bool,
+    send_overflowed: bool,
     /// `true` until the initial snapshot has been sent.
     pending_snapshot: bool,
     /// One-shot diagnostic clients should not receive normal terminal output.
@@ -41,6 +44,26 @@ struct Client {
     /// of the first STATE_SYNC so the bridge can use STATE_SYNC arrival as
     /// the "no ACK means old daemon" anchor.
     hello_ack_pending: bool,
+}
+
+impl Client {
+    fn queue_frame(&mut self, frame: &[u8]) {
+        if self.send_overflowed {
+            return;
+        }
+        if frame.len() > proto::MAX_SERVER_PAYLOAD + proto::HEADER_SIZE
+            || self
+                .send_buf
+                .pending_bytes()
+                .saturating_add(self.send_buf.front_written)
+                .saturating_add(frame.len())
+                > MAX_CLIENT_SEND_BYTES
+        {
+            self.send_overflowed = true;
+            return;
+        }
+        self.send_buf.push(frame);
+    }
 }
 
 /// Outbound frame queue for a client.
@@ -261,7 +284,7 @@ impl Server {
 
                     let msg = proto::encode(proto::server::EXIT, &exit_code.to_le_bytes());
                     for client in self.clients.values_mut() {
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     self.flush_all_clients();
                     self.exit_sent = true;
@@ -337,6 +360,7 @@ impl Server {
                             recv_buf: Vec::new(),
                             send_buf: SendQueue::default(),
                             large_send_buf_warned: false,
+                            send_overflowed: false,
                             pending_snapshot: true,
                             diagnostic: false,
                             proto: 0,
@@ -418,16 +442,16 @@ impl Server {
             // have been dropped, so re-send for any handshaked client;
             // duplicate ACKs are idempotent on the bridge side.
             if client.hello_ack_pending || (replace_send_buf && client.proto != 0) {
-                client.send_buf.push(&hello_ack_message());
+                client.queue_frame(&hello_ack_message());
                 client.hello_ack_pending = false;
             }
             if !history.is_empty() {
                 let msg = proto::encode(proto::server::HISTORY, &history);
-                client.send_buf.push(&msg);
+                client.queue_frame(&msg);
             }
             if !snapshot.is_empty() {
                 let msg = proto::encode(proto::server::STATE_SYNC, &snapshot);
-                client.send_buf.push(&msg);
+                client.queue_frame(&msg);
             }
         }
         if let Err(e) = self.flush_client_send_buf(client_id) {
@@ -436,6 +460,7 @@ impl Server {
                 client_id,
                 e
             );
+            self.clients.remove(&client_id);
         }
     }
 
@@ -495,7 +520,13 @@ impl Server {
         loop {
             match self.session.read_pty(buf, &mut self.pending_pty_output) {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(_) => {
+                    // A continuously-writing child must not grow one OUTPUT
+                    // frame without bound while the drain loop is running.
+                    if self.pending_pty_output.len() >= 64 * 1024 {
+                        self.flush_pty_output();
+                    }
+                }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     if self.pending_pty_output.is_empty() {
@@ -599,7 +630,7 @@ impl Server {
             if snapshot_ids.contains(&id) {
                 continue;
             }
-            client.send_buf.push(&msg);
+            client.queue_frame(&msg);
             flush_ids.push(id);
         }
         for id in flush_ids {
@@ -637,6 +668,12 @@ impl Server {
                 None => return Ok(()),
             };
 
+            if client.send_overflowed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "client output backlog or response exceeded its limit",
+                ));
+            }
             client.send_buf.write_to(&mut client.stream)?;
 
             let pending_bytes = client.send_buf.pending_bytes();
@@ -713,7 +750,9 @@ impl Server {
         };
 
         let mut flush_all = false;
-        for frame in proto::decode_frames(&mut recv_buf) {
+        for frame in proto::decode_frames(&mut recv_buf, proto::MAX_CLIENT_PAYLOAD)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        {
             match frame.msg_type {
                 proto::client::HELLO => match proto::parse_hello(&frame.payload) {
                     Ok((version, flags)) => {
@@ -769,10 +808,10 @@ impl Server {
                         // The bridge anchors "old daemon" detection on the
                         // first STATE_SYNC, so a pending ACK must precede it.
                         if client.hello_ack_pending {
-                            client.send_buf.push(&hello_ack_message());
+                            client.queue_frame(&hello_ack_message());
                             client.hello_ack_pending = false;
                         }
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     flush_all = true;
                 }
@@ -795,7 +834,7 @@ impl Server {
                     let msg = proto::encode(proto::server::DUMP, &payload);
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.send_buf.clear_unsent();
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     flush_all = true;
                 }
@@ -817,7 +856,7 @@ impl Server {
                     let msg = proto::encode(proto::server::SNAPSHOT_TEXT, payload.as_bytes());
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.send_buf.clear_unsent();
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     flush_all = true;
                 }
@@ -839,7 +878,7 @@ impl Server {
                     let msg = proto::encode(proto::server::FULL_TEXT, payload.as_bytes());
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.send_buf.clear_unsent();
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     flush_all = true;
                 }
@@ -861,7 +900,7 @@ impl Server {
                     let msg = proto::encode(proto::server::SNAPSHOT_ANSI, payload.as_bytes());
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.send_buf.clear_unsent();
-                        client.send_buf.push(&msg);
+                        client.queue_frame(&msg);
                     }
                     flush_all = true;
                 }
@@ -901,6 +940,87 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn oversized_request_disconnects_only_its_sender() {
+        let dir = std::env::temp_dir().join(format!("pterm-large-request-{}", std::process::id()));
+        let session =
+            Session::new("large-request".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        let socket = dir.join("socket");
+        let worker = std::thread::spawn(move || server.run());
+        let mut bad = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        bad.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut header = vec![proto::client::INPUT];
+        header.extend_from_slice(&((proto::MAX_CLIENT_PAYLOAD + 1) as u32).to_le_bytes());
+        bad.write_all(&header).unwrap();
+        let closed = bad.read(&mut [0; 1]);
+
+        let mut query = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        query
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        query
+            .write_all(&proto::encode(proto::client::SNAPSHOT_TEXT, &[]))
+            .unwrap();
+        let frames = read_frames_until(&mut query, &mut Vec::new(), |frame| {
+            frame.msg_type == proto::server::SNAPSHOT_TEXT
+        });
+        std::fs::remove_file(&socket).unwrap();
+        worker.join().unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            closed.unwrap(),
+            0,
+            "oversized sender was not disconnected on its header"
+        );
+        assert!(frames
+            .iter()
+            .any(|frame| frame.msg_type == proto::server::SNAPSHOT_TEXT));
+    }
+
+    #[test]
+    fn output_backlog_is_bounded_and_other_clients_keep_their_frames() {
+        let dir = std::env::temp_dir().join(format!("pterm-output-limit-{}", std::process::id()));
+        let session = Session::new("output-limit".into(), "sh", &["sh", "-c", "exit 0"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        let _slow = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        server.accept_client().unwrap();
+        let mut healthy = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        healthy
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        server.accept_client().unwrap();
+
+        let chunk = proto::encode(proto::server::OUTPUT, &vec![b'x'; 1024 * 1024]);
+        let slow = server.clients.get_mut(&0).unwrap();
+        for _ in 0..=MAX_CLIENT_SEND_BYTES / chunk.len() {
+            slow.queue_frame(&chunk);
+            assert!(slow.send_buf.pending_bytes() <= MAX_CLIENT_SEND_BYTES);
+        }
+        assert!(slow.send_overflowed);
+        let retained = slow.send_buf.pending_bytes();
+        slow.queue_frame(&chunk);
+        assert_eq!(slow.send_buf.pending_bytes(), retained);
+
+        let healthy_client = server.clients.get_mut(&1).unwrap();
+        healthy_client.queue_frame(&proto::encode(proto::server::HISTORY, b"history\r\n"));
+        healthy_client.queue_frame(&proto::encode(proto::server::STATE_SYNC, b"screen"));
+        server.flush_all_clients();
+        assert!(!server.clients.contains_key(&0));
+        assert!(server.clients.contains_key(&1));
+        let frames = read_frames_until(&mut healthy, &mut Vec::new(), |frame| {
+            frame.msg_type == proto::server::STATE_SYNC
+        });
+        assert_eq!(
+            frames.iter().map(|f| f.msg_type).collect::<Vec<_>>(),
+            vec![proto::server::HISTORY, proto::server::STATE_SYNC]
+        );
+        assert_eq!(frames[0].payload, b"history\r\n");
+        assert_eq!(frames[1].payload, b"screen");
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn client_read_drains_all_available_bytes() {
@@ -1293,7 +1413,7 @@ mod tests {
         let mut chunk = [0u8; 65536];
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            for frame in proto::decode_frames(recv) {
+            for frame in proto::decode_frames(recv, proto::MAX_SERVER_PAYLOAD).unwrap() {
                 let done = stop(&frame);
                 frames.push(frame);
                 if done {
