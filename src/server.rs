@@ -108,7 +108,10 @@ impl SendQueue {
         self.write_with(|bytes| stream.write(bytes))
     }
 
-    fn write_with(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) -> io::Result<()> {
+    pub(crate) fn write_with(
+        &mut self,
+        mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<()> {
         while let Some(front) = self.frames.front() {
             match write(&front[self.front_written..]) {
                 Ok(0) => {

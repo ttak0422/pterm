@@ -318,3 +318,243 @@ fn bridge_preserves_input_frames_until_daemon_resumes_reading() {
     writer.join().unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
 }
+
+#[test]
+fn bridge_keeps_input_and_resize_responsive_with_stopped_stdout() {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::libc;
+    use nix::sys::signal::{kill, Signal};
+    use nix::sys::termios;
+    use nix::unistd::Pid;
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Instant;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    for terminal in [false, true] {
+        let dir = TestDir::new();
+        let session = dir.0.join("sessions/output");
+        std::fs::create_dir_all(&session).unwrap();
+        let listener = UnixListener::bind(session.join("socket")).unwrap();
+        let (read, write) = if terminal {
+            let pty = nix::pty::openpty(None, None).unwrap();
+            (pty.master, pty.slave)
+        } else {
+            nix::unistd::pipe().unwrap()
+        };
+        let original_flags = fcntl(&write, FcntlArg::F_GETFL).unwrap();
+        let original_termios = terminal.then(|| termios::tcgetattr(&write).unwrap());
+        let mut command = dir.command();
+        command
+            .args(["attach", "output"])
+            .stdout(Stdio::from(write.try_clone().unwrap()));
+        if terminal {
+            command.stdin(Stdio::from(write.try_clone().unwrap()));
+        } else {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = ChildGuard(command.stderr(Stdio::null()).spawn().unwrap());
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut handshake = [0; 22];
+        stream.read_exact(&mut handshake).unwrap();
+
+        let keyboard_cleanup = b"\x1b[<u\x1b[=0u";
+        let mut expected = b"history".to_vec();
+        expected.extend_from_slice(keyboard_cleanup);
+        expected.extend_from_slice(b"snapshot");
+        let payload = vec![b'x'; 16 * 1024];
+        let mut frames = pterm_proto::encode(
+            pterm_proto::server::HELLO_ACK,
+            &pterm_proto::encode_hello_ack(pterm_proto::PROTO_VERSION, "test"),
+        );
+        frames.extend(pterm_proto::encode(
+            pterm_proto::server::HISTORY,
+            b"history",
+        ));
+        frames.extend(pterm_proto::encode(
+            pterm_proto::server::STATE_SYNC,
+            b"snapshot",
+        ));
+        for _ in 0..256 {
+            frames.extend(pterm_proto::encode(pterm_proto::server::OUTPUT, &payload));
+            expected.extend_from_slice(&payload);
+        }
+        frames.extend(pterm_proto::encode(
+            pterm_proto::server::EXIT,
+            &pterm_proto::encode_exit(42),
+        ));
+        let mut producer = stream.try_clone().unwrap();
+        let (sent, result) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let status = producer.write_all(&frames);
+            let _ = sent.send(status);
+        });
+        // The producer cannot drain 4 MiB into an unbounded bridge queue.
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(150)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(child.0.try_wait().unwrap().is_none());
+        if terminal {
+            let size = libc::winsize {
+                ws_row: 30,
+                ws_col: 90,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(write.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                0
+            );
+            kill(Pid::from_raw(child.0.id() as i32), Signal::SIGWINCH).unwrap();
+            nix::unistd::write(&read, b"probe").unwrap();
+        } else {
+            child.0.stdin.as_mut().unwrap().write_all(b"probe").unwrap();
+        }
+        let mut incoming = Vec::new();
+        let mut got_input = false;
+        let mut got_resize = !terminal;
+        while !got_input || !got_resize {
+            let mut buf = [0; 1024];
+            let n = stream
+                .read(&mut buf)
+                .expect("bridge blocked on stdout instead of handling input/signal");
+            assert!(n > 0);
+            incoming.extend_from_slice(&buf[..n]);
+            for frame in
+                pterm_proto::decode_frames(&mut incoming, pterm_proto::MAX_CLIENT_PAYLOAD).unwrap()
+            {
+                got_input |=
+                    frame.msg_type == pterm_proto::client::INPUT && frame.payload == b"probe";
+                got_resize |= frame.msg_type == pterm_proto::client::RESIZE
+                    && pterm_proto::parse_resize(&frame.payload).unwrap() == (90, 30);
+            }
+        }
+
+        // Resume the reader. Read to a deadline because we retain the write fd
+        // to verify its shared flags and terminal settings after bridge exit.
+        fcntl(
+            &read,
+            FcntlArg::F_SETFL(
+                OFlag::from_bits_retain(fcntl(&read, FcntlArg::F_GETFL).unwrap())
+                    | OFlag::O_NONBLOCK,
+            ),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut actual = Vec::new();
+        let mut status = None;
+        loop {
+            let mut buf = [0; 65536];
+            match nix::unistd::read(&read, &mut buf) {
+                Ok(n) if n > 0 => actual.extend_from_slice(&buf[..n]),
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => {
+                    if status.is_some() {
+                        break;
+                    }
+                    let mut fd = libc::pollfd {
+                        fd: read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    assert!(unsafe { libc::poll(&mut fd, 1, 20) } >= 0);
+                }
+                Err(error) => panic!("stdout read failed: {error}"),
+            }
+            status = child.0.try_wait().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "bridge did not drain stdout after resume (terminal={terminal}, bytes={}/{}, status={status:?})",
+                actual.len(), expected.len()
+            );
+        }
+        result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(status.unwrap().code(), Some(42));
+        assert!(actual.starts_with(&expected));
+        let cleanup = &actual[expected.len()..];
+        assert!(cleanup.starts_with(b"\x1b[?1000l"));
+        assert!(cleanup.ends_with(b"\x1b[<u\x1b[=0u"));
+        // Rust's macOS startup may add FNOSIGPIPE; check the flag we change.
+        assert_eq!(
+            fcntl(&write, FcntlArg::F_GETFL).unwrap() & libc::O_NONBLOCK,
+            original_flags & libc::O_NONBLOCK
+        );
+        if let Some(original) = original_termios {
+            let restored = termios::tcgetattr(&write).unwrap();
+            assert_eq!(
+                restored.local_flags & !termios::LocalFlags::PENDIN,
+                original.local_flags & !termios::LocalFlags::PENDIN
+            );
+            assert_eq!(restored.input_flags, original.input_flags);
+            assert_eq!(restored.output_flags, original.output_flags);
+        }
+    }
+}
+
+#[test]
+fn bridge_writes_regular_file_stdout_and_restores_flags() {
+    use nix::fcntl::{fcntl, FcntlArg};
+    let dir = TestDir::new();
+    let session = dir.0.join("sessions/file");
+    std::fs::create_dir_all(&session).unwrap();
+    let listener = UnixListener::bind(session.join("socket")).unwrap();
+    let output = std::fs::File::create(dir.0.join("output")).unwrap();
+    let original_flags = fcntl(&output, FcntlArg::F_GETFL).unwrap();
+    let mut child = dir
+        .command()
+        .args(["attach", "file"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut handshake = [0; 22];
+    stream.read_exact(&mut handshake).unwrap();
+    let mut frames = pterm_proto::encode(pterm_proto::server::OUTPUT, b"file output");
+    frames.extend(pterm_proto::encode(
+        pterm_proto::server::EXIT,
+        &pterm_proto::encode_exit(7),
+    ));
+    stream.write_all(&frames).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("bridge failed to write regular file stdout");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(status.code(), Some(7));
+    assert!(std::fs::read(dir.0.join("output"))
+        .unwrap()
+        .starts_with(b"file output"));
+    assert_eq!(
+        fcntl(&output, FcntlArg::F_GETFL).unwrap() & nix::libc::O_NONBLOCK,
+        original_flags & nix::libc::O_NONBLOCK
+    );
+}
