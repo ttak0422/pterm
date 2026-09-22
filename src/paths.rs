@@ -68,13 +68,39 @@ pub fn socket_dir() -> PathBuf {
 /// Resolve the socket path for a session name.
 /// Session name may contain `/` for hierarchical sessions (e.g. "parent/child").
 /// Returns: `<socket_dir>/<session_name>/socket`
-pub fn session_socket_path(session_name: &str) -> PathBuf {
-    socket_dir().join(session_name).join(SOCKET_FILENAME)
+pub fn session_socket_path(session_name: &str) -> io::Result<PathBuf> {
+    Ok(session_dir(session_name)?.join(SOCKET_FILENAME))
 }
 
 /// Resolve the session directory for a session name.
-pub fn session_dir(session_name: &str) -> PathBuf {
-    socket_dir().join(session_name)
+pub fn session_dir(session_name: &str) -> io::Result<PathBuf> {
+    if session_name.contains('\0')
+        || session_name
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".." | SOCKET_FILENAME | CWD_FILENAME))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name must contain nonempty relative components other than '.', '..', 'socket', or 'cwd'",
+        ));
+    }
+
+    let mut path = socket_dir();
+    for part in session_name.split('/') {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session path must not contain symlinks",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(path)
 }
 
 /// Recursively find all sessions under a directory.
@@ -83,6 +109,15 @@ pub fn find_sessions(base: &Path, prefix: &str) -> io::Result<Vec<String>> {
     let mut sessions = Vec::new();
     if !base.exists() {
         return Ok(sessions);
+    }
+
+    if !prefix.is_empty() {
+        match std::fs::symlink_metadata(base.join(SOCKET_FILENAME)) {
+            Ok(meta) if meta.file_type().is_socket() => sessions.push(prefix.to_string()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
 
     for entry in std::fs::read_dir(base)? {
@@ -97,20 +132,12 @@ pub fn find_sessions(base: &Path, prefix: &str) -> io::Result<Vec<String>> {
             continue;
         }
 
-        if path.is_dir() {
+        if entry.file_type()?.is_dir() {
             let full_name = if prefix.is_empty() {
                 name.clone()
             } else {
                 format!("{}/{}", prefix, name)
             };
-
-            let sock = path.join(SOCKET_FILENAME);
-            if sock.exists() {
-                let meta = std::fs::metadata(&sock)?;
-                if meta.file_type().is_socket() {
-                    sessions.push(full_name.clone());
-                }
-            }
 
             let children = find_sessions(&path, &full_name)?;
             sessions.extend(children);

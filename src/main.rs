@@ -79,7 +79,7 @@ fn cmd_new(args: &[String], quiet: bool) -> io::Result<()> {
         cmd_args.push(shell);
     }
 
-    let sess_dir = session_dir(&session_name);
+    let sess_dir = session_dir(&session_name)?;
     let sock_path = sess_dir.join(SOCKET_FILENAME);
 
     // Clean up stale socket file from pre-hierarchy daemon layout.
@@ -172,7 +172,7 @@ fn cmd_list(args: &[String]) -> io::Result<()> {
     let search_dir = if prefix.is_empty() {
         sock_dir
     } else {
-        sock_dir.join(prefix)
+        session_dir(prefix)?
     };
 
     let mut sessions = find_sessions(&search_dir, prefix)?;
@@ -189,7 +189,7 @@ fn cmd_kill(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let sess_dir = session_dir(name);
+    let sess_dir = session_dir(name)?;
 
     if !sess_dir.exists() {
         eprintln!("Error: session '{}' not found", name);
@@ -268,7 +268,7 @@ fn cmd_attach(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     }
 
-    let sock = session_socket_path(&session_name);
+    let sock = session_socket_path(&session_name)?;
     if !sock.exists() {
         eprintln!("Error: session '{}' not found", session_name);
         std::process::exit(1);
@@ -284,7 +284,7 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let sock = session_socket_path(name);
+    let sock = session_socket_path(name)?;
     if !sock.exists() {
         cmd_new(args, true)?;
         let ok = wait_for_socket(
@@ -311,7 +311,7 @@ fn cmd_redraw(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let sock = session_socket_path(name);
+    let sock = session_socket_path(name)?;
     if !sock.exists() {
         eprintln!("Error: session '{}' not found", name);
         std::process::exit(1);
@@ -385,7 +385,7 @@ fn cmd_query(args: &[String], request: u8, response: u8) -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let sock = session_socket_path(name);
+    let sock = session_socket_path(name)?;
     if !sock.exists() {
         eprintln!("Error: session '{}' not found", name);
         std::process::exit(1);
@@ -408,7 +408,7 @@ fn cmd_socket(args: &[String]) -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let sock_path = session_socket_path(name);
+    let sock_path = session_socket_path(name)?;
     println!("{}", sock_path.display());
     Ok(())
 }

@@ -42,6 +42,8 @@ pterm kill mysession
 ```
 
 Session names may contain `/` for hierarchical sessions. Killing a parent session also kills all children.
+Names must be relative, with no empty, `.`, `..`, `socket`, or `cwd` components.
+Session directories below the socket root must not be symbolic links.
 
 ```sh
 pterm new parent
