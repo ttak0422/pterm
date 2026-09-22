@@ -26,6 +26,14 @@ The daemon keeps up to 1 MiB of pending PTY input per session. If the child stop
 reading and a client exceeds that limit, that client is disconnected; the session
 and other clients remain available. Input already accepted stays queued in order.
 
+When stdout stops reading, the bridge queues output and waits for it to become
+writable. At 1 MiB of queued output it pauses daemon reads while continuing to
+process stdin, socket writes, and resize signals. One decoded frame (up to 64 MiB)
+and a 64 KiB socket read can exceed that watermark. Output and terminal cleanup
+drain in order before the bridge returns the daemon's exit code. Pipes, PTYs, and
+regular-file output are supported; shared file flags and terminal settings are
+restored on exit.
+
 ## Resource limits
 
 These fixed limits apply to each session/connection; they do not change the wire format.

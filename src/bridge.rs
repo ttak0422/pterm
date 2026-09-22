@@ -6,22 +6,18 @@
 
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::server::SendQueue;
-use mio::net::UnixStream;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use nix::sys::termios;
 use pterm_proto as proto;
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const TOKEN_STDIN: Token = Token(0);
-const TOKEN_SOCKET: Token = Token(1);
-const TOKEN_WAKE: Token = Token(2);
 const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024;
+const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -121,19 +117,33 @@ extern "C" fn sigwinch_handler(_sig: libc::c_int) {
     }
 }
 
-/// Write all bytes to a file descriptor, retrying on EAGAIN.
-fn write_all_raw(fd: impl AsFd, data: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        match nix::unistd::write(&fd, &data[written..]) {
-            Ok(n) => written += n,
-            Err(e) if e == nix::errno::Errno::EAGAIN || e == nix::errno::Errno::EWOULDBLOCK => {
-                continue
-            }
-            Err(e) => return Err(io::Error::other(e)),
-        }
+/// Restore the shared open-file flags, including when stdin/stdout are a PTY.
+struct NonblockingGuard<'fd> {
+    fd: BorrowedFd<'fd>,
+    original: OFlag,
+}
+
+impl<'fd> NonblockingGuard<'fd> {
+    fn enter(fd: BorrowedFd<'fd>) -> io::Result<Self> {
+        let original = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(original | OFlag::O_NONBLOCK))?;
+        Ok(Self { fd, original })
     }
-    Ok(())
+}
+
+impl Drop for NonblockingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fcntl(self.fd, FcntlArg::F_SETFL(self.original));
+    }
+}
+
+fn poll_fd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    libc::pollfd {
+        // poll reports HUP even without requested events; disable paused fds.
+        fd: if events == 0 { -1 } else { fd },
+        events,
+        revents: 0,
+    }
 }
 
 /// Run the bridge, connecting stdin/stdout to the daemon session at `socket_path`.
@@ -174,30 +184,10 @@ pub fn run(
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
     }
 
-    // Connect to daemon socket
-    let std_stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-    std_stream.set_nonblocking(true)?;
-    let mut socket = UnixStream::from_std(std_stream);
-
-    // Set stdin to non-blocking
-    let flags = fcntl(&stdin, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-    fcntl(
-        &stdin,
-        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
-    )
-    .map_err(io::Error::from)?;
-
-    // Set up mio poll
-    let mut poll = Poll::new()?;
-    let mut stdin_source = SourceFd(&stdin_fd);
-    poll.registry()
-        .register(&mut stdin_source, TOKEN_STDIN, Interest::READABLE)?;
-    poll.registry()
-        .register(&mut socket, TOKEN_SOCKET, Interest::READABLE)?;
-    let wake_read_fd = wake_read.as_raw_fd();
-    let mut wake_source = SourceFd(&wake_read_fd);
-    poll.registry()
-        .register(&mut wake_source, TOKEN_WAKE, Interest::READABLE)?;
+    let mut socket = UnixStream::connect(socket_path)?;
+    socket.set_nonblocking(true)?;
+    let _stdin_flags = NonblockingGuard::enter(stdin.as_fd())?;
+    let _stdout_flags = NonblockingGuard::enter(stdout.as_fd())?;
 
     // Send initial RESIZE to sync terminal size.
     // CLI-supplied values take priority, then TIOCGWINSZ, then the default
@@ -228,218 +218,192 @@ pub fn run(
         send_buf.push(&msg);
     }
 
-    let mut events = Events::with_capacity(16);
     let mut stdin_buf = [0u8; 8192];
     let mut sock_buf = [0u8; 65536];
-    let mut recv_buf: Vec<u8> = Vec::new();
-    let mut exit_code: i32 = 0;
-    // None until a HELLO_ACK arrives. A daemon that predates the handshake
-    // never sends one, so the first STATE_SYNC is the detection anchor:
-    // no ACK by then means protocol v0.
-    let mut daemon_proto: Option<u32> = None;
+    let mut recv_buf = Vec::new();
+    let mut output = SendQueue::default();
+    let mut exit_code = 0;
+    // A daemon predating HELLO_ACK is detected at the first STATE_SYNC.
+    let mut daemon_proto = None;
     let mut proto_checked = false;
-    let mut stdin_open = true;
-    let mut stdin_registered = true;
-    'main: loop {
-        if send_buf.write_to(&mut socket).is_err() {
+    let mut running = true;
+    let mut socket_open = true;
+    let mut cleanup_queued = false;
+    loop {
+        if !running && !cleanup_queued {
+            output.push(DETACH_CLEANUP_SEQUENCES);
+            cleanup_queued = true;
+        }
+        if !running && output.is_empty() && (!socket_open || send_buf.is_empty()) {
             break;
         }
-        if !stdin_open && send_buf.is_empty() {
-            break;
-        }
-        let socket_interest = if send_buf.is_empty() {
-            Interest::READABLE
-        } else {
-            Interest::READABLE.add(Interest::WRITABLE)
-        };
-        poll.registry()
-            .reregister(&mut socket, TOKEN_SOCKET, socket_interest)?;
 
-        // Apply backpressure to stdin while the daemon is not reading.
-        let read_stdin = stdin_open && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES;
-        if read_stdin {
-            if stdin_registered {
-                // A full queue may have stopped the last read before EAGAIN.
-                poll.registry()
-                    .reregister(&mut stdin_source, TOKEN_STDIN, Interest::READABLE)?;
-            } else {
-                poll.registry()
-                    .register(&mut stdin_source, TOKEN_STDIN, Interest::READABLE)?;
+        // Native poll also supports regular files, unlike epoll registration.
+        // Pause only socket reads at the output watermark; input, socket writes,
+        // and SIGWINCH remain responsive while the display is stopped.
+        let read_socket = running && output.pending_bytes() < MAX_PENDING_OUTPUT_BYTES;
+        let mut fds = [
+            poll_fd(
+                stdin_fd,
+                if running && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES {
+                    libc::POLLIN
+                } else {
+                    0
+                },
+            ),
+            poll_fd(
+                socket.as_raw_fd(),
+                if socket_open {
+                    (if read_socket { libc::POLLIN } else { 0 })
+                        | (if !send_buf.is_empty() {
+                            libc::POLLOUT
+                        } else {
+                            0
+                        })
+                } else {
+                    0
+                },
+            ),
+            poll_fd(wake_read.as_raw_fd(), libc::POLLIN),
+            poll_fd(stdout_fd, if output.is_empty() { 0 } else { libc::POLLOUT }),
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-        } else if stdin_registered {
-            poll.registry().deregister(&mut stdin_source)?;
-        }
-        stdin_registered = read_stdin;
-
-        match poll.poll(&mut events, None) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            return Err(error);
         }
 
-        for event in events.iter() {
-            match event.token() {
-                TOKEN_STDIN => {
-                    // Read from stdin, send as INPUT to daemon
-                    while stdin_open && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES {
-                        match nix::unistd::read(&stdin, &mut stdin_buf) {
-                            Ok(0) => {
-                                // Drain queued input and DETACH before exiting.
-                                stdin_open = false;
-                                send_buf.push(&proto::encode(proto::client::DETACH, &[]));
-                            }
-                            Ok(n) => {
-                                let msg = proto::encode(proto::client::INPUT, &stdin_buf[..n]);
-                                send_buf.push(&msg);
-                            }
-                            Err(e)
-                                if e == nix::errno::Errno::EAGAIN
-                                    || e == nix::errno::Errno::EWOULDBLOCK =>
-                            {
-                                break;
-                            }
-                            Err(_) => {
-                                break 'main;
-                            }
-                        }
-                    }
+        if fds[0].revents != 0 {
+            match nix::unistd::read(&stdin, &mut stdin_buf) {
+                Ok(0) => {
+                    running = false;
+                    send_buf.push(&proto::encode(proto::client::DETACH, &[]));
                 }
+                Ok(n) => send_buf.push(&proto::encode(proto::client::INPUT, &stdin_buf[..n])),
+                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
 
-                TOKEN_SOCKET => {
-                    // Read from socket, parse protocol frames
-                    loop {
-                        match socket.read(&mut sock_buf) {
-                            Ok(0) => {
-                                break 'main;
+        if read_socket && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            match socket.read(&mut sock_buf) {
+                Ok(0) => {
+                    running = false;
+                    socket_open = false;
+                }
+                Ok(n) => {
+                    recv_buf.extend_from_slice(&sock_buf[..n]);
+                    let mut output_batch: Vec<u8> = Vec::new();
+                    let mut state_sync_cleanup_queued = false;
+                    for frame in proto::decode_frames(&mut recv_buf, proto::MAX_SERVER_PAYLOAD)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    {
+                        match frame.msg_type {
+                            proto::server::OUTPUT => {
+                                output_batch.extend_from_slice(&frame.payload);
                             }
-                            Ok(n) => {
-                                recv_buf.extend_from_slice(&sock_buf[..n]);
-                            }
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                break;
-                            }
-                            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(_) => {
-                                break 'main;
-                            }
-                        }
-
-                        // Decode after every read to bound the partial-frame buffer.
-                        // Process complete frames, batching output payloads into
-                        // a single write to avoid incremental rendering.
-                        let mut output_batch: Vec<u8> = Vec::new();
-                        let mut state_sync_cleanup_queued = false;
-                        for frame in proto::decode_frames(&mut recv_buf, proto::MAX_SERVER_PAYLOAD)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                        {
-                            match frame.msg_type {
-                                proto::server::OUTPUT => {
-                                    output_batch.extend_from_slice(&frame.payload);
-                                }
-                                proto::server::HELLO_ACK => {
-                                    match proto::parse_hello_ack(&frame.payload) {
-                                        Ok((version, pkg_version)) => {
-                                            log::info!(
-                                                "Daemon hello ack: proto v{}, pterm {}",
-                                                version,
-                                                pkg_version
-                                            );
-                                            daemon_proto = Some(version);
-                                        }
-                                        Err(e) => {
-                                            log::warn!("Invalid hello ack payload: {}", e);
-                                        }
+                            proto::server::HELLO_ACK => {
+                                match proto::parse_hello_ack(&frame.payload) {
+                                    Ok((version, pkg_version)) => {
+                                        log::info!(
+                                            "Daemon hello ack: proto v{}, pterm {}",
+                                            version,
+                                            pkg_version
+                                        );
+                                        daemon_proto = Some(version);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Invalid hello ack payload: {}", e);
                                     }
                                 }
-                                proto::server::HISTORY => {
-                                    // Scrollback replay: written to the terminal
-                                    // like OUTPUT so it accumulates in the client
-                                    // terminal's own scrollback. The daemon sends
-                                    // it just before the initial STATE_SYNC.
-                                    output_batch.extend_from_slice(&frame.payload);
-                                }
-                                proto::server::STATE_SYNC => {
-                                    if !proto_checked {
-                                        proto_checked = true;
-                                        let version = daemon_proto.unwrap_or(0);
-                                        if version != proto::PROTO_VERSION {
-                                            log::warn!(
-                                                "Daemon protocol v{} differs from client v{}",
-                                                version,
-                                                proto::PROTO_VERSION
-                                            );
-                                            let notice = format!(
+                            }
+                            proto::server::HISTORY => {
+                                // Scrollback replay: written to the terminal
+                                // like OUTPUT so it accumulates in the client
+                                // terminal's own scrollback. The daemon sends
+                                // it just before the initial STATE_SYNC.
+                                output_batch.extend_from_slice(&frame.payload);
+                            }
+                            proto::server::STATE_SYNC => {
+                                if !proto_checked {
+                                    proto_checked = true;
+                                    let version = daemon_proto.unwrap_or(0);
+                                    if version != proto::PROTO_VERSION {
+                                        log::warn!(
+                                            "Daemon protocol v{} differs from client v{}",
+                                            version,
+                                            proto::PROTO_VERSION
+                                        );
+                                        let notice = format!(
                                             "[pterm: daemon protocol v{} / client v{} — restart the session to upgrade]\r\n",
                                             version,
                                             proto::PROTO_VERSION
                                         );
-                                            output_batch.extend_from_slice(notice.as_bytes());
-                                        }
+                                        output_batch.extend_from_slice(notice.as_bytes());
                                     }
-                                    if !state_sync_cleanup_queued {
-                                        output_batch.extend_from_slice(
-                                            STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES,
-                                        );
-                                        state_sync_cleanup_queued = true;
-                                    }
-                                    output_batch.extend_from_slice(&frame.payload);
                                 }
-                                proto::server::EXIT => {
-                                    if let Ok(code) = proto::parse_exit(&frame.payload) {
-                                        exit_code = code;
-                                    }
-                                    // Flush any batched output before exiting
-                                    if !output_batch.is_empty() {
-                                        let _ = write_all_raw(&stdout, &output_batch);
-                                    }
-                                    break 'main;
+                                if !state_sync_cleanup_queued {
+                                    output_batch
+                                        .extend_from_slice(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES);
+                                    state_sync_cleanup_queued = true;
                                 }
-                                _ => {}
+                                output_batch.extend_from_slice(&frame.payload);
                             }
+                            proto::server::EXIT => {
+                                if let Ok(code) = proto::parse_exit(&frame.payload) {
+                                    exit_code = code;
+                                }
+                                running = false;
+                                socket_open = false;
+                                break;
+                            }
+                            _ => {}
                         }
-
-                        if !output_batch.is_empty()
-                            && write_all_raw(&stdout, &output_batch).is_err()
-                        {
-                            break 'main;
-                        }
+                    }
+                    if !output_batch.is_empty() {
+                        output.push(&output_batch);
                     }
                 }
-
-                TOKEN_WAKE => {
-                    // Drain wake pipe
-                    let mut drain = [0u8; 64];
-                    loop {
-                        match nix::unistd::read(&wake_read, &mut drain) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                    }
-
-                    // Handle SIGWINCH
-                    if stdin_open && SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
-                        if let Ok((cols, rows)) = get_winsize(stdout_fd) {
-                            if cols == 0 || rows == 0 {
-                                continue;
-                            }
-                            let resize_payload = proto::encode_resize(cols, rows);
-                            let msg = proto::encode(proto::client::RESIZE, &resize_payload);
-                            send_buf.push(&msg);
-                        }
-                    }
+                Err(ref error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    running = false;
+                    socket_open = false;
                 }
-
-                _ => {}
             }
         }
-    }
 
-    // Send DETACH before exiting
-    if stdin_open {
-        send_buf.push(&proto::encode(proto::client::DETACH, &[]));
-        let _ = send_buf.write_to(&mut socket);
+        if socket_open
+            && fds[1].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+            && send_buf.write_to(&mut socket).is_err()
+        {
+            running = false;
+            socket_open = false;
+        }
+
+        if fds[2].revents != 0 {
+            let mut drain = [0u8; 64];
+            while matches!(nix::unistd::read(&wake_read, &mut drain), Ok(n) if n > 0) {}
+            if running && SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
+                if let Ok((cols, rows)) = get_winsize(stdout_fd) {
+                    if cols > 0 && rows > 0 {
+                        let payload = proto::encode_resize(cols, rows);
+                        send_buf.push(&proto::encode(proto::client::RESIZE, &payload));
+                    }
+                }
+            }
+        }
+
+        if fds[3].revents != 0 {
+            output
+                .write_with(|bytes| nix::unistd::write(&stdout, bytes).map_err(io::Error::from))?;
+        }
     }
-    let _ = write_all_raw(&stdout, DETACH_CLEANUP_SEQUENCES);
 
     Ok(exit_code)
 }
@@ -447,7 +411,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        make_pipe, write_all_raw, RawModeGuard, DETACH_CLEANUP_SEQUENCES,
+        make_pipe, NonblockingGuard, RawModeGuard, DETACH_CLEANUP_SEQUENCES,
         STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES,
     };
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -466,9 +430,24 @@ mod tests {
             nix::unistd::read(&read, &mut buf),
             Err(nix::errno::Errno::EAGAIN)
         );
-        write_all_raw(&write, b"wake").unwrap();
+        assert_eq!(nix::unistd::write(&write, b"wake").unwrap(), 4);
         assert_eq!(nix::unistd::read(&read, &mut buf).unwrap(), 4);
         assert_eq!(&buf, b"wake");
+    }
+
+    #[test]
+    fn nonblocking_guard_restores_shared_descriptor_flags() {
+        let (read, _) = nix::unistd::pipe().unwrap();
+        let original = fcntl(&read, FcntlArg::F_GETFL).unwrap();
+        {
+            let _first = NonblockingGuard::enter(read.as_fd()).unwrap();
+            {
+                let _second = NonblockingGuard::enter(read.as_fd()).unwrap();
+            }
+            let flags = OFlag::from_bits_retain(fcntl(&read, FcntlArg::F_GETFL).unwrap());
+            assert!(flags.contains(OFlag::O_NONBLOCK));
+        }
+        assert_eq!(fcntl(&read, FcntlArg::F_GETFL).unwrap(), original);
     }
 
     #[test]
