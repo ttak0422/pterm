@@ -743,11 +743,17 @@ fn push_sgr_diff(out: &mut String, from: &SgrState, to: &SgrState) {
             _ => push_color(&mut params, to.bg, 40),
         }
     }
-    if to.bold != from.bold {
-        params.push(if to.bold { "1".into() } else { "22".into() });
-    }
-    if to.dim != from.dim {
-        params.push(if to.dim { "2".into() } else { "22".into() });
+    if to.bold != from.bold || to.dim != from.dim {
+        // SGR 22 clears both bold and dim, so reset before enabling either.
+        if from.bold || from.dim {
+            params.push("22".into());
+        }
+        if to.bold {
+            params.push("1".into());
+        }
+        if to.dim {
+            params.push("2".into());
+        }
     }
     if to.italic != from.italic {
         params.push(if to.italic { "3".into() } else { "23".into() });
@@ -801,6 +807,10 @@ fn build_snapshot_ansi(screen: &vt100::Screen) -> String {
             }
 
             // Pad to this cell's column with default-styled spaces.
+            if col > prev_col {
+                push_sgr_diff(&mut out, &current, &SgrState::default());
+                current = SgrState::default();
+            }
             for _ in 0..(col.saturating_sub(prev_col)) {
                 out.push(' ');
             }
@@ -2152,6 +2162,40 @@ mod tests {
         let count = ansi.matches("\x1b[32m").count();
         assert_eq!(count, 1);
         assert_eq!(strip_sgr(&ansi), "aaaabbbb\n");
+    }
+
+    #[test]
+    fn snapshot_ansi_preserves_intensity_transitions() {
+        let mut parser = vt100::Parser::new(1, 8, 0);
+        parser.process(b"\x1b[2md\x1b[1mb\x1b[2md");
+
+        let mut replay = vt100::Parser::new(1, 8, 0);
+        replay.process(build_snapshot_ansi(parser.screen()).as_bytes());
+
+        for col in 0..3 {
+            let expected = parser.screen().cell(0, col).unwrap();
+            let actual = replay.screen().cell(0, col).unwrap();
+            assert_eq!(actual.bold(), expected.bold(), "bold at column {col}");
+            assert_eq!(actual.dim(), expected.dim(), "dim at column {col}");
+        }
+    }
+
+    #[test]
+    fn snapshot_ansi_resets_attributes_before_padding_gaps() {
+        let mut parser = vt100::Parser::new(1, 8, 0);
+        parser.process(b"\x1b[41mA\x1b[0m\x1b[3CB");
+
+        let mut replay = vt100::Parser::new(1, 8, 0);
+        replay.process(build_snapshot_ansi(parser.screen()).as_bytes());
+
+        assert_eq!(replay.screen().contents(), parser.screen().contents());
+        for col in 0..5 {
+            assert_eq!(
+                replay.screen().cell(0, col).unwrap().bgcolor(),
+                parser.screen().cell(0, col).unwrap().bgcolor(),
+                "background at column {col}",
+            );
+        }
     }
 
     #[test]
