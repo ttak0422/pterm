@@ -48,11 +48,15 @@ local function find_binary()
 	error("pterm binary not found. Install pterm with Nix or build it in this repository.")
 end
 
+local function command_env()
+	return { PTERM_SOCKET_DIR = M.config.socket_dir, SHELL = M.config.shell }
+end
+
 local function trigger_redraw(session_name)
 	local conn = connections[session_name]
 	if conn and conn.job_id then
 		local bin = find_binary()
-		vim.fn.jobstart({ bin, "redraw", session_name })
+		vim.fn.jobstart({ bin, "redraw", session_name }, { env = command_env() })
 	end
 end
 
@@ -164,19 +168,24 @@ function M.kill(session_name)
 		return
 	end
 
-	-- Detach if connected
-	local conn = connections[session_name]
-	if conn then
-		M.detach(session_name)
-	end
-
 	local bin = find_binary()
-	vim.fn.system({ bin, "kill", session_name })
+	local result = vim.system({ bin, "kill", session_name }, { text = true, env = command_env() }):wait()
+	if result.code ~= 0 then
+		vim.notify(
+			"Failed to kill session '"
+				.. session_name
+				.. "': "
+				.. vim.trim((result.stderr or "") .. (result.stdout or "")),
+			vim.log.levels.ERROR
+		)
+		return
+	end
+	M.detach(session_name)
 	vim.notify("Killed session: " .. session_name, vim.log.levels.INFO)
 end
 
-local function augroup_name(session_name)
-	return "pterm_" .. session_name:gsub("/", "_")
+local function augroup_name(buf)
+	return "pterm_" .. buf
 end
 
 local function teardown_connection(session_name, opts)
@@ -201,7 +210,7 @@ local function teardown_connection(session_name, opts)
 	end
 
 	pcall(function()
-		vim.api.nvim_del_augroup_by_name(augroup_name(session_name))
+		vim.api.nvim_del_augroup_by_name(augroup_name(conn.buf))
 	end)
 
 	if conn.buf and vim.api.nvim_buf_is_valid(conn.buf) then
@@ -266,6 +275,8 @@ end
 --- Internal: create a terminal buffer and start a pterm bridge process.
 --- `cmd` is the full argv for jobstart (e.g. {"pterm","open","main"}).
 local function start_terminal(session_name, cmd)
+	teardown_connection(session_name)
+
 	-- Clean up any stale buffer with the same name from a previous connection
 	local buf_name = "pterm://" .. session_name
 	local existing = vim.fn.bufnr(buf_name)
@@ -296,6 +307,7 @@ local function start_terminal(session_name, cmd)
 	local job_id
 	job_id = vim.fn.jobstart(cmd, {
 		term = true,
+		env = command_env(),
 		on_exit = function(_, exit_code, _)
 			vim.schedule(function()
 				local conn = connections[session_name]
@@ -326,7 +338,7 @@ local function start_terminal(session_name, cmd)
 		session_name = session_name,
 	}
 
-	local augroup = vim.api.nvim_create_augroup(augroup_name(session_name), { clear = true })
+	local augroup = vim.api.nvim_create_augroup(augroup_name(buf), { clear = true })
 
 	-- Clean up on buffer delete.
 	-- BufDelete fires both when a buffer is truly deleted (:bdelete/:bwipeout)
@@ -338,6 +350,10 @@ local function start_terminal(session_name, cmd)
 		buffer = buf,
 		callback = function()
 			vim.schedule(function()
+				local conn = connections[session_name]
+				if not conn or conn.buf ~= buf then
+					return
+				end
 				if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
 					return
 				end
@@ -431,7 +447,7 @@ function M.open(session_name, args)
 			return
 		else
 			-- Buffer was closed, clean up
-			connections[session_name] = nil
+			teardown_connection(session_name)
 		end
 	end
 
@@ -488,8 +504,8 @@ function M.redraw(session_name)
 	end
 
 	local bin = find_binary()
-	vim.fn.system({ bin, "redraw", session_name })
-	if vim.v.shell_error ~= 0 then
+	local result = vim.system({ bin, "redraw", session_name }, { text = true, env = command_env() }):wait()
+	if result.code ~= 0 then
 		vim.notify("Failed to redraw session '" .. session_name .. "'", vim.log.levels.ERROR)
 	end
 end
@@ -501,8 +517,9 @@ local function run_text_command(subcommand, session_name)
 	end
 
 	local bin = find_binary()
-	local output = vim.fn.system({ bin, subcommand, session_name })
-	if vim.v.shell_error ~= 0 then
+	local result = vim.system({ bin, subcommand, session_name }, { text = true, env = command_env() }):wait()
+	local output = (result.stdout or "") .. (result.stderr or "")
+	if result.code ~= 0 then
 		return nil, output
 	end
 
@@ -550,7 +567,7 @@ function M.snapshot_text_async(session_name, callback)
 	local system_ok, job = pcall(
 		vim.system,
 		{ bin, "snapshot-text", session_name },
-		{ text = true },
+		{ text = true, env = command_env() },
 		vim.schedule_wrap(function(result)
 			if result.code == 0 then
 				callback((result.stdout or ""):gsub("\n$", ""))
@@ -598,7 +615,7 @@ function M.snapshot_ansi_async(session_name, callback)
 	local system_ok, job = pcall(
 		vim.system,
 		{ bin, "snapshot-ansi", session_name },
-		{ text = true },
+		{ text = true, env = command_env() },
 		vim.schedule_wrap(function(result)
 			if result.code == 0 then
 				callback((result.stdout or ""):gsub("\n$", ""))

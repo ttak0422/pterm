@@ -4,7 +4,7 @@ use mio::{Events, Interest, Poll, Token};
 use pterm_proto::{self as proto};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,9 @@ const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c"; // Primary Device Attributes (DA1)
 const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c"; // Secondary Device Attributes (DA2)
 const DA_QUERY_WARN_THRESHOLD: usize = 2;
 const LARGE_SEND_BUF_WARN_BYTES: usize = 64 * 1024;
+// ponytail: one shared 1 MiB input budget; use per-client queues if fair
+// scheduling between simultaneous writers becomes necessary.
+const MAX_PENDING_PTY_INPUT_BYTES: usize = 1024 * 1024;
 /// How often the daemon re-reads the child shell's working directory and
 /// refreshes the `cwd` file so session lists can follow `cd`.
 const CWD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -47,23 +50,23 @@ struct Client {
 /// permanently desync the client's decoder, so queue replacement
 /// (`clear_unsent`) always preserves it.
 #[derive(Default)]
-struct SendQueue {
+pub(crate) struct SendQueue {
     frames: VecDeque<Vec<u8>>,
     /// Bytes of the front frame already written to the socket.
     front_written: usize,
 }
 
 impl SendQueue {
-    fn push(&mut self, frame: &[u8]) {
+    pub(crate) fn push(&mut self, frame: &[u8]) {
         self.frames.push_back(frame.to_vec());
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
     /// Total bytes still waiting to go out on the wire.
-    fn pending_bytes(&self) -> usize {
+    pub(crate) fn pending_bytes(&self) -> usize {
         self.frames.iter().map(Vec::len).sum::<usize>() - self.front_written
     }
 
@@ -78,13 +81,17 @@ impl SendQueue {
     }
 
     /// Write as much as the stream accepts, stopping on `WouldBlock`.
-    fn write_to(&mut self, stream: &mut UnixStream) -> io::Result<()> {
+    pub(crate) fn write_to(&mut self, stream: &mut impl Write) -> io::Result<()> {
+        self.write_with(|bytes| stream.write(bytes))
+    }
+
+    fn write_with(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) -> io::Result<()> {
         while let Some(front) = self.frames.front() {
-            match stream.write(&front[self.front_written..]) {
+            match write(&front[self.front_written..]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "client stream closed",
+                        "output stream closed",
                     ));
                 }
                 Ok(n) => {
@@ -95,6 +102,7 @@ impl SendQueue {
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -104,6 +112,7 @@ impl SendQueue {
 
 pub struct Server {
     socket_path: PathBuf,
+    socket_identity: (u64, u64),
     session: Session,
     poll: Poll,
     listener: UnixListener,
@@ -111,6 +120,8 @@ pub struct Server {
     next_client_id: usize,
     /// Accumulated PTY output waiting to be flushed.
     pending_pty_output: Vec<u8>,
+    /// Input waiting for the child to make room in its PTY input buffer.
+    pending_pty_input: SendQueue,
     /// `true` after the EXIT message has been broadcast to clients.
     exit_sent: bool,
     /// Path of the `cwd` file recording the session's working directory.
@@ -135,11 +146,8 @@ impl Server {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)?;
-        }
-
         let mut listener = UnixListener::bind(&socket_path)?;
+        let socket_metadata = std::fs::symlink_metadata(&socket_path)?;
 
         #[cfg(unix)]
         {
@@ -158,12 +166,14 @@ impl Server {
 
         Ok(Self {
             socket_path,
+            socket_identity: (socket_metadata.dev(), socket_metadata.ino()),
             session,
             poll,
             listener,
             clients: HashMap::new(),
             next_client_id: 0,
             pending_pty_output: Vec::new(),
+            pending_pty_input: SendQueue::default(),
             exit_sent: false,
             cwd_path,
             last_cwd,
@@ -183,18 +193,15 @@ impl Server {
         );
 
         loop {
-            // If the socket path disappears (or is replaced with a non-socket),
-            // treat the session as deleted and shut down.
-            match std::fs::symlink_metadata(&self.socket_path) {
-                Ok(meta) if meta.file_type().is_socket() => {}
-                _ => {
-                    log::warn!(
-                        "Socket path '{}' is missing; shutting down session '{}'",
-                        self.socket_path.display(),
-                        self.session.name
-                    );
-                    break;
-                }
+            // A quick kill/recreate can replace this path with another daemon's
+            // socket before we observe its removal.
+            if !self.owns_socket() {
+                log::warn!(
+                    "Socket path '{}' is missing or replaced; shutting down session '{}'",
+                    self.socket_path.display(),
+                    self.session.name
+                );
+                break;
             }
 
             self.poll
@@ -224,7 +231,18 @@ impl Server {
                             }
                         }
                     }
-                    PTY_BASE => self.handle_pty_output(&mut pty_buf)?,
+                    PTY_BASE => {
+                        if event.is_readable() {
+                            self.handle_pty_output(&mut pty_buf)?;
+                        }
+                        if event.is_writable() {
+                            if let Err(e) = self.flush_pty_input() {
+                                log::warn!("PTY input write error: {}", e);
+                                self.pending_pty_input = SendQueue::default();
+                                self.flush_pty_input()?;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -236,8 +254,9 @@ impl Server {
 
             if !self.exit_sent {
                 if let Some(exit_code) = self.session.check_exit() {
-                    // Flush pending output before the EXIT message.
-                    self.flush_pty_output();
+                    // The child may have written its final bytes after the
+                    // readiness batch above. Drain them before sending EXIT.
+                    self.handle_pty_output(&mut pty_buf)?;
                     log::info!("Child exited with code {}", exit_code);
 
                     let msg = proto::encode(proto::server::EXIT, &exit_code.to_le_bytes());
@@ -258,9 +277,21 @@ impl Server {
             }
         }
 
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_socket();
         log::info!("Server shut down for session '{}'", self.session.name);
         Ok(())
+    }
+
+    fn owns_socket(&self) -> bool {
+        std::fs::symlink_metadata(&self.socket_path).is_ok_and(|meta| {
+            meta.file_type().is_socket() && (meta.dev(), meta.ino()) == self.socket_identity
+        })
+    }
+
+    fn remove_socket(&self) {
+        if self.owns_socket() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 
     /// Re-read the child shell's working directory and update the `cwd` file
@@ -425,6 +456,39 @@ impl Server {
         Ok(())
     }
 
+    fn queue_pty_input(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self
+            .pending_pty_input
+            .pending_bytes()
+            .saturating_add(data.len())
+            > MAX_PENDING_PTY_INPUT_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY input backlog exceeds 1 MiB",
+            ));
+        }
+        self.pending_pty_input.push(data);
+        self.flush_pty_input()
+    }
+
+    fn flush_pty_input(&mut self) -> io::Result<()> {
+        self.pending_pty_input
+            .write_with(|bytes| self.session.write_pty(bytes))?;
+        let interest = if self.pending_pty_input.is_empty() {
+            Interest::READABLE
+        } else {
+            Interest::READABLE.add(Interest::WRITABLE)
+        };
+        let fd = self.session.master_fd();
+        self.poll
+            .registry()
+            .reregister(&mut mio::unix::SourceFd(&fd), PTY_BASE, interest)
+    }
+
     fn drain_pty_output(&mut self, buf: &mut [u8]) -> io::Result<()> {
         // Drain all available PTY data (non-blocking). No timer-based batching
         // -- the drain loop itself coalesces all bytes available right now.
@@ -459,13 +523,13 @@ impl Server {
             match self.session.echo_enabled() {
                 Ok(false) => {
                     for _ in 0..pending_da1 {
-                        if let Err(e) = self.session.write_pty(DA1_RESPONSE) {
+                        if let Err(e) = self.queue_pty_input(DA1_RESPONSE) {
                             log::warn!("Failed to write DA1 response to PTY: {}", e);
                             break;
                         }
                     }
                     for _ in 0..pending_da2 {
-                        if let Err(e) = self.session.write_pty(DA2_RESPONSE) {
+                        if let Err(e) = self.queue_pty_input(DA2_RESPONSE) {
                             log::warn!("Failed to write DA2 response to PTY: {}", e);
                             break;
                         }
@@ -610,37 +674,35 @@ impl Server {
     }
 
     fn handle_client_data(&mut self, client_id: usize, buf: &mut [u8]) -> io::Result<()> {
-        let remove = {
+        // mio readiness is edge-triggered; consume all available bytes before
+        // waiting again, processing complete frames before a possible EOF.
+        loop {
             let client = match self.clients.get_mut(&client_id) {
                 Some(c) => c,
                 None => return Ok(()),
             };
             match client.stream.read(buf) {
-                Ok(0) => true,
+                Ok(0) => {
+                    log::info!("Client {} disconnected", client_id);
+                    self.clients.remove(&client_id);
+                    return Ok(());
+                }
                 Ok(n) => {
                     client.recv_buf.extend_from_slice(&buf[..n]);
-                    false
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
-                Err(_) => true,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
-        };
 
-        if remove {
-            log::info!("Client {} disconnected", client_id);
-            self.clients.remove(&client_id);
-        } else if let Some(client) = self.clients.get_mut(&client_id) {
-            if !client.recv_buf.is_empty() {
-                // Flush pending PTY output so the vt state is current before
-                // processing client messages (e.g. REDRAW, RESIZE snapshots).
-                self.flush_pty_output();
-                let needs_flush = self.process_client_recv_buf(client_id)?;
-                if needs_flush {
-                    self.flush_all_clients();
-                }
+            // Flush pending PTY output so the vt state is current before
+            // processing client messages (e.g. REDRAW, RESIZE snapshots).
+            self.flush_pty_output();
+            let needs_flush = self.process_client_recv_buf(client_id)?;
+            if needs_flush {
+                self.flush_all_clients();
             }
         }
-        Ok(())
     }
 
     fn process_client_recv_buf(&mut self, client_id: usize) -> io::Result<bool> {
@@ -680,7 +742,7 @@ impl Server {
                     }
                 },
                 proto::client::INPUT => {
-                    self.session.write_pty(&frame.payload)?;
+                    self.queue_pty_input(&frame.payload)?;
                 }
                 proto::client::RESIZE => {
                     let (cols, rows) = match proto::parse_resize(&frame.payload) {
@@ -831,7 +893,7 @@ fn history_replay_limit() -> usize {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_socket();
     }
 }
 
@@ -839,6 +901,207 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn client_read_drains_all_available_bytes() {
+        let dir = std::env::temp_dir().join(format!("pterm-client-drain-{}", std::process::id()));
+        let session = Session::new("client-drain".into(), "sh", &["sh", "-c", "exit 0"])
+            .expect("failed to spawn test session");
+        let mut server = Server::new(&dir, session).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        server.accept_client().unwrap();
+        client
+            .write_all(&proto::encode(
+                proto::client::HELLO,
+                &proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::REQUEST_HISTORY),
+            ))
+            .unwrap();
+
+        // One readiness notification must consume even a frame larger than
+        // the read buffer: edge-triggered polling need not notify us again.
+        server.handle_client_data(0, &mut [0; 3]).unwrap();
+        let received = &server.clients[&0];
+        assert_eq!(received.proto, proto::PROTO_VERSION);
+        assert!(received.wants_history);
+        assert!(received.recv_buf.is_empty());
+
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn server_creation_preserves_existing_socket() {
+        let dir =
+            std::env::temp_dir().join(format!("pterm-existing-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let session = Session::new("existing-socket".into(), "sh", &["sh", "-c", "exit 0"])
+            .expect("failed to spawn test session");
+
+        let result = Server::new(&dir, session);
+        assert!(matches!(result, Err(ref e) if e.kind() == io::ErrorKind::AddrInUse));
+        let _client = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+        assert!(
+            listener.accept().is_ok(),
+            "existing listener must remain reachable"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_preserves_replacement_socket() {
+        let dir =
+            std::env::temp_dir().join(format!("pterm-replaced-socket-{}", std::process::id()));
+        let session = Session::new("replaced-socket".into(), "sh", &["sh", "-c", "exit 0"])
+            .expect("failed to spawn test session");
+        let mut server = Server::new(&dir, session).unwrap();
+        let socket_path = dir.join("socket");
+        std::fs::remove_file(&socket_path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+
+        server.run().unwrap();
+        assert!(socket_path.exists(), "shutdown removed replacement socket");
+        drop(server);
+        let _client = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+        assert!(replacement.accept().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn child_exit_drains_final_output_before_exit_frame() {
+        let dir = std::env::temp_dir().join(format!("pterm-final-output-{}", std::process::id()));
+        let session = Session::new(
+            "final-output".into(),
+            "sh",
+            &["sh", "-c", "printf 'final output'; exec sleep 30"],
+        )
+        .expect("failed to spawn test session");
+        let mut server = Server::new(&dir, session).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        server.accept_client().unwrap();
+        server.clients.get_mut(&0).unwrap().pending_snapshot = false;
+
+        // Simulate child exit becoming visible after the current readiness
+        // batch: the final bytes are in the PTY, but no read event is delivered.
+        let mut events = Events::with_capacity(4);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            server
+                .poll
+                .poll(&mut events, Some(Duration::from_millis(50)))
+                .unwrap();
+            if events
+                .iter()
+                .any(|event| event.token() == PTY_BASE && event.is_readable())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not produce output");
+        }
+        let fd = server.session.master_fd();
+        server
+            .poll
+            .registry()
+            .deregister(&mut mio::unix::SourceFd(&fd))
+            .unwrap();
+        // Inject the exit observation without depending on OS-specific PTY
+        // close behavior (macOS can wait for unread output before closing).
+        server.session.exited = Some(23);
+        let server_thread = std::thread::spawn(move || server.run());
+        let frames = read_frames_until(&mut client, &mut Vec::new(), |frame| {
+            frame.msg_type == proto::server::EXIT
+        });
+        drop(client);
+        server_thread.join().unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let output: Vec<u8> = frames
+            .iter()
+            .take_while(|frame| frame.msg_type != proto::server::EXIT)
+            .filter(|frame| frame.msg_type == proto::server::OUTPUT)
+            .flat_map(|frame| frame.payload.iter().copied())
+            .collect();
+        assert_eq!(output, b"final output");
+        assert_eq!(
+            frames.last().map(|frame| frame.msg_type),
+            Some(proto::server::EXIT)
+        );
+    }
+
+    #[test]
+    fn blocked_pty_input_is_bounded_and_does_not_block_queries() {
+        use nix::sys::signal::{kill, Signal};
+
+        let dir = std::env::temp_dir().join(format!("pterm-input-backlog-{}", std::process::id()));
+        let session = Session::new(
+            "input-backlog".into(),
+            "sh",
+            &["sh", "-c", "stty raw -echo; exec sleep 30"],
+        )
+        .unwrap();
+        let pid = session.pty.child_pid;
+        let mut server = Server::new(&dir, session).unwrap();
+        let _writer = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        server.accept_client().unwrap();
+        let mut query = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        query
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        server.accept_client().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.session.echo_enabled().unwrap() {
+            assert!(Instant::now() < deadline, "child did not enter raw mode");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let input = proto::encode(
+            proto::client::INPUT,
+            &vec![b'x'; MAX_PENDING_PTY_INPUT_BYTES],
+        );
+        server.clients.get_mut(&0).unwrap().recv_buf = input.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            let result = server.process_client_recv_buf(0);
+            tx.send((server, result)).ok();
+        });
+        let received = rx.recv_timeout(Duration::from_secs(2));
+        if received.is_err() {
+            // Keep this regression bounded even if a blocking write loop returns.
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+        writer_thread.join().unwrap();
+        let (mut server, result) = received.expect("PTY input blocked the event loop");
+        result.unwrap();
+        let pending = server.pending_pty_input.pending_bytes();
+        assert!(pending > 0, "test did not fill the PTY input buffer");
+
+        server.clients.get_mut(&0).unwrap().recv_buf = input;
+        assert_eq!(
+            server.process_client_recv_buf(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(server.pending_pty_input.pending_bytes(), pending);
+        server.clients.get_mut(&1).unwrap().recv_buf = proto::encode(proto::client::DUMP, &[]);
+        assert!(server.process_client_recv_buf(1).unwrap());
+        server.flush_all_clients();
+        let frames = read_frames_until(&mut query, &mut Vec::new(), |frame| {
+            frame.msg_type == proto::server::DUMP
+        });
+        let _ = kill(pid, Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(frames
+            .iter()
+            .any(|frame| frame.msg_type == proto::server::DUMP));
+    }
 
     /// Regression test: a RESIZE arriving while a client's outbound frame is
     /// only partially written to the socket must not corrupt the frame stream.

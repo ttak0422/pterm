@@ -73,7 +73,7 @@ do
 		if v == 0 then
 			return 0
 		end
-		return 55 + (v - 1) * 40
+		return 55 + v * 40
 	end
 	for i = 16, 231 do
 		local n = i - 16

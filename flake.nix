@@ -63,6 +63,7 @@
               nixFiles
               rustFiles
               ./docs
+              ./tests
               (fileset.maybeMissing ./target)
             ]
           );
@@ -98,6 +99,12 @@
               cargoTestOptions = opts: opts ++ [ "--workspace" ];
             };
             clippy = buildPackage { mode = "clippy"; };
+            neovim = pkgs.runCommand "pterm-neovim-regressions" { nativeBuildInputs = [ pkgs.neovim ]; } ''
+              export NVIM_LOG_FILE="$TMPDIR/nvim.log"
+              cd ${./.}
+              nvim --headless -u NONE -l tests/neovim_regressions.lua
+              touch "$out"
+            '';
           };
 
           apps = import ./nix/apps {
