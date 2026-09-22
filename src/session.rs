@@ -1234,26 +1234,16 @@ impl Session {
         }
     }
 
-    /// Write input data to pty (forward user keystrokes).
-    pub fn write_pty(&self, data: &[u8]) -> io::Result<()> {
-        let mut written = 0;
-        while written < data.len() {
-            match nix::unistd::write(&self.pty.master, &data[written..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "pty write returned 0",
-                    ));
-                }
-                Ok(n) => written += n,
+    /// Write available input to the non-blocking PTY. The server retains any
+    /// unwritten bytes and retries when the PTY becomes writable.
+    pub fn write_pty(&self, data: &[u8]) -> io::Result<usize> {
+        loop {
+            match nix::unistd::write(&self.pty.master, data) {
+                Ok(n) => return Ok(n),
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(nix::errno::Errno::EAGAIN) => {
-                    std::thread::yield_now();
-                }
-                Err(e) => return Err(io::Error::other(e)),
+                Err(e) => return Err(io::Error::from(e)),
             }
         }
-        Ok(())
     }
 
     pub fn echo_enabled(&self) -> io::Result<bool> {
@@ -1263,6 +1253,12 @@ impl Session {
 
     /// Resize the pty and VT parser.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        if cols == 0 || rows == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal dimensions must be nonzero",
+            ));
+        }
         self.pty.resize(cols, rows)?;
         self.parser.screen_mut().set_size(rows, cols);
         Ok(())
@@ -1357,6 +1353,33 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 10_000);
         parser.process(bytes);
         parser.screen().contents()
+    }
+
+    #[test]
+    fn zero_resize_preserves_the_terminal_and_allows_later_resize() {
+        let mut session =
+            super::Session::new("zero-resize".into(), "sh", &["sh", "-c", "exit 0"]).unwrap();
+        for (cols, rows) in [(0, 24), (80, 0), (0, 0)] {
+            assert_eq!(
+                session.resize(cols, rows).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                session.parser.screen().size(),
+                (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+            );
+            let mut size: nix::libc::winsize = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { nix::libc::ioctl(session.master_fd(), nix::libc::TIOCGWINSZ, &mut size) },
+                0
+            );
+            assert_eq!(
+                (size.ws_row, size.ws_col),
+                (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+            );
+        }
+        session.resize(100, 30).unwrap();
+        assert_eq!(session.parser.screen().size(), (30, 100));
     }
 
     #[test]

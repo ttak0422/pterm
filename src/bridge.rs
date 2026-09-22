@@ -5,6 +5,7 @@
 //! libvterm processes escape sequences natively in C -- no Lua intermediary.
 
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
+use crate::server::SendQueue;
 use mio::net::UnixStream;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
@@ -12,7 +13,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use nix::sys::termios;
 use pterm_proto as proto;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TOKEN_STDIN: Token = Token(0);
 const TOKEN_SOCKET: Token = Token(1);
 const TOKEN_WAKE: Token = Token(2);
+const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024;
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -203,13 +205,18 @@ pub fn run(
     let (cols, rows) = {
         let winsize = get_winsize(stdout_fd).ok();
         let c = initial_cols
+            .filter(|&cols| cols > 0)
             .or(winsize.map(|(c, _)| c))
+            .filter(|&cols| cols > 0)
             .unwrap_or(DEFAULT_TERMINAL_COLS);
         let r = initial_rows
+            .filter(|&rows| rows > 0)
             .or(winsize.map(|(_, r)| r))
+            .filter(|&rows| rows > 0)
             .unwrap_or(DEFAULT_TERMINAL_ROWS);
         (c, r)
     };
+    let mut send_buf = SendQueue::default();
     {
         // HELLO must precede RESIZE in a single write so the daemon records
         // the handshake before queueing the initial snapshot.
@@ -218,7 +225,7 @@ pub fn run(
         let mut msg = proto::encode(proto::client::HELLO, &hello_payload);
         let resize_payload = proto::encode_resize(cols, rows);
         msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
-        socket.write_all(&msg)?;
+        send_buf.push(&msg);
     }
 
     let mut events = Events::with_capacity(16);
@@ -231,7 +238,39 @@ pub fn run(
     // no ACK by then means protocol v0.
     let mut daemon_proto: Option<u32> = None;
     let mut proto_checked = false;
+    let mut stdin_open = true;
+    let mut stdin_registered = true;
     'main: loop {
+        if send_buf.write_to(&mut socket).is_err() {
+            break;
+        }
+        if !stdin_open && send_buf.is_empty() {
+            break;
+        }
+        let socket_interest = if send_buf.is_empty() {
+            Interest::READABLE
+        } else {
+            Interest::READABLE.add(Interest::WRITABLE)
+        };
+        poll.registry()
+            .reregister(&mut socket, TOKEN_SOCKET, socket_interest)?;
+
+        // Apply backpressure to stdin while the daemon is not reading.
+        let read_stdin = stdin_open && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES;
+        if read_stdin {
+            if stdin_registered {
+                // A full queue may have stopped the last read before EAGAIN.
+                poll.registry()
+                    .reregister(&mut stdin_source, TOKEN_STDIN, Interest::READABLE)?;
+            } else {
+                poll.registry()
+                    .register(&mut stdin_source, TOKEN_STDIN, Interest::READABLE)?;
+            }
+        } else if stdin_registered {
+            poll.registry().deregister(&mut stdin_source)?;
+        }
+        stdin_registered = read_stdin;
+
         match poll.poll(&mut events, None) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -242,19 +281,16 @@ pub fn run(
             match event.token() {
                 TOKEN_STDIN => {
                     // Read from stdin, send as INPUT to daemon
-                    loop {
+                    while stdin_open && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES {
                         match nix::unistd::read(&stdin, &mut stdin_buf) {
                             Ok(0) => {
-                                // stdin EOF: detach and exit
-                                let msg = proto::encode(proto::client::DETACH, &[]);
-                                let _ = socket.write_all(&msg);
-                                break 'main;
+                                // Drain queued input and DETACH before exiting.
+                                stdin_open = false;
+                                send_buf.push(&proto::encode(proto::client::DETACH, &[]));
                             }
                             Ok(n) => {
                                 let msg = proto::encode(proto::client::INPUT, &stdin_buf[..n]);
-                                if socket.write_all(&msg).is_err() {
-                                    break 'main;
-                                }
+                                send_buf.push(&msg);
                             }
                             Err(e)
                                 if e == nix::errno::Errno::EAGAIN
@@ -271,11 +307,13 @@ pub fn run(
 
                 TOKEN_SOCKET => {
                     // Read from socket, parse protocol frames
+                    let mut socket_closed = false;
                     loop {
                         match socket.read(&mut sock_buf) {
                             Ok(0) => {
-                                // Socket EOF: daemon closed
-                                break 'main;
+                                // Process already-read OUTPUT/EXIT frames before leaving.
+                                socket_closed = true;
+                                break;
                             }
                             Ok(n) => {
                                 recv_buf.extend_from_slice(&sock_buf[..n]);
@@ -283,6 +321,7 @@ pub fn run(
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 break;
                             }
+                            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                             Err(_) => {
                                 break 'main;
                             }
@@ -362,6 +401,9 @@ pub fn run(
                     if !output_batch.is_empty() && write_all_raw(&stdout, &output_batch).is_err() {
                         break 'main;
                     }
+                    if socket_closed {
+                        break 'main;
+                    }
                 }
 
                 TOKEN_WAKE => {
@@ -375,11 +417,14 @@ pub fn run(
                     }
 
                     // Handle SIGWINCH
-                    if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
+                    if stdin_open && SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
                         if let Ok((cols, rows)) = get_winsize(stdout_fd) {
+                            if cols == 0 || rows == 0 {
+                                continue;
+                            }
                             let resize_payload = proto::encode_resize(cols, rows);
                             let msg = proto::encode(proto::client::RESIZE, &resize_payload);
-                            let _ = socket.write_all(&msg);
+                            send_buf.push(&msg);
                         }
                     }
                 }
@@ -390,8 +435,10 @@ pub fn run(
     }
 
     // Send DETACH before exiting
-    let msg = proto::encode(proto::client::DETACH, &[]);
-    let _ = socket.write_all(&msg);
+    if stdin_open {
+        send_buf.push(&proto::encode(proto::client::DETACH, &[]));
+        let _ = send_buf.write_to(&mut socket);
+    }
     let _ = write_all_raw(&stdout, DETACH_CLEANUP_SEQUENCES);
 
     Ok(exit_code)
