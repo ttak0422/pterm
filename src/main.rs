@@ -354,7 +354,10 @@ fn read_single_response(
             }
             Ok(n) => {
                 recv_buf.extend_from_slice(&read_buf[..n]);
-                for frame in pterm_proto::decode_frames(&mut recv_buf) {
+                for frame in
+                    pterm_proto::decode_frames(&mut recv_buf, pterm_proto::MAX_SERVER_PAYLOAD)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                {
                     if frame.msg_type == expected_msg_type {
                         return Ok(frame.payload);
                     }

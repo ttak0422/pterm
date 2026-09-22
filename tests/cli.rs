@@ -4,7 +4,7 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct TestDir(PathBuf);
 
@@ -31,6 +31,100 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn bridge_and_query_reject_oversized_response_headers_without_payload() {
+    for command in ["attach", "dump"] {
+        let dir = TestDir::new();
+        let session = dir.0.join("sessions/oversized");
+        std::fs::create_dir_all(&session).unwrap();
+        let listener = UnixListener::bind(session.join("socket")).unwrap();
+        let mut child = dir
+            .command()
+            .args([command, "oversized"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take().unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = vec![0; if command == "attach" { 22 } else { 5 }];
+        stream.read_exact(&mut request).unwrap();
+        let mut header = vec![pterm_proto::server::OUTPUT];
+        header.extend_from_slice(&((pterm_proto::MAX_SERVER_PAYLOAD + 1) as u32).to_le_bytes());
+        stream.write_all(&header).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!timed_out, "{command} waited for an oversized payload");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("exceeds limit"),
+            "{command}: {:?}",
+            output
+        );
+    }
+}
+
+#[test]
+fn bridge_preserves_fragmented_history_before_snapshot_and_exit() {
+    let dir = TestDir::new();
+    let session = dir.0.join("sessions/history");
+    std::fs::create_dir_all(&session).unwrap();
+    let listener = UnixListener::bind(session.join("socket")).unwrap();
+    let mut child = dir
+        .command()
+        .args(["attach", "history"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    let history = vec![b'h'; 128 * 1024];
+    let expected = history.clone();
+    let daemon = std::thread::spawn(move || {
+        let mut request = [0; 22];
+        stream.read_exact(&mut request).unwrap();
+        let mut wire = pterm_proto::encode(
+            pterm_proto::server::HELLO_ACK,
+            &pterm_proto::encode_hello_ack(pterm_proto::PROTO_VERSION, "test"),
+        );
+        wire.extend(pterm_proto::encode(pterm_proto::server::HISTORY, &history));
+        wire.extend(pterm_proto::encode(
+            pterm_proto::server::STATE_SYNC,
+            b"screen",
+        ));
+        wire.extend(pterm_proto::encode(
+            pterm_proto::server::EXIT,
+            &pterm_proto::encode_exit(17),
+        ));
+        for chunk in wire.chunks(1031) {
+            stream.write_all(chunk).unwrap();
+        }
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+    let output = child.wait_with_output().unwrap();
+    daemon.join().unwrap();
+    assert_eq!(output.status.code(), Some(17));
+    assert!(output.stdout.starts_with(&expected));
+    assert!(output.stdout[expected.len()..]
+        .windows(6)
+        .any(|bytes| bytes == b"screen"));
 }
 
 #[test]
@@ -208,7 +302,7 @@ fn bridge_preserves_input_frames_until_daemon_resumes_reading() {
 
     let mut wire = Vec::new();
     stream.read_to_end(&mut wire).unwrap();
-    let frames = pterm_proto::decode_frames(&mut wire);
+    let frames = pterm_proto::decode_frames(&mut wire, pterm_proto::MAX_CLIENT_PAYLOAD).unwrap();
     assert!(wire.is_empty(), "truncated frame after stdin EOF");
     assert_eq!(frames.last().unwrap().msg_type, pterm_proto::client::DETACH);
     let received: Vec<u8> = frames

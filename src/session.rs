@@ -1,4 +1,5 @@
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
+use crate::constants::{MAX_TERMINAL_CELLS, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS};
 use crate::pty::Pty;
 use nix::sys::termios;
 use serde::Serialize;
@@ -1256,10 +1257,15 @@ impl Session {
 
     /// Resize the pty and VT parser.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        if cols == 0 || rows == 0 {
+        if cols == 0
+            || rows == 0
+            || cols > MAX_TERMINAL_COLS
+            || rows > MAX_TERMINAL_ROWS
+            || usize::from(cols) * usize::from(rows) > MAX_TERMINAL_CELLS
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "terminal dimensions must be nonzero",
+                "terminal size must be 1..512 columns, 1..256 rows, and at most 65536 cells",
             ));
         }
         self.pty.resize(cols, rows)?;
@@ -1359,10 +1365,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_resize_preserves_the_terminal_and_allows_later_resize() {
+    fn invalid_resize_preserves_the_terminal_and_allows_boundary_sizes() {
         let mut session =
             super::Session::new("zero-resize".into(), "sh", &["sh", "-c", "exit 0"]).unwrap();
-        for (cols, rows) in [(0, 24), (80, 0), (0, 0)] {
+        for (cols, rows) in [
+            (0, 24),
+            (80, 0),
+            (0, 0),
+            (513, 1),
+            (1, 257),
+            (512, 129),
+            (u16::MAX, u16::MAX),
+        ] {
             assert_eq!(
                 session.resize(cols, rows).unwrap_err().kind(),
                 std::io::ErrorKind::InvalidInput
@@ -1381,8 +1395,43 @@ mod tests {
                 (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
             );
         }
-        session.resize(100, 30).unwrap();
-        assert_eq!(session.parser.screen().size(), (30, 100));
+        for (cols, rows) in [(512, 128), (256, 256), (512, 1), (1, 256), (100, 30)] {
+            session.resize(cols, rows).unwrap();
+            assert_eq!(session.parser.screen().size(), (rows, cols));
+            assert!(!session.snapshot().is_empty());
+        }
+    }
+
+    #[test]
+    fn representative_colored_history_and_dumps_fit_response_limits() {
+        for (cols, rows) in [(80, 24), (240, 80), (512, 128)] {
+            let mut session =
+                super::Session::new("payload-size".into(), "sh", &["sh", "-c", "exit 0"]).unwrap();
+            session.resize(cols, rows).unwrap();
+            let mut line = String::new();
+            for col in 0..cols {
+                line.push_str(&format!("\x1b[38;5;{}mX", 16 + col % 216));
+            }
+            line.push_str("\r\n");
+            for _ in 0..10_000 + rows as usize {
+                session.parser.process(line.as_bytes());
+            }
+            let sizes = [
+                ("snapshot", session.snapshot().len()),
+                ("history", session.history_formatted(usize::MAX).len()),
+                (
+                    "dump",
+                    serde_json::to_vec_pretty(&session.dump()).unwrap().len(),
+                ),
+            ];
+            for (kind, bytes) in sizes {
+                eprintln!("{cols}x{rows} {kind}: {bytes} bytes");
+                assert!(
+                    bytes <= pterm_proto::MAX_SERVER_PAYLOAD,
+                    "{cols}x{rows} {kind} exceeded response limit: {bytes}"
+                );
+            }
+        }
     }
 
     #[test]
