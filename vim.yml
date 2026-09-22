@@ -1,0 +1,144 @@
+# Neovim API subset used by this repository; extend when adding API calls.
+# Format: https://kampfkarren.github.io/selene/usage/std.html
+globals:
+  vim.api.nvim_buf_clear_namespace:
+    args: [{ type: number }, { type: number }, { type: number }, { type: number }]
+  vim.api.nvim_buf_delete:
+    args: [{ type: number }, { type: table }]
+  vim.api.nvim_buf_get_lines:
+    args: [{ type: number }, { type: number }, { type: number }, { type: bool }]
+  vim.api.nvim_buf_get_name:
+    args: [{ type: number }]
+  vim.api.nvim_buf_is_loaded:
+    args: [{ type: number }]
+  vim.api.nvim_buf_is_valid:
+    args: [{ type: number }]
+  vim.api.nvim_buf_set_extmark:
+    args: [{ type: number }, { type: number }, { type: number }, { type: number }, { type: table }]
+  vim.api.nvim_buf_set_lines:
+    args: [{ type: number }, { type: number }, { type: number }, { type: bool }, { type: table }]
+  vim.api.nvim_buf_set_name:
+    args: [{ type: number }, { type: string }]
+  vim.api.nvim_create_augroup:
+    args: [{ type: string }, { type: table }]
+  vim.api.nvim_create_autocmd:
+    args: [{ type: any }, { type: table }]
+  vim.api.nvim_create_buf:
+    args: [{ type: bool }, { type: bool }]
+  vim.api.nvim_create_namespace:
+    args: [{ type: string }]
+  vim.api.nvim_create_user_command:
+    args: [{ type: string }, { type: any }, { type: table }]
+  vim.api.nvim_del_augroup_by_name:
+    args: [{ type: string }]
+  vim.api.nvim_exec_autocmds:
+    args: [{ type: any }, { type: table }]
+  vim.api.nvim_get_current_buf:
+    args: []
+  vim.api.nvim_get_current_win:
+    args: []
+  vim.api.nvim_get_hl:
+    args: [{ type: number }, { type: table }]
+  vim.api.nvim_list_wins:
+    args: []
+  vim.api.nvim_set_current_buf:
+    args: [{ type: number }]
+  vim.api.nvim_set_hl:
+    args: [{ type: number }, { type: string }, { type: table }]
+  vim.api.nvim_set_option_value:
+    args: [{ type: string }, { type: any }, { type: table }]
+  vim.api.nvim_win_get_buf:
+    args: [{ type: number }]
+  vim.api.nvim_win_get_height:
+    args: [{ type: number }]
+  vim.api.nvim_win_get_width:
+    args: [{ type: number }]
+  vim.api.nvim_win_is_valid:
+    args: [{ type: number }]
+  vim.api.nvim_win_set_cursor:
+    args: [{ type: number }, { type: table }]
+  vim.cmd:
+    args: [{ type: any }]
+  vim.defer_fn:
+    args: [{ type: function }, { type: number }]
+  vim.env.*:
+    property: full-write
+  vim.fn.bufnr:
+    args: [{ type: any, required: false }, { type: number, required: false }]
+  vim.fn.delete:
+    args: [{ type: string }, { type: string, required: false }]
+  vim.fn.executable:
+    args: [{ type: string }]
+  vim.fn.exepath:
+    args: [{ type: string }]
+  vim.fn.exists:
+    args: [{ type: string }]
+  vim.fn.fnamemodify:
+    args: [{ type: string }, { type: string }]
+  vim.fn.getcwd:
+    args: [{ type: number, required: false }, { type: number, required: false }]
+  vim.fn.jobresize:
+    args: [{ type: number }, { type: number }, { type: number }]
+  vim.fn.jobstart:
+    args: [{ type: any }, { type: table, required: false }]
+  vim.fn.jobstop:
+    args: [{ type: number }]
+  vim.fn.mkdir:
+    args: [{ type: string }, { type: string, required: false }, { type: number, required: false }]
+  vim.fn.strcharpart:
+    args: [{ type: string }, { type: number }, { type: number, required: false }, { type: number, required: false }]
+  vim.fn.strchars:
+    args: [{ type: string }, { type: number, required: false }]
+  vim.fn.strdisplaywidth:
+    args: [{ type: string }, { type: number, required: false }]
+  vim.fn.tempname:
+    args: []
+  vim.fn.writefile:
+    args: [{ type: any }, { type: string }, { type: string, required: false }]
+  vim.g.*:
+    property: full-write
+  vim.go.*:
+    property: full-write
+  vim.list_extend:
+    args: [{ type: table }, { type: table }, { type: number, required: false }, { type: number, required: false }]
+  vim.list_slice:
+    args: [{ type: table }, { type: number, required: false }, { type: number, required: false }]
+  vim.log.levels.ERROR:
+    property: read-only
+  vim.log.levels.INFO:
+    property: read-only
+  vim.notify:
+    args: [{ type: string }, { type: number, required: false }, { type: table, required: false }]
+  vim.opt.runtimepath.prepend:
+    method: true
+    args: [{ type: any }]
+  vim.schedule:
+    args: [{ type: function }]
+  vim.schedule_wrap:
+    args: [{ type: function }]
+  vim.split:
+    args: [{ type: string }, { type: string }, { type: table, required: false }]
+  vim.system:
+    args: [{ type: table }, { type: table, required: false }, { type: function, required: false }]
+  vim.tbl_deep_extend:
+    args: [{ type: [error, force, keep] }, { type: table }, { type: "..." }]
+  vim.tbl_extend:
+    args: [{ type: [error, force, keep] }, { type: table }, { type: "..." }]
+  vim.tbl_filter:
+    args: [{ type: function }, { type: table }]
+  vim.trim:
+    args: [{ type: string }]
+  vim.uv.fs_scandir:
+    args: [{ type: string }, { type: function, required: false }]
+  vim.uv.fs_scandir_next:
+    args: [{ type: any }]
+  vim.uv.fs_stat:
+    args: [{ type: string }, { type: function, required: false }]
+  vim.uv.new_timer:
+    args: []
+  vim.uv.os_get_passwd:
+    args: []
+  vim.v.event.windows:
+    property: read-only
+  vim.wait:
+    args: [{ type: number }, { type: function, required: false }, { type: number, required: false }, { type: bool, required: false }]
