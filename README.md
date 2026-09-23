@@ -70,7 +70,9 @@ The Lua module also exports functions for programmatic use: `open`, `attach`, `d
 
 - Neovim 0.10+
 - [Nix](https://nixos.org/) (with flakes enabled)
-- Linux / macOS
+- Linux (`x86_64-linux`, `aarch64-linux`) or macOS on Apple Silicon (`aarch64-darwin`)
+
+Intel macOS (`x86_64-darwin`) is no longer supported. The Nix flake and macOS CI target Apple Silicon only.
 
 ## Install
 
