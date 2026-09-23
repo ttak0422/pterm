@@ -2,7 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.0.1] - 2026-08-20
+## [2.1.0] - 2026-09-23
+
+### Features
+
+- *(telescope)* Highlight grep matches
+- *(ci)* Add release version bump choices
+
+### Bug Fixes
+
+- *(build)* Update Rust build inputs
+- Preserve scrollback width after terminal resize
+- *(paths)* Confine session operations to the socket root
+- *(render)* Preserve ANSI intensity and gap attributes
+- *(io)* Preserve session ownership and queued terminal traffic
+- *(neovim)* Preserve connection ownership and configured environments
+- Bound protocol frames, terminal sizes, and client output queues
+- Keep bridge responsive under stdout backpressure
+
+### Refactor
+
+- Refresh dependencies and modernize Nix builds
+
+### Testing
+
+- *(nix)* Run Neovim regressions and document input limits
+
+### Miscellaneous Tasks
+
+- Build and cache aarch64-darwin
+- *(lua)* Make Neovim lint reproducible
+- *(ci)* Remove Claude Code workflows
+## [2.0.1] - 2026-08-29
 
 ### Bug Fixes
 
@@ -583,6 +614,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.1.0]: https://github.com/ttak0422/pterm/compare/v2.0.1..v2.1.0
 [2.0.1]: https://github.com/ttak0422/pterm/compare/v2.0.0..v2.0.1
 [2.0.0]: https://github.com/ttak0422/pterm/compare/v1.2.0..v2.0.0
 [1.2.0]: https://github.com/ttak0422/pterm/compare/v1.1.0..v1.2.0
