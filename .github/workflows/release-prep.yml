@@ -3,10 +3,14 @@ name: release-prep
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Release version without the leading v
+      release_type:
+        description: Version increment
         required: true
-        type: string
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
 
 permissions:
   contents: write
@@ -22,11 +26,51 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.repository.default_branch }}
 
+      - name: Calculate release version
+        id: version
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+        run: |
+          set -euo pipefail
+
+          latest_tag=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)
+          if [[ ! "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Latest tag is not a valid semantic version: $latest_tag" >&2
+            exit 1
+          fi
+
+          major=${BASH_REMATCH[1]}
+          minor=${BASH_REMATCH[2]}
+          patch=${BASH_REMATCH[3]}
+
+          case "$RELEASE_TYPE" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "Unsupported release type: $RELEASE_TYPE" >&2
+              exit 1
+              ;;
+          esac
+
+          version="$major.$minor.$patch"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Calculated release version: v$version"
+
       - name: Regenerate full changelog
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --tag v${{ inputs.version }} --output CHANGELOG.md
+          args: --tag v${{ steps.version.outputs.version }} --output CHANGELOG.md
         env:
           GITHUB_REPO: ${{ github.repository }}
 
@@ -42,11 +86,11 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
           base: ${{ github.event.repository.default_branch }}
-          branch: release/v${{ inputs.version }}
-          title: "chore(release): prepare v${{ inputs.version }}"
-          commit-message: "chore(release): prepare v${{ inputs.version }}"
+          branch: release/v${{ steps.version.outputs.version }}
+          title: "chore(release): prepare v${{ steps.version.outputs.version }}"
+          commit-message: "chore(release): prepare v${{ steps.version.outputs.version }}"
           body: |
             ## Summary
-            - regenerate `CHANGELOG.md` for `v${{ inputs.version }}`
-            - prepare the repository state for tagging `v${{ inputs.version }}`
+            - regenerate `CHANGELOG.md` for `v${{ steps.version.outputs.version }}`
+            - prepare the repository state for tagging `v${{ steps.version.outputs.version }}`
             - keep release metadata changes on the normal PR review path
