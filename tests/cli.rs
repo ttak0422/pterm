@@ -558,3 +558,165 @@ fn bridge_writes_regular_file_stdout_and_restores_flags() {
         original_flags & nix::libc::O_NONBLOCK
     );
 }
+
+#[test]
+fn bridge_keeps_tui_alive_under_terminal_output_backpressure() {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+
+    struct BridgeChild(std::process::Child);
+    impl Drop for BridgeChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = TestDir::new();
+    let session_name = "opencode-like";
+    let socket = dir.0.join(format!("sessions/{session_name}/socket"));
+    let script = r#"
+sleep 1
+printf '\033[?1049h\033[?25l\033[?2026h\033[H'
+head -c 8388608 /dev/zero | tr '\000' 'x'
+printf '\033[?2026l'
+i=0
+while [ "$i" -lt 40 ]; do
+  printf '\033[?2026h\033[H\033[2J\033[32mPTERM-TUI-TICK-%02d\033[0m\033[?2026l' "$i"
+  sleep 0.1
+  i=$((i + 1))
+done
+exec sleep 20
+"#;
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+
+    // `open` creates a real daemon session and attaches the bridge through a
+    // PTY, matching the Neovim jobstart(..., { term = true }) path. The first
+    // second lets the bridge finish its handshake before the synthetic TUI
+    // starts producing an 8 MiB redraw burst followed by live updates.
+    let mut bridge_command = dir.command();
+    let child = bridge_command
+        .args(["open", session_name, "--", "sh", "-c", script])
+        .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stdout(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut bridge = BridgeChild(child);
+    drop(pty.slave);
+
+    let socket_deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() {
+        assert!(
+            bridge.0.try_wait().unwrap().is_none(),
+            "pterm open exited before creating the session socket"
+        );
+        assert!(
+            Instant::now() < socket_deadline,
+            "pterm open did not create the session socket"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Deliberately do not read the terminal PTY while the TUI writes more
+    // than the bridge's 1 MiB output watermark. This applies backpressure all
+    // the way from the terminal PTY through the bridge and daemon to the child.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        bridge.0.try_wait().unwrap().is_none(),
+        "pterm bridge exited while terminal output was not being drained"
+    );
+
+    let flags = fcntl(&pty.master, FcntlArg::F_GETFL).unwrap();
+    fcntl(
+        &pty.master,
+        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )
+    .unwrap();
+    let marker = b"PTERM-TUI-TICK-39";
+    let mut terminal_output = Vec::new();
+    let mut read_buf = [0u8; 65536];
+    let output_deadline = Instant::now() + Duration::from_secs(15);
+    let mut marker_seen = false;
+    while !marker_seen {
+        assert!(
+            Instant::now() < output_deadline,
+            "timed out draining terminal output ({} bytes received)",
+            terminal_output.len()
+        );
+        match nix::unistd::read(&pty.master, &mut read_buf) {
+            Ok(0) => panic!("terminal PTY closed before final TUI marker"),
+            Ok(n) => {
+                let search_start = terminal_output.len().saturating_sub(marker.len() - 1);
+                terminal_output.extend_from_slice(&read_buf[..n]);
+                marker_seen = terminal_output[search_start..]
+                    .windows(marker.len())
+                    .any(|window| window == marker);
+            }
+            Err(nix::errno::Errno::EAGAIN) => {
+                assert!(
+                    bridge.0.try_wait().unwrap().is_none(),
+                    "pterm bridge exited before the final TUI marker"
+                );
+                assert!(
+                    Instant::now() < output_deadline,
+                    "timed out draining terminal output ({} bytes received)",
+                    terminal_output.len()
+                );
+                let mut fd = libc::pollfd {
+                    fd: pty.master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(unsafe { libc::poll(&mut fd, 1, 20) } >= 0);
+            }
+            Err(error) => panic!("failed reading terminal PTY: {error}"),
+        }
+    }
+    assert!(
+        terminal_output.len() >= 8 * 1024 * 1024,
+        "TUI output burst did not reach terminal: {} bytes",
+        terminal_output.len()
+    );
+
+    assert!(bridge.0.try_wait().unwrap().is_none());
+    assert!(
+        socket.exists(),
+        "daemon session disappeared during TUI output"
+    );
+    let snapshot = dir
+        .command()
+        .args(["snapshot-text", session_name])
+        .output()
+        .unwrap();
+    assert!(
+        snapshot.status.success(),
+        "snapshot query failed: {snapshot:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&snapshot.stdout).contains("PTERM-TUI-TICK-39"),
+        "daemon screen did not reach the final TUI marker"
+    );
+
+    let _ = dir.command().args(["kill", session_name]).output();
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    while bridge.0.try_wait().unwrap().is_none() && Instant::now() < exit_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if bridge.0.try_wait().unwrap().is_none() {
+        bridge.0.kill().unwrap();
+    }
+    bridge.0.wait().unwrap();
+}
