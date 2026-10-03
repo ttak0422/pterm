@@ -14,6 +14,8 @@ M.config = {
 local connections = {}
 local redraw_timers = {}
 local cached_binary = nil
+local editor_focused = true
+local focus_autocmds_initialized = false
 
 --- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
@@ -58,6 +60,131 @@ local function trigger_redraw(session_name)
 		local bin = find_binary()
 		vim.fn.jobstart({ bin, "redraw", session_name }, { env = command_env() })
 	end
+end
+
+local function configure_views(buf)
+	-- A buffer may be displayed in a pre-existing, unfocused window. Apply
+	-- clipping to every mirror without granting it session resize authority.
+	for _, win in ipairs(vim.api.nvim_list_wins()) do
+		if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+			vim.api.nvim_set_option_value("wrap", false, { win = win, scope = "local" })
+		end
+	end
+end
+
+local function window_size(win)
+	-- Window width includes number/sign/fold columns. Match Neovim's terminal
+	-- text area even when another window has different local options.
+	local info = vim.fn.getwininfo(win)[1]
+	local cols = math.min(512, math.max(1, vim.api.nvim_win_get_width(win) - (info and info.textoff or 0)))
+	local rows = math.min(256, math.max(1, vim.api.nvim_win_get_height(win)))
+	-- Respect the daemon's fixed dimension/cell budgets even on very large UIs.
+	return { cols = cols, rows = math.min(rows, math.floor(65536 / cols)) }
+end
+
+-- Neovim sizes native terminal jobs to the largest window displaying their
+-- buffer. That PTY size is a rendering detail, not session resize authority.
+-- The plugin's --no-resize bridge leaves sizing to these explicit requests.
+local function flush_resize(session_name, conn)
+	if connections[session_name] ~= conn then
+		return
+	end
+	local win = vim.api.nvim_get_current_win()
+	if not editor_focused or vim.api.nvim_win_get_buf(win) ~= conn.buf then
+		conn.pending_size = nil
+		return
+	end
+	if conn.resize_job or not conn.pending_size then
+		return
+	end
+	-- A queued command may outlive a focus/layout change. Never dispatch an
+	-- old window's dimensions after another window or buffer became active.
+	local size = window_size(win)
+	conn.pending_size = nil
+
+	local resize_job
+	resize_job = vim.fn.jobstart({
+		find_binary(),
+		"resize",
+		session_name,
+		"--cols",
+		tostring(size.cols),
+		"--rows",
+		tostring(size.rows),
+	}, {
+		env = command_env(),
+		on_exit = function(_, exit_code, _)
+			vim.schedule(function()
+				if connections[session_name] ~= conn or conn.resize_job ~= resize_job then
+					return
+				end
+				conn.resize_job = nil
+				if exit_code ~= 0 then
+					-- A failed command must not suppress the next layout retry.
+					conn.last_size = nil
+				end
+				flush_resize(session_name, conn)
+			end)
+		end,
+	})
+	if resize_job > 0 then
+		conn.resize_job = resize_job
+		conn.last_size = size
+	else
+		conn.last_size = nil
+	end
+end
+
+local function resize_active_window(session_name, force)
+	local conn = connections[session_name]
+	if not conn or not editor_focused then
+		return
+	end
+	local win = vim.api.nvim_get_current_win()
+	if vim.api.nvim_win_get_buf(win) ~= conn.buf then
+		return
+	end
+	configure_views(conn.buf)
+
+	local size = window_size(win)
+	local last = conn.pending_size or conn.last_size
+	if not force and last and last.cols == size.cols and last.rows == size.rows then
+		return
+	end
+	conn.pending_size = size
+	if conn.resize_scheduled then
+		return
+	end
+	conn.resize_scheduled = true
+	vim.schedule(function()
+		conn.resize_scheduled = nil
+		flush_resize(session_name, conn)
+	end)
+end
+
+local function initialize_focus_autocmds()
+	if focus_autocmds_initialized then
+		return
+	end
+	focus_autocmds_initialized = true
+	-- Keep these handlers even when the last connection closes while the editor
+	-- is unfocused. A subsequent FocusGained must not leave new sessions frozen.
+	local group = vim.api.nvim_create_augroup("pterm_focus", { clear = true })
+	vim.api.nvim_create_autocmd("FocusLost", {
+		group = group,
+		callback = function()
+			editor_focused = false
+		end,
+	})
+	vim.api.nvim_create_autocmd("FocusGained", {
+		group = group,
+		callback = function()
+			editor_focused = true
+			for session_name in pairs(connections) do
+				resize_active_window(session_name, true)
+			end
+		end,
+	})
 end
 
 --- Get socket directory (must match daemon's socket_dir() logic).
@@ -205,6 +332,10 @@ local function teardown_connection(session_name, opts)
 
 	connections[session_name] = nil
 
+	if conn.resize_job then
+		pcall(vim.fn.jobstop, conn.resize_job)
+	end
+
 	if opts.stop_job ~= false and conn.job_id then
 		pcall(vim.fn.jobstop, conn.job_id)
 	end
@@ -275,6 +406,7 @@ end
 --- Internal: create a terminal buffer and start a pterm bridge process.
 --- `cmd` is the full argv for jobstart (e.g. {"pterm","open","main"}).
 local function start_terminal(session_name, cmd)
+	initialize_focus_autocmds()
 	teardown_connection(session_name)
 
 	-- Clean up any stale buffer with the same name from a previous connection
@@ -294,16 +426,21 @@ local function start_terminal(session_name, cmd)
 	local win = vim.api.nvim_get_current_win()
 	vim.api.nvim_set_option_value("number", false, { win = win })
 	vim.api.nvim_set_option_value("relativenumber", false, { win = win })
-	with_preserved_global_options({ "signcolumn", "foldcolumn", "statuscolumn" }, function()
+	with_preserved_global_options({ "signcolumn", "foldcolumn", "statuscolumn", "wrap" }, function()
 		vim.api.nvim_set_option_value("signcolumn", "no", { win = win })
 		vim.api.nvim_set_option_value("foldcolumn", "0", { win = win })
 		vim.api.nvim_set_option_value("statuscolumn", "", { win = win })
+		vim.api.nvim_set_option_value("wrap", false, { win = win })
 	end)
 
-	-- Let the bridge read the actual PTY size via TIOCGWINSZ instead of
-	-- passing --cols/--rows from Lua.  jobstart({term=true}) creates a PTY
-	-- sized to the current window, and the bridge's get_winsize(stdout)
-	-- will return exactly that size.
+	-- Pass the active window size before any child command separator. Native
+	-- terminal resizes may occur before the bridge starts; they must not choose
+	-- the shared session's initial size either.
+	local size = window_size(win)
+	table.insert(cmd, 5, "--cols")
+	table.insert(cmd, 6, tostring(size.cols))
+	table.insert(cmd, 7, "--rows")
+	table.insert(cmd, 8, tostring(size.rows))
 	local job_id
 	job_id = vim.fn.jobstart(cmd, {
 		term = true,
@@ -336,9 +473,45 @@ local function start_terminal(session_name, cmd)
 		buf = buf,
 		job_id = job_id,
 		session_name = session_name,
+		last_size = size,
 	}
 
 	local augroup = vim.api.nvim_create_augroup(augroup_name(buf), { clear = true })
+
+	vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+		group = augroup,
+		buffer = buf,
+		callback = function()
+			configure_views(buf)
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("TermRequest", {
+		group = augroup,
+		buffer = buf,
+		callback = function(event)
+			local sequence = event.data and event.data.sequence or vim.v.termrequest
+			if sequence ~= "\27]51;pterm-reset-history" then
+				return
+			end
+			local conn = connections[session_name]
+			vim.schedule(function()
+				if not conn or connections[session_name] ~= conn or not vim.api.nvim_buf_is_valid(buf) then
+					return
+				end
+				-- Neovim <=0.11 has no CSI 3 J scrollback-clear callback, and a
+				-- scrollback value below 1 means unlimited. The bridge first
+				-- scrolls a blank row into history. Keep that one sentinel row
+				-- while dropping all old content, then restore the user's limit.
+				-- Reducing this option synchronously calls refresh_terminal(),
+				-- so the ACK cannot race ahead of the native history cleanup.
+				local scrollback = vim.api.nvim_get_option_value("scrollback", { buf = buf })
+				vim.api.nvim_set_option_value("scrollback", 1, { buf = buf })
+				vim.api.nvim_set_option_value("scrollback", scrollback, { buf = buf })
+				vim.fn.chansend(conn.job_id, "\27]51;pterm-history-ready\7")
+			end)
+		end,
+	})
 
 	-- Clean up on buffer delete.
 	-- BufDelete fires both when a buffer is truly deleted (:bdelete/:bwipeout)
@@ -362,61 +535,28 @@ local function start_terminal(session_name, cmd)
 		end,
 	})
 
-	-- Propagate resize events to the bridge process via jobresize().
-	-- VimResized fires on SIGWINCH (whole Neovim frame resized).
+	-- Only the focused terminal window may update the shared session size.
+	-- Resizing an inactive mirror must not win over the user's current window.
 	vim.api.nvim_create_autocmd("VimResized", {
 		group = augroup,
 		callback = function()
-			local conn = connections[session_name]
-			if not conn or not conn.job_id then
-				return
-			end
-			-- Find all windows showing this terminal buffer and resize each.
-			for _, w in ipairs(vim.api.nvim_list_wins()) do
-				if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == conn.buf then
-					local cols = vim.api.nvim_win_get_width(w)
-					local rows = vim.api.nvim_win_get_height(w)
-					pcall(vim.fn.jobresize, conn.job_id, cols, rows)
-					break -- one jobresize is enough; the bridge sends RESIZE to daemon
-				end
-			end
+			resize_active_window(session_name, false)
 		end,
 	})
-
-	-- WinResized fires when individual windows change size (Neovim ≥ 0.9).
 	if vim.fn.exists("##WinResized") == 1 then
 		vim.api.nvim_create_autocmd("WinResized", {
 			group = augroup,
 			callback = function()
-				local conn = connections[session_name]
-				if not conn or not conn.job_id then
-					return
-				end
-				local resized_wins = vim.v.event and vim.v.event.windows or {}
-				for _, w in ipairs(resized_wins) do
-					if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == conn.buf then
-						local cols = vim.api.nvim_win_get_width(w)
-						local rows = vim.api.nvim_win_get_height(w)
-						pcall(vim.fn.jobresize, conn.job_id, cols, rows)
-						break
-					end
-				end
+				resize_active_window(session_name, false)
 			end,
 		})
 	end
 
-	vim.api.nvim_create_autocmd("BufEnter", {
+	vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "TermEnter" }, {
 		group = augroup,
 		buffer = buf,
 		callback = function()
-			schedule_redraw(session_name)
-		end,
-	})
-
-	vim.api.nvim_create_autocmd("TermEnter", {
-		group = augroup,
-		buffer = buf,
-		callback = function()
+			resize_active_window(session_name, true)
 			schedule_redraw(session_name)
 		end,
 	})
@@ -443,6 +583,8 @@ function M.open(session_name, args)
 		local conn = connections[session_name]
 		if vim.api.nvim_buf_is_valid(conn.buf) then
 			vim.api.nvim_set_current_buf(conn.buf)
+			configure_views(conn.buf)
+			resize_active_window(session_name, true)
 			vim.cmd("startinsert")
 			return
 		else
@@ -454,7 +596,7 @@ function M.open(session_name, args)
 	local bin = find_binary()
 
 	-- Build `pterm open` command with optional child command arguments.
-	local cmd = { bin, "open", session_name }
+	local cmd = { bin, "open", session_name, "--no-resize" }
 
 	local cmd_parts = {}
 	local found_name = false
@@ -486,7 +628,7 @@ function M.attach(session_name)
 	end
 
 	local bin = find_binary()
-	start_terminal(session_name, { bin, "attach", session_name })
+	start_terminal(session_name, { bin, "attach", session_name, "--no-resize" })
 end
 
 --- Detach from a session (does not kill the daemon).

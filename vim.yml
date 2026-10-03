@@ -37,10 +37,14 @@ globals:
     args: []
   vim.api.nvim_get_current_win:
     args: []
+  vim.api.nvim_get_option_value:
+    args: [{ type: string }, { type: table }]
   vim.api.nvim_get_hl:
     args: [{ type: number }, { type: table }]
   vim.api.nvim_list_wins:
     args: []
+  vim.api.nvim_set_current_win:
+    args: [{ type: number }]
   vim.api.nvim_set_current_buf:
     args: [{ type: number }]
   vim.api.nvim_set_hl:
@@ -55,6 +59,8 @@ globals:
     args: [{ type: number }]
   vim.api.nvim_win_is_valid:
     args: [{ type: number }]
+  vim.api.nvim_win_set_buf:
+    args: [{ type: number }, { type: number }]
   vim.api.nvim_win_set_cursor:
     args: [{ type: number }, { type: table }]
   vim.cmd:
@@ -65,6 +71,8 @@ globals:
     property: full-write
   vim.fn.bufnr:
     args: [{ type: any, required: false }, { type: number, required: false }]
+  vim.fn.chansend:
+    args: [{ type: number }, { type: any }]
   vim.fn.delete:
     args: [{ type: string }, { type: string, required: false }]
   vim.fn.executable:
@@ -75,6 +83,8 @@ globals:
     args: [{ type: string }]
   vim.fn.fnamemodify:
     args: [{ type: string }, { type: string }]
+  vim.fn.getwininfo:
+    args: [{ type: number, required: false }]
   vim.fn.getcwd:
     args: [{ type: number, required: false }, { type: number, required: false }]
   vim.fn.jobresize:
@@ -138,6 +148,8 @@ globals:
     args: []
   vim.uv.os_get_passwd:
     args: []
+  vim.v.termrequest:
+    property: read-only
   vim.v.event.windows:
     property: read-only
   vim.wait:

@@ -14,7 +14,7 @@
 use std::fmt;
 
 /// Wire protocol version. Bump on incompatible changes.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 /// Per-frame payload limits. Framing and protocol version remain unchanged.
 // ponytail: fixed caps cover measured colored histories; stream/chunk replies
 // if larger individual responses must be supported.
@@ -52,12 +52,23 @@ pub mod client {
 
     /// Request an ANSI-colored snapshot of the visible terminal screen (no payload)
     pub const SNAPSHOT_ANSI: u8 = 0x09;
+
+    /// Report a managed client renderer size without changing PTY authority.
+    /// Payload: cols:u16, rows:u16 (little endian).
+    pub const VIEW_SIZE: u8 = 0x0a;
+
+    /// Set authoritative dimensions from a one-shot controller. The server
+    /// replies with RESIZE_ACK only after processing this request.
+    pub const SET_SIZE: u8 = 0x0b;
 }
 
 /// Flags carried in the client HELLO payload.
 pub mod hello_flags {
     /// Client wants scrollback history replay on attach.
     pub const REQUEST_HISTORY: u32 = 1 << 0;
+
+    /// Request canonical, cropped view frames instead of raw terminal output.
+    pub const CANONICAL_VIEW: u32 = 1 << 1;
 }
 
 /// Daemon → Client message types
@@ -98,6 +109,17 @@ pub mod server {
     /// ANSI-colored snapshot of the visible terminal screen.
     /// Payload: UTF-8 text rows with SGR escape sequences, separated by LF
     pub const SNAPSHOT_ANSI: u8 = 0x86;
+
+    /// Managed renderer update: flags:u8 followed by ANSI bytes. Bit 0 asks
+    /// the client to replace its scrollback before replaying the bytes.
+    pub const VIEW: u8 = 0x87;
+
+    /// A one-shot non-render event for managed clients (e.g. BEL or an OSC52
+    /// clipboard write). Never replay these on resize or screen refresh.
+    pub const VIEW_EVENT: u8 = 0x88;
+
+    /// Successful SET_SIZE acknowledgement, echoing cols:u16, rows:u16.
+    pub const RESIZE_ACK: u8 = 0x89;
 }
 
 /// Encode a framed message into a Vec<u8>.

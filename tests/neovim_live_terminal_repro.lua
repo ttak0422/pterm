@@ -27,7 +27,6 @@ pterm.setup({
 })
 
 local real_jobstart = vim.fn.jobstart
-local real_jobresize = vim.fn.jobresize
 local terminal_jobs = {}
 local job_buffers = {}
 local exits = {}
@@ -42,6 +41,9 @@ end
 
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstart = function(command, opts)
+	if command[2] == "resize" then
+		table.insert(resizes, { session = command[3], cols = tonumber(command[5]), rows = tonumber(command[7]) })
+	end
 	if opts and opts.term then
 		local on_exit = opts.on_exit
 		opts.on_exit = function(job, code, event)
@@ -61,12 +63,6 @@ vim.fn.jobstart = function(command, opts)
 		job_buffers[job] = vim.api.nvim_get_current_buf()
 	end
 	return job
-end
-
--- selene: allow(incorrect_standard_library_use)
-vim.fn.jobresize = function(job, cols, rows)
-	table.insert(resizes, { job = job, cols = cols, rows = rows })
-	return real_jobresize(job, cols, rows)
 end
 
 local sessions = {}
@@ -124,10 +120,10 @@ local function hide_show_and_resize(name, job, buf)
 		vim.api.nvim_exec_autocmds("VimResized", { modeline = false })
 		vim.wait(150)
 	end
-	assert(#resizes > resize_start, name .. " did not issue jobresize after the split")
+	assert(#resizes > resize_start, name .. " did not issue a managed resize after the split")
 	local resize
 	for i = #resizes, resize_start + 1, -1 do
-		if resizes[i].job == job then
+		if resizes[i].session == name then
 			resize = resizes[i]
 			break
 		end
@@ -136,7 +132,7 @@ local function hide_show_and_resize(name, job, buf)
 	local resized_screen = screen_size(name)
 	assert(
 		resized_screen.cols == resize.cols and resized_screen.rows == resize.rows,
-		("daemon size %dx%d did not follow jobresize %dx%d while split was open"):format(
+		("daemon size %dx%d did not follow active-window resize %dx%d while split was open"):format(
 			resized_screen.cols,
 			resized_screen.rows,
 			resize.cols,
@@ -155,8 +151,6 @@ local function cleanup()
 	end
 	-- selene: allow(incorrect_standard_library_use)
 	vim.fn.jobstart = real_jobstart
-	-- selene: allow(incorrect_standard_library_use)
-	vim.fn.jobresize = real_jobresize
 	vim.fn.delete(temp_root, "rf")
 end
 
@@ -236,7 +230,7 @@ exec sleep 30
 	vim.wait(1500)
 	assert_running("live-opencode", opencode_job, opencode_buf)
 	print(
-		("OpenCode TUI startup: job=%d running after startup/focus/resize; jobresize=%dx%d (%s)\n%s"):format(
+		("OpenCode TUI startup: job=%d running after startup/focus/resize; active-window resize=%dx%d (%s)\n%s"):format(
 			opencode_job,
 			opencode_resize.cols,
 			opencode_resize.rows,
