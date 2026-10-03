@@ -1,5 +1,6 @@
 mod bridge;
 mod constants;
+mod input;
 mod paths;
 mod pty;
 mod server;
@@ -25,6 +26,8 @@ Usage:
                # attach to session (bridge mode)
   pterm open   <session-name> [--] <command> [args...]
                # attach if exists, otherwise create and attach
+  pterm resize <session-name> --cols N --rows N
+               # set the authoritative session dimensions
   pterm list   [prefix]
   pterm kill   <session-name>
   pterm redraw <session-name>   # redraw terminal (resend snapshot)
@@ -220,22 +223,6 @@ fn cmd_kill(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Extract session name from args following the same parsing rule as `cmd_new`:
-/// first non-option argument, ignoring an optional `--` separator.
-fn parse_session_name(args: &[String]) -> Option<&str> {
-    let mut parsing_opts = true;
-    let mut i = 0;
-    while i < args.len() {
-        if parsing_opts && args[i] == "--" {
-            parsing_opts = false;
-            i += 1;
-            continue;
-        }
-        return Some(args[i].as_str());
-    }
-    None
-}
-
 fn wait_for_socket(sock: &Path, timeout: Duration, poll: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -252,57 +239,159 @@ fn wait_for_socket(sock: &Path, timeout: Duration, poll: Duration) -> io::Result
     }
 }
 
-fn cmd_attach(args: &[String]) -> io::Result<()> {
-    let mut session_name = String::new();
+#[derive(Default)]
+struct AttachOptions {
+    name: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    no_resize: bool,
+    command: Vec<String>,
+}
 
+fn parse_attach_options(args: &[String]) -> io::Result<AttachOptions> {
+    let mut options = AttachOptions::default();
     let mut i = 0;
     while i < args.len() {
-        if session_name.is_empty() {
-            session_name = args[i].clone();
+        match args[i].as_str() {
+            "--" => {
+                if options.name.is_empty() {
+                    i += 1;
+                    options.name = args.get(i).cloned().unwrap_or_default();
+                }
+                options
+                    .command
+                    .extend_from_slice(args.get(i + 1..).unwrap_or_default());
+                break;
+            }
+            "--no-resize" => options.no_resize = true,
+            "--cols" | "--rows" => {
+                let flag = &args[i];
+                i += 1;
+                let value = args
+                    .get(i)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|&n| n != 0)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{flag} requires a positive integer"),
+                        )
+                    })?;
+                if flag == "--cols" {
+                    options.cols = Some(value);
+                } else {
+                    options.rows = Some(value);
+                }
+            }
+            _ if options.name.is_empty() => options.name = args[i].clone(),
+            _ => {
+                // Preserve the historical `open session command args` form.
+                options.command.extend_from_slice(&args[i..]);
+                break;
+            }
         }
         i += 1;
     }
-
-    if session_name.is_empty() {
-        eprintln!("Error: session name required");
-        std::process::exit(1);
+    if options.name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name required",
+        ));
     }
-
-    let sock = session_socket_path(&session_name)?;
-    if !sock.exists() {
-        eprintln!("Error: session '{}' not found", session_name);
-        std::process::exit(1);
+    if options
+        .cols
+        .is_some_and(|n| n > constants::MAX_TERMINAL_COLS)
+        || options
+            .rows
+            .is_some_and(|n| n > constants::MAX_TERMINAL_ROWS)
+        || options.cols.zip(options.rows).is_some_and(|(cols, rows)| {
+            usize::from(cols) * usize::from(rows) > constants::MAX_TERMINAL_CELLS
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal dimensions exceed the supported limits",
+        ));
     }
+    Ok(options)
+}
 
-    let exit_code = bridge::run(&sock, None, None)?;
+fn cmd_attach(args: &[String]) -> io::Result<()> {
+    let options = parse_attach_options(args)?;
+    let sock = session_socket_path(&options.name)?;
+    let exit_code = bridge::run(&sock, options.cols, options.rows, !options.no_resize)?;
     std::process::exit(exit_code);
 }
 
 fn cmd_open(args: &[String]) -> io::Result<()> {
-    let name = parse_session_name(args).unwrap_or_else(|| {
-        eprintln!("Error: session name required");
-        std::process::exit(1);
-    });
-
-    let sock = session_socket_path(name)?;
+    let options = parse_attach_options(args)?;
+    let sock = session_socket_path(&options.name)?;
     if !sock.exists() {
-        cmd_new(args, true)?;
-        let ok = wait_for_socket(
+        let mut new_args = vec![options.name.clone(), "--".to_string()];
+        new_args.extend(options.command);
+        cmd_new(&new_args, true)?;
+        if !wait_for_socket(
             &sock,
             Duration::from_millis(3000),
             Duration::from_millis(50),
-        )?;
-        if !ok {
-            eprintln!(
-                "Error: session '{}' was created but socket did not appear in time",
-                name
-            );
-            std::process::exit(1);
+        )? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "session '{}' was created but socket did not appear in time",
+                    options.name
+                ),
+            ));
         }
     }
-
-    let exit_code = bridge::run(&sock, None, None)?;
+    let exit_code = bridge::run(&sock, options.cols, options.rows, !options.no_resize)?;
     std::process::exit(exit_code);
+}
+
+fn cmd_resize(args: &[String]) -> io::Result<()> {
+    let options = parse_attach_options(args)?;
+    let (cols, rows) = options.cols.zip(options.rows).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resize requires --cols and --rows",
+        )
+    })?;
+    let socket_path = session_socket_path(&options.name)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let payload = pterm_proto::encode_resize(cols, rows);
+    stream.write_all(&pterm_proto::encode(
+        pterm_proto::client::SET_SIZE,
+        &payload,
+    ))?;
+    // Broadcast snapshots may precede our request under active PTY output.
+    // Only the dedicated response to this controller connection acknowledges
+    // completion, so serialized focus changes cannot overtake one another.
+    let ack = read_single_response(
+        &mut stream,
+        pterm_proto::server::RESIZE_ACK,
+        Duration::from_secs(3),
+    )?;
+    if ack != payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resize acknowledgement does not match request",
+        ));
+    }
+    Ok(())
 }
 
 fn cmd_redraw(args: &[String]) -> io::Result<()> {
@@ -431,6 +520,7 @@ fn main() {
         "list" | "ls" => cmd_list(&args[2..]),
         "kill" => cmd_kill(&args[2..]),
         "redraw" => cmd_redraw(&args[2..]),
+        "resize" => cmd_resize(&args[2..]),
         "dump" => cmd_query(
             &args[2..],
             pterm_proto::client::DUMP,
@@ -466,5 +556,63 @@ fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod resize_options_tests {
+    use super::parse_attach_options;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn managed_options_do_not_leak_into_the_child_command() {
+        let parsed = parse_attach_options(&args(&[
+            "dev",
+            "--no-resize",
+            "--cols",
+            "1",
+            "--rows",
+            "24",
+            "--",
+            "sh",
+            "-c",
+            "echo ok",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.name, "dev");
+        assert_eq!(parsed.cols, Some(1));
+        assert_eq!(parsed.rows, Some(24));
+        assert!(parsed.no_resize);
+        assert_eq!(parsed.command, args(&["sh", "-c", "echo ok"]));
+    }
+
+    #[test]
+    fn legacy_command_arguments_and_separator_remain_supported() {
+        for input in [
+            args(&["dev", "sh", "-c", "echo ok"]),
+            args(&["--", "dev", "sh", "-c", "echo ok"]),
+        ] {
+            let parsed = parse_attach_options(&input).unwrap();
+            assert_eq!(parsed.name, "dev");
+            assert_eq!(parsed.command, args(&["sh", "-c", "echo ok"]));
+            assert!(!parsed.no_resize);
+        }
+    }
+
+    #[test]
+    fn invalid_dimensions_are_rejected_before_contacting_a_daemon() {
+        for input in [
+            vec!["dev", "--cols", "0"],
+            vec!["dev", "--cols"],
+            vec!["dev", "--rows", "abc"],
+            vec!["dev", "--cols", "513"],
+            vec!["dev", "--rows", "257"],
+            vec!["dev", "--cols", "512", "--rows", "256"],
+        ] {
+            assert!(parse_attach_options(&args(&input)).is_err());
+        }
     }
 }

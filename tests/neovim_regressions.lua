@@ -7,6 +7,15 @@ local stopped_jobs = {}
 local expected_socket_dir
 local expected_shell
 local last_command
+local last_terminal_command
+local resize_requests = {}
+local complete_resizes = true
+local mouse_key_listener
+-- selene: allow(incorrect_standard_library_use)
+vim.on_key = function(callback)
+	mouse_key_listener = callback
+	return 1
+end
 -- Selene allowances below cover deliberate Neovim function mocks and restoration.
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.executable = function()
@@ -15,12 +24,30 @@ end
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstart = function(cmd, opts)
 	last_command = cmd
+	if opts.term then
+		last_terminal_command = cmd
+	end
 	if expected_socket_dir then
 		assert(opts.env and opts.env.PTERM_SOCKET_DIR == expected_socket_dir, "job uses the wrong socket directory")
 		assert(opts.env.SHELL == expected_shell, "job ignores the configured shell")
 	end
 	next_job = next_job + 1
-	return next_job
+	local job = next_job
+	if cmd[2] == "resize" then
+		resize_requests[#resize_requests + 1] = {
+			job = job,
+			session = cmd[3],
+			cols = tonumber(cmd[5]),
+			rows = tonumber(cmd[7]),
+			on_exit = opts.on_exit,
+		}
+		if complete_resizes then
+			vim.schedule(function()
+				opts.on_exit(job, 0, "exit")
+			end)
+		end
+	end
+	return job
 end
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstop = function(job)
@@ -98,7 +125,10 @@ check("configured socket directory and shell reach every subprocess", function()
 
 	pterm.open("custom", { "custom", "/bin/echo", "hello" })
 	assert(
-		last_command[4] == "--" and last_command[5] == "/bin/echo" and last_command[6] == "hello",
+		last_command[4] == "--no-resize"
+			and last_command[9] == "--"
+			and last_command[10] == "/bin/echo"
+			and last_command[11] == "hello",
 		"configured shell replaced explicit command arguments"
 	)
 	vim.api.nvim_exec_autocmds("BufEnter", { buffer = vim.api.nvim_get_current_buf() })
@@ -166,6 +196,290 @@ vim.notify = notify
 pterm.detach("kill-failure")
 vim.wait(10)
 
+local function settle_resizes()
+	vim.wait(30)
+end
+
+local function expect_current_size(session)
+	settle_resizes()
+	local win = vim.api.nvim_get_current_win()
+	local latest = resize_requests[#resize_requests]
+	local cols = vim.api.nvim_win_get_width(win) - vim.fn.getwininfo(win)[1].textoff
+	assert(latest and latest.session == session, "focused session did not request a resize")
+	assert(latest.cols == cols, "resize did not use the active window's text width")
+	assert(latest.rows == vim.api.nvim_win_get_height(win), "resize did not use the active window's height")
+end
+
+check("focus chooses the active window rather than an arbitrary mirror", function()
+	pterm.setup({ auto_redraw = false })
+	pterm.open("active-window")
+	local first_win = vim.api.nvim_get_current_win()
+	local initial = last_terminal_command
+	assert(initial[4] == "--no-resize", "native SIGWINCH still controls the shared session")
+	assert(tonumber(initial[6]) == vim.api.nvim_win_get_width(first_win), "initial width is not explicit")
+	assert(tonumber(initial[8]) == vim.api.nvim_win_get_height(first_win), "initial height is not explicit")
+
+	vim.cmd("vsplit")
+	vim.cmd("vertical resize 24")
+	local small_win = vim.api.nvim_get_current_win()
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	expect_current_size("active-window")
+	local small_cols = resize_requests[#resize_requests].cols
+	local buf = vim.api.nvim_get_current_buf()
+	vim.api.nvim_win_set_buf(small_win, vim.api.nvim_create_buf(false, true))
+	vim.api.nvim_set_option_value("wrap", true, { win = small_win, scope = "local" })
+	vim.api.nvim_set_current_win(first_win)
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	vim.api.nvim_win_set_buf(small_win, buf)
+	assert(
+		not vim.api.nvim_get_option_value("wrap", { win = small_win }),
+		"unfocused existing mirror wraps terminal rows"
+	)
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	vim.api.nvim_set_current_win(small_win)
+	expect_current_size("active-window")
+
+	-- Both windows show the same buffer, so BufEnter alone misses this change.
+	vim.api.nvim_set_current_win(first_win)
+	expect_current_size("active-window")
+	assert(resize_requests[#resize_requests].cols > small_cols, "larger active window never became authoritative")
+
+	-- The active text area may contain window-local decorations.
+	vim.api.nvim_set_option_value("number", true, { win = first_win })
+	vim.api.nvim_exec_autocmds("VimResized", { modeline = false })
+	expect_current_size("active-window")
+
+	-- A notification about another window does not give that mirror authority.
+	local count = #resize_requests
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	settle_resizes()
+	assert(#resize_requests == count, "unchanged active window issued a redundant layout resize")
+
+	vim.api.nvim_set_current_win(small_win)
+	expect_current_size("active-window")
+	vim.cmd("close")
+	expect_current_size("active-window")
+end)
+pterm.detach("active-window")
+settle_resizes()
+vim.cmd("silent! only")
+
+check("background editors and inactive session buffers cannot take resize authority", function()
+	pterm.open("focus-owner")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	expect_current_size("focus-owner")
+	local count = #resize_requests
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	vim.api.nvim_exec_autocmds("VimResized", { modeline = false })
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	settle_resizes()
+	assert(#resize_requests == count, "background editor stole resize authority")
+
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	expect_current_size("focus-owner")
+	assert(#resize_requests == count + 1, "same-sized focused editor did not reclaim authority")
+	local buf = vim.api.nvim_get_current_buf()
+	vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(false, true))
+	count = #resize_requests
+	vim.api.nvim_exec_autocmds("VimResized", { modeline = false })
+	settle_resizes()
+	assert(#resize_requests == count, "hidden terminal buffer stole resize authority")
+	vim.api.nvim_set_option_value("wrap", true, { win = vim.api.nvim_get_current_win(), scope = "local" })
+	vim.api.nvim_set_current_buf(buf)
+	expect_current_size("focus-owner")
+	assert(
+		not vim.api.nvim_get_option_value("wrap", { win = vim.api.nvim_get_current_win() }),
+		"mirror wraps canonical rows"
+	)
+end)
+pterm.detach("focus-owner")
+settle_resizes()
+
+check("editor focus is tracked while there are no attached sessions", function()
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	pterm.open("focus-after-detach")
+	vim.api.nvim_exec_autocmds("WinEnter", { buffer = vim.api.nvim_get_current_buf() })
+	expect_current_size("focus-after-detach")
+end)
+pterm.detach("focus-after-detach")
+settle_resizes()
+
+check("rapid focus resizes are serialized and keep only the newest pending size", function()
+	complete_resizes = false
+	pterm.open("resize-order")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local first = resize_requests[#resize_requests]
+	local count = #resize_requests
+	vim.cmd("vsplit")
+	vim.cmd("vertical resize 21")
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	settle_resizes()
+	vim.cmd("vertical resize 29")
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	settle_resizes()
+	assert(#resize_requests == count, "concurrent resize commands can finish out of focus order")
+	first.on_exit(first.job, 0, "exit")
+	expect_current_size("resize-order")
+	assert(#resize_requests == count + 1, "superseded intermediate window sizes were not coalesced")
+	local pending = resize_requests[#resize_requests]
+	pterm.detach("resize-order")
+	assert(stopped_jobs[pending.job], "detaching left a resize command running")
+	pending.on_exit(pending.job, 0, "exit")
+	settle_resizes()
+	assert(#resize_requests == count + 1, "old resize callback revived a detached connection")
+end)
+complete_resizes = true
+pterm.detach("resize-order")
+settle_resizes()
+vim.cmd("silent! only")
+
+check("queued resizes cannot take authority after focus leaves their buffer", function()
+	complete_resizes = false
+	pterm.open("stale-size")
+	local buf = vim.api.nvim_get_current_buf()
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local first = resize_requests[#resize_requests]
+	local count = #resize_requests
+	vim.cmd("vsplit")
+	vim.cmd("vertical resize 25")
+	vim.api.nvim_exec_autocmds("WinResized", { modeline = false })
+	settle_resizes()
+	vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(false, true))
+	first.on_exit(first.job, 0, "exit")
+	settle_resizes()
+	assert(#resize_requests == count, "a completed command dispatched a stale hidden-buffer resize")
+
+	vim.api.nvim_set_current_buf(buf)
+	-- Losing editor focus before the scheduled dispatch must discard the request.
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	settle_resizes()
+	assert(#resize_requests == count, "an unfocused scheduled resize stole authority")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	expect_current_size("stale-size")
+end)
+complete_resizes = true
+pterm.detach("stale-size")
+settle_resizes()
+vim.cmd("silent! only")
+
+local real_window_width = vim.api.nvim_win_get_width
+local real_window_height = vim.api.nvim_win_get_height
+check("large window sizes stay inside the daemon resource limits", function()
+	-- Headless 'columns'/'lines' changes need not resize the current window.
+	-- Exercise the dimension guard directly, independent of UI attachment.
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_get_width = function()
+		return 1000
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_get_height = function()
+		return 400
+	end
+	pterm.open("large-size")
+	assert(tonumber(last_terminal_command[6]) == 512, "initial width exceeds the daemon maximum")
+	assert(tonumber(last_terminal_command[8]) == 128, "initial dimensions exceed the cell budget")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local resize = resize_requests[#resize_requests]
+	assert(resize.cols == 512 and resize.rows == 128, "focused resize exceeds the daemon budget")
+end)
+-- selene: allow(incorrect_standard_library_use)
+vim.api.nvim_win_get_width = real_window_width
+-- selene: allow(incorrect_standard_library_use)
+vim.api.nvim_win_get_height = real_window_height
+pterm.detach("large-size")
+settle_resizes()
+
+check("focus loss cancels an in-flight resize controller", function()
+	complete_resizes = false
+	pterm.open("cancel-resize")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local count = #resize_requests
+	local pending = resize_requests[count]
+	assert(pending.session == "cancel-resize", "resize request missing")
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	assert(stopped_jobs[pending.job], "unfocused resize process was left running")
+	pending.on_exit(pending.job, 143, "exit")
+	vim.wait(100)
+	assert(#resize_requests == count, "cancelled controller retried after focus loss")
+	complete_resizes = true
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	expect_current_size("cancel-resize")
+end)
+complete_resizes = true
+pterm.detach("cancel-resize")
+settle_resizes()
+
+check("startup resize failure retries without another focus event", function()
+	complete_resizes = false
+	pterm.open("startup-retry")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local count = #resize_requests
+	local failed = resize_requests[count]
+	assert(failed.session == "startup-retry", "initial retry request missing")
+	failed.on_exit(failed.job, 1, "exit")
+	assert(
+		vim.wait(500, function()
+			return #resize_requests > count
+		end, 10),
+		"failed resize was lost without a later focus event"
+	)
+	local retried = resize_requests[#resize_requests]
+	assert(retried.session == "startup-retry", "retry targeted another session")
+	assert(retried.cols == vim.api.nvim_win_get_width(0), "retry used stale dimensions")
+	retried.on_exit(retried.job, 0, "exit")
+	settle_resizes()
+end)
+complete_resizes = true
+pterm.detach("startup-retry")
+settle_resizes()
+
+check("managed history reset restores scrollback before acknowledging the bridge", function()
+	pterm.open("history-reset")
+	local buf = vim.api.nvim_get_current_buf()
+	local job = next_job
+	vim.api.nvim_set_option_value("scrollback", 1234, { buf = buf })
+	local chansend = vim.fn.chansend
+	local acknowledgements = 0
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.chansend = function(channel, text)
+		assert(channel == job, "history acknowledgement reached another bridge")
+		assert(text == "\27]51;pterm-history-ready\7", "unexpected history acknowledgement")
+		assert(vim.api.nvim_get_option_value("scrollback", { buf = buf }) == 1234, "ACK preceded option restoration")
+		acknowledgements = acknowledgements + 1
+		return #text
+	end
+	vim.api.nvim_exec_autocmds("TermRequest", {
+		buffer = buf,
+		data = { sequence = "\27]51;pterm-reset-history" },
+	})
+	assert(acknowledgements == 0, "history reset did not defer out of the terminal callback")
+	settle_resizes()
+	assert(acknowledgements == 1, "bridge was not released after clearing history")
+	vim.api.nvim_exec_autocmds("TermRequest", {
+		buffer = buf,
+		data = { sequence = "\27]51;unrelated-request" },
+	})
+	settle_resizes()
+	assert(acknowledgements == 1, "unrelated terminal request cleared history")
+	vim.api.nvim_exec_autocmds("TermRequest", {
+		buffer = buf,
+		data = { sequence = "\27]51;pterm-reset-history" },
+	})
+	pterm.detach("history-reset")
+	settle_resizes()
+	assert(acknowledgements == 1, "late reset acknowledged a detached bridge")
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.chansend = chansend
+end)
+pterm.detach("history-reset")
+settle_resizes()
+
 check("ANSI preview uses the xterm 256-color cube", function()
 	local ansi = require("pterm.ansi")
 	for _, color in ipairs({ { 16, 0x000000 }, { 17, 0x00005f }, { 196, 0xff0000 }, { 231, 0xffffff } }) do
@@ -173,6 +487,64 @@ check("ANSI preview uses the xterm 256-color cube", function()
 		local highlight = vim.api.nvim_get_hl(0, { name = ansi.hl_group(run.attrs) })
 		assert(highlight.fg == color[2], "incorrect xterm palette color " .. color[1])
 	end
+end)
+
+check("mouse origin follows the clicked mirror without consuming keys or changing focus", function()
+	pterm.open("mouse-origin")
+	local job = next_job
+	local buf = vim.api.nvim_get_current_buf()
+	local active = vim.api.nvim_get_current_win()
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two", "three", "four", "five" })
+	vim.cmd("vsplit")
+	local passive = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_current_win(active)
+	local old_mode, old_mouse, old_view, old_send =
+		vim.api.nvim_get_mode, vim.fn.getmousepos, vim.api.nvim_win_call, vim.fn.chansend
+	local mode, mouse_win, topline, leftcol = "t", passive, 3, 4
+	local sent = {}
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_get_mode = function()
+		return { mode = mode }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.getmousepos = function()
+		return { winid = mouse_win }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_call = function(win)
+		assert(win == mouse_win, "origin was read from the active window instead of the clicked mirror")
+		return { topline = topline, leftcol = leftcol }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.chansend = function(channel, text)
+		assert(channel == job, "mouse origin reached another terminal job")
+		sent[#sent + 1] = text
+		return #text
+	end
+	local ok, err = pcall(function()
+		local function mouse_key(name)
+			return vim.api.nvim_replace_termcodes(name, true, false, true)
+		end
+		assert(type(mouse_key_listener) == "function", "mouse observer was not registered")
+		assert(mouse_key_listener(mouse_key("<LeftMouse>")) == nil, "mouse key was consumed")
+		assert(sent[1] == "\27]51;pterm-input-origin;-3;4\7", "incorrect passive window origin")
+		assert(vim.api.nvim_get_current_win() == active, "mouse metadata changed focus")
+		mouse_win, topline, leftcol = active, 1, 0
+		mouse_key_listener(mouse_key("<C-LeftDrag>"))
+		assert(sent[2] == "\27]51;pterm-input-origin;-5;0\7", "active window origin was stale")
+		mouse_key_listener("x")
+		mode = "n"
+		mouse_key_listener(mouse_key("<LeftMouse>"))
+		mode, mouse_win = "t", 0
+		mouse_key_listener(mouse_key("<LeftRelease>"))
+		assert(#sent == 2, "ordinary keys or non-terminal/outside clicks emitted metadata")
+	end)
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_get_mode, vim.fn.getmousepos, vim.api.nvim_win_call, vim.fn.chansend =
+		old_mode, old_mouse, old_view, old_send
+	pterm.detach("mouse-origin")
+	vim.cmd("silent! only")
+	assert(ok, err)
 end)
 
 assert(#failures == 0, table.concat(failures, "\n"))

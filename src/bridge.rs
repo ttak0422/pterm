@@ -5,6 +5,7 @@
 //! libvterm processes escape sequences natively in C -- no Lua intermediary.
 
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
+use crate::input::{InputEvent, ManagedInput};
 use crate::server::SendQueue;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
@@ -15,9 +16,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
+const INPUT_PREFIX_TIMEOUT: Duration = Duration::from_millis(25);
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -56,6 +59,100 @@ const DETACH_CLEANUP_SEQUENCES: &[u8] = b"\
 // already-attached terminal can retain its own current flags / push-pop stack
 // and later `CSI < u` from the PTY will restore the wrong state.
 const STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES: &[u8] = b"\x1b[<u\x1b[=0u";
+
+// Neovim before 0.12 does not implement ED3's scrollback callback. The plugin
+// clears its native history, refreshes the terminal, then acknowledges this
+// request. Keep replay bytes behind the acknowledgement to avoid duplication.
+const HISTORY_RESET_REQUEST: &[u8] = b"\x1b[?1049l\x1b[?6l\x1b[?69l\x1b[r\x1b[0m\x1b[2J\x1b[999;1H\n\x1b[H\x1b]51;pterm-reset-history\x07";
+const HISTORY_RESET_ACK: &[u8] = b"\x1b]51;pterm-history-ready\x07";
+
+#[derive(Default)]
+struct HistoryReset {
+    deadline: Option<Instant>,
+    pending: Vec<u8>,
+    input_prefix: Vec<u8>,
+}
+
+impl HistoryReset {
+    fn queue_view(&mut self, payload: &[u8], output: &mut SendQueue) -> io::Result<()> {
+        let (&flags, bytes) = payload
+            .split_first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty canonical view"))?;
+        if flags & 1 != 0 {
+            self.pending.clear();
+            if self.deadline.is_none() {
+                output.push(HISTORY_RESET_REQUEST);
+                self.deadline = Some(Instant::now() + Duration::from_secs(30));
+            }
+        }
+        self.queue_bytes(bytes, output);
+        Ok(())
+    }
+
+    fn queue_bytes(&mut self, bytes: &[u8], output: &mut SendQueue) {
+        if self.deadline.is_some() {
+            self.pending.extend_from_slice(bytes);
+        } else {
+            output.push(bytes);
+        }
+    }
+
+    fn input(&mut self, input: &[u8], output: &mut SendQueue) -> Vec<u8> {
+        if self.deadline.is_none() {
+            return input.to_vec();
+        }
+        let mut forwarded = Vec::new();
+        for &byte in input {
+            if self.deadline.is_none() {
+                forwarded.push(byte);
+                continue;
+            }
+            self.input_prefix.push(byte);
+            while !HISTORY_RESET_ACK.starts_with(&self.input_prefix) {
+                forwarded.push(self.input_prefix.remove(0));
+            }
+            if self.input_prefix == HISTORY_RESET_ACK {
+                self.input_prefix.clear();
+                self.deadline = None;
+                output.push(b"\x1b[3J");
+                output.push(&self.pending);
+                self.pending.clear();
+            }
+        }
+        forwarded
+    }
+}
+
+fn queue_managed_input(
+    events: Vec<InputEvent>,
+    reset: &mut HistoryReset,
+    output: &mut SendQueue,
+    socket: &mut SendQueue,
+) {
+    for event in events {
+        match event {
+            InputEvent::Bytes(bytes) => {
+                let bytes = reset.input(&bytes, output);
+                if !bytes.is_empty() {
+                    socket.push(&proto::encode(proto::client::INPUT, &bytes));
+                }
+            }
+            InputEvent::Origin { row_base, leftcol } => {
+                // Mouse clicks during a blank/resetting display have no
+                // reliable origin. Invalidate rather than remapping them to
+                // unrelated application rows; active releases remain safe.
+                let row_base = if reset.deadline.is_some() {
+                    i32::MIN
+                } else {
+                    row_base
+                };
+                let mut payload = row_base.to_le_bytes().to_vec();
+                payload.extend_from_slice(&leftcol.to_le_bytes());
+                socket.push(&proto::encode(proto::client::INPUT_ORIGIN, &payload));
+            }
+        }
+    }
+}
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -156,6 +253,7 @@ pub fn run(
     socket_path: &Path,
     initial_cols: Option<u16>,
     initial_rows: Option<u16>,
+    propagate_resize: bool,
 ) -> io::Result<i32> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -210,11 +308,30 @@ pub fn run(
     {
         // HELLO must precede RESIZE in a single write so the daemon records
         // the handshake before queueing the initial snapshot.
-        let hello_payload =
-            proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::REQUEST_HISTORY);
+        let flags = proto::hello_flags::REQUEST_HISTORY
+            | if propagate_resize {
+                0
+            } else {
+                proto::hello_flags::CANONICAL_VIEW
+            };
+        let hello_payload = proto::encode_hello(proto::PROTO_VERSION, flags);
         let mut msg = proto::encode(proto::client::HELLO, &hello_payload);
-        let resize_payload = proto::encode_resize(cols, rows);
-        msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
+        if !propagate_resize {
+            let (view_cols, view_rows) = get_winsize(stdout_fd).unwrap_or((cols, rows));
+            if view_cols > 0 && view_rows > 0 {
+                msg.extend_from_slice(&proto::encode(
+                    proto::client::VIEW_SIZE,
+                    &proto::encode_resize(view_cols, view_rows),
+                ));
+            }
+        }
+        // Managed Neovim clients claim authority through SET_SIZE after the
+        // plugin has registered the connection. An independently delayed
+        // initial RESIZE here could overwrite a newer focus request.
+        if propagate_resize {
+            let resize_payload = proto::encode_resize(cols, rows);
+            msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
+        }
         send_buf.push(&msg);
     }
 
@@ -222,6 +339,9 @@ pub fn run(
     let mut sock_buf = [0u8; 65536];
     let mut recv_buf = Vec::new();
     let mut output = SendQueue::default();
+    let mut history_reset = HistoryReset::default();
+    let mut managed_input = ManagedInput::new();
+    let mut input_pending_since = None;
     let mut exit_code = 0;
     // A daemon predating HELLO_ACK is detected at the first STATE_SYNC.
     let mut daemon_proto = None;
@@ -230,22 +350,48 @@ pub fn run(
     let mut socket_open = true;
     let mut cleanup_queued = false;
     loop {
-        if !running && !cleanup_queued {
+        if input_pending_since.is_some_and(|since: Instant| since.elapsed() >= INPUT_PREFIX_TIMEOUT)
+        {
+            queue_managed_input(
+                managed_input.flush_pending(),
+                &mut history_reset,
+                &mut output,
+                &mut send_buf,
+            );
+            input_pending_since = None;
+        }
+        if history_reset
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Neovim did not acknowledge the scrollback reset",
+            ));
+        }
+        if !running && history_reset.deadline.is_none() && !cleanup_queued {
             output.push(DETACH_CLEANUP_SEQUENCES);
             cleanup_queued = true;
         }
-        if !running && output.is_empty() && (!socket_open || send_buf.is_empty()) {
+        if !running
+            && history_reset.deadline.is_none()
+            && output.is_empty()
+            && (!socket_open || send_buf.is_empty())
+        {
             break;
         }
 
         // Native poll also supports regular files, unlike epoll registration.
         // Pause only socket reads at the output watermark; input, socket writes,
         // and SIGWINCH remain responsive while the display is stopped.
-        let read_socket = running && output.pending_bytes() < MAX_PENDING_OUTPUT_BYTES;
+        let read_socket = running
+            && output.pending_bytes() + history_reset.pending.len() < MAX_PENDING_OUTPUT_BYTES;
         let mut fds = [
             poll_fd(
                 stdin_fd,
-                if running && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES {
+                if (running || history_reset.deadline.is_some())
+                    && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES
+                {
                     libc::POLLIN
                 } else {
                     0
@@ -267,7 +413,14 @@ pub fn run(
             poll_fd(wake_read.as_raw_fd(), libc::POLLIN),
             poll_fd(stdout_fd, if output.is_empty() { 0 } else { libc::POLLOUT }),
         ];
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+        let timeout = if managed_input.has_pending() {
+            25
+        } else if history_reset.deadline.is_some() {
+            100
+        } else {
+            -1
+        };
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -278,10 +431,32 @@ pub fn run(
         if fds[0].revents != 0 {
             match nix::unistd::read(&stdin, &mut stdin_buf) {
                 Ok(0) => {
+                    queue_managed_input(
+                        managed_input.flush_pending(),
+                        &mut history_reset,
+                        &mut output,
+                        &mut send_buf,
+                    );
                     running = false;
                     send_buf.push(&proto::encode(proto::client::DETACH, &[]));
                 }
-                Ok(n) => send_buf.push(&proto::encode(proto::client::INPUT, &stdin_buf[..n])),
+                Ok(n) => {
+                    if propagate_resize {
+                        send_buf.push(&proto::encode(proto::client::INPUT, &stdin_buf[..n]));
+                    } else {
+                        queue_managed_input(
+                            managed_input.decode(&stdin_buf[..n]),
+                            &mut history_reset,
+                            &mut output,
+                            &mut send_buf,
+                        );
+                        if managed_input.has_pending() {
+                            input_pending_since.get_or_insert_with(Instant::now);
+                        } else {
+                            input_pending_since = None;
+                        }
+                    }
+                }
                 Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -301,6 +476,16 @@ pub fn run(
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                     {
                         match frame.msg_type {
+                            proto::server::VIEW_EVENT if !propagate_resize => {
+                                history_reset.queue_bytes(&frame.payload, &mut output);
+                            }
+                            proto::server::VIEW if !propagate_resize => {
+                                if !output_batch.is_empty() {
+                                    history_reset.queue_bytes(&output_batch, &mut output);
+                                    output_batch.clear();
+                                }
+                                history_reset.queue_view(&frame.payload, &mut output)?;
+                            }
                             proto::server::OUTPUT => {
                                 output_batch.extend_from_slice(&frame.payload);
                             }
@@ -312,6 +497,10 @@ pub fn run(
                                             version,
                                             pkg_version
                                         );
+                                        if !propagate_resize && version < 2 {
+                                            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                                "managed rendering requires a new pterm daemon; restart this session to upgrade"));
+                                        }
                                         daemon_proto = Some(version);
                                     }
                                     Err(e) => {
@@ -327,6 +516,10 @@ pub fn run(
                                 output_batch.extend_from_slice(&frame.payload);
                             }
                             proto::server::STATE_SYNC => {
+                                if !propagate_resize {
+                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                        "daemon does not support canonical rendering; restart this session to upgrade"));
+                                }
                                 if !proto_checked {
                                     proto_checked = true;
                                     let version = daemon_proto.unwrap_or(0);
@@ -363,7 +556,7 @@ pub fn run(
                         }
                     }
                     if !output_batch.is_empty() {
-                        output.push(&output_batch);
+                        history_reset.queue_bytes(&output_batch, &mut output);
                     }
                 }
                 Err(ref error)
@@ -393,7 +586,12 @@ pub fn run(
                 if let Ok((cols, rows)) = get_winsize(stdout_fd) {
                     if cols > 0 && rows > 0 {
                         let payload = proto::encode_resize(cols, rows);
-                        send_buf.push(&proto::encode(proto::client::RESIZE, &payload));
+                        let kind = if propagate_resize {
+                            proto::client::RESIZE
+                        } else {
+                            proto::client::VIEW_SIZE
+                        };
+                        send_buf.push(&proto::encode(kind, &payload));
                     }
                 }
             }
@@ -487,5 +685,111 @@ mod tests {
     fn state_sync_cleanup_resets_kitty_keyboard_state() {
         let cleanup = std::str::from_utf8(STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES).unwrap();
         assert_eq!(cleanup, "\x1b[<u\x1b[=0u");
+    }
+}
+
+#[cfg(test)]
+mod history_reset_tests {
+    use super::{queue_managed_input, HistoryReset, HISTORY_RESET_ACK, HISTORY_RESET_REQUEST};
+    use crate::input::{InputEvent, ManagedInput};
+    use crate::server::SendQueue;
+    use pterm_proto as proto;
+
+    fn drain(queue: &mut SendQueue) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        queue
+            .write_with(|part| {
+                bytes.extend_from_slice(part);
+                Ok(part.len())
+            })
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn mouse_origin_is_ordered_before_native_reports_and_never_reaches_pty_text() {
+        let mut decoder = ManagedInput::default();
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        let mut socket = SendQueue::default();
+        let events = decoder.decode(b"key\x1b]51;pterm-input-origin;-40;3\x07\x1b[<4;5;31M");
+        queue_managed_input(events, &mut reset, &mut output, &mut socket);
+        let frames =
+            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.msg_type)
+                .collect::<Vec<_>>(),
+            vec![
+                proto::client::INPUT,
+                proto::client::INPUT_ORIGIN,
+                proto::client::INPUT
+            ]
+        );
+        assert_eq!(frames[0].payload, b"key");
+        assert_eq!(&frames[1].payload[..4], &(-40i32).to_le_bytes());
+        assert_eq!(&frames[1].payload[4..], &3i32.to_le_bytes());
+        assert_eq!(frames[2].payload, b"\x1b[<4;5;31M");
+    }
+
+    #[test]
+    fn mouse_origin_during_blank_history_reset_is_invalidated() {
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        let mut socket = SendQueue::default();
+        reset.queue_view(b"\x01screen", &mut output).unwrap();
+        queue_managed_input(
+            vec![InputEvent::Origin {
+                row_base: -40,
+                leftcol: 0,
+            }],
+            &mut reset,
+            &mut output,
+            &mut socket,
+        );
+        let frames =
+            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+        assert_eq!(&frames[0].payload[..4], &i32::MIN.to_le_bytes());
+    }
+
+    #[test]
+    fn replacement_waits_for_split_ack_and_preserves_keyboard_input() {
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        reset.queue_view(b"\x01history", &mut output).unwrap();
+        assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
+        reset.queue_view(b"\x00screen", &mut output).unwrap();
+        assert!(output.is_empty());
+        let mut keyboard = b"before".to_vec();
+        keyboard.extend_from_slice(HISTORY_RESET_ACK);
+        keyboard.extend_from_slice(b"after");
+        let mut forwarded = Vec::new();
+        for part in keyboard.chunks(2) {
+            forwarded.extend(reset.input(part, &mut output));
+        }
+        assert_eq!(forwarded, b"beforeafter");
+        assert_eq!(drain(&mut output), b"\x1b[3Jhistoryscreen");
+        assert!(reset.deadline.is_none());
+    }
+
+    #[test]
+    fn repeated_resizes_keep_only_latest_replacement_before_ack() {
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        reset.queue_view(b"\x01old", &mut output).unwrap();
+        reset.queue_view(b"\x01new", &mut output).unwrap();
+        assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
+        reset.input(HISTORY_RESET_ACK, &mut output);
+        assert_eq!(drain(&mut output), b"\x1b[3Jnew");
+    }
+
+    #[test]
+    fn ordinary_escape_input_is_not_eaten_by_reset_handshake() {
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        reset.queue_view(b"\x01screen", &mut output).unwrap();
+        assert_eq!(reset.input(b"\x1b[Ahello", &mut output), b"\x1b[Ahello");
+        assert!(reset.queue_view(&[], &mut output).is_err());
     }
 }

@@ -21,6 +21,8 @@ struct SessionCallbacks {
     hyperlink_uri: Option<String>,
     passthrough_sequences: VecDeque<Vec<u8>>,
     passthrough_bytes: usize,
+    canonical_events: Vec<u8>,
+    terminal_responses: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -150,6 +152,8 @@ struct BytesDump {
 impl SessionCallbacks {
     const MAX_PASSTHROUGH_SEQUENCES: usize = 256;
     const MAX_PASSTHROUGH_BYTES: usize = 16 * 1024;
+    const MAX_CANONICAL_EVENT_BYTES: usize = 1024 * 1024;
+    const MAX_TERMINAL_RESPONSE_BYTES: usize = 16 * 1024;
     // DEC private modes not fully reconstructed by `vt100::Screen::state_formatted()`.
     // Modes 1004 and 2026 are now tracked as explicit struct fields instead.
     const PASSTHROUGH_DEC_PRIVATE_MODES: [u16; 2] = [12, 69];
@@ -224,6 +228,26 @@ impl SessionCallbacks {
         self.pending_da1_queries = 0;
         self.pending_da2_queries = 0;
         counts
+    }
+
+    fn push_canonical_event(&mut self, event: &[u8]) {
+        if self.canonical_events.len().saturating_add(event.len())
+            <= Self::MAX_CANONICAL_EVENT_BYTES
+        {
+            self.canonical_events.extend_from_slice(event);
+        } else {
+            log::warn!("Dropping terminal event exceeding the managed event budget");
+        }
+    }
+
+    fn push_terminal_response(&mut self, response: &[u8]) {
+        if self.terminal_responses.len().saturating_add(response.len())
+            <= Self::MAX_TERMINAL_RESPONSE_BYTES
+        {
+            self.terminal_responses.extend_from_slice(response);
+        } else {
+            log::warn!("Dropping terminal response exceeding the reply budget");
+        }
     }
 
     fn push_passthrough_sequence(&mut self, seq: Vec<u8>) {
@@ -835,6 +859,211 @@ fn build_snapshot_ansi(screen: &vt100::Screen) -> String {
     out
 }
 
+/// Paint one canonical row without allowing a client's different width to
+/// rewrap it. The caller has positioned the cursor and cleared the row.
+fn push_view_row(out: &mut String, screen: &vt100::Screen, row: u16, cols: u16) {
+    let mut current = SgrState::default();
+    let mut next_col = 0;
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.is_wide_continuation() || (cell.is_wide() && col + 1 >= cols) {
+            continue;
+        }
+        let state = SgrState::from_cell(cell);
+        if !cell.has_contents() && state == SgrState::default() {
+            continue;
+        }
+        if col > next_col {
+            push_sgr_diff(out, &current, &SgrState::default());
+            current = SgrState::default();
+            for _ in next_col..col {
+                out.push(' ');
+            }
+        }
+        push_sgr_diff(out, &current, &state);
+        current = state;
+        if cell.has_contents() {
+            if cell.natural_width() > 1 && !cell.is_wide() {
+                // A two-cell glyph retained through canonical width 1 must
+                // not spill into a passive viewer's otherwise blank padding.
+                out.push('\u{fffd}');
+            } else {
+                out.push_str(cell.contents());
+            }
+        } else {
+            out.push(' ');
+        }
+        next_col = col + if cell.is_wide() { 2 } else { 1 };
+    }
+    out.push_str("\x1b[0m");
+}
+
+/// Keep the newest complete visual rows that fit on the wire. This is a
+/// display-only budget: canonical history remains available for later wider
+/// views and text queries. Walk newest-first so even a very narrow reflow
+/// with millions of rows cannot allocate an oversized VIEW before checking.
+fn push_view_history(
+    out: &mut String,
+    screen: &mut vt100::Screen,
+    cols: u16,
+    view_rows: u16,
+    max_lines: usize,
+    max_bytes: usize,
+) {
+    screen.set_scrollback(usize::MAX);
+    let total = screen.scrollback().min(max_lines);
+    let mut history = Vec::new();
+    let mut bytes = 0usize;
+    for offset in 1..=total {
+        screen.set_scrollback(offset);
+        let mut row = String::from("\x1b[1;1H\x1b[2K");
+        push_view_row(&mut row, screen, 0, cols);
+        // The top row is exactly what should be archived. LF at the physical
+        // bottom scrolls it out independently of the canonical screen height.
+        let _ = writeln!(row, "\x1b[{};1H", view_rows);
+        if row.len() > max_bytes.saturating_sub(bytes) {
+            break;
+        }
+        bytes += row.len();
+        history.push(row);
+    }
+    screen.set_scrollback(0);
+    out.reserve(bytes);
+    for row in history.into_iter().rev() {
+        out.push_str(&row);
+    }
+}
+
+/// Reconstruct a client-sized view of the daemon screen. History is pushed
+/// into the native terminal one physical row at a time; live rows use CUP,
+/// never LF or implicit autowrap, so passive viewers cannot create history.
+fn build_canonical_view(
+    screen: &mut vt100::Screen,
+    view_cols: u16,
+    view_rows: u16,
+    previous_alternate: Option<bool>,
+    history_lines: usize,
+) -> Vec<u8> {
+    let alternate = screen.alternate_screen();
+    let mut out = String::new();
+    // None means queued views were replaced or this is a fresh attachment.
+    // Establish the screen explicitly because a discarded frame might have
+    // contained an alternate-screen transition that never reached the client.
+    match previous_alternate {
+        None => {
+            out.push_str("\x1b[?1049l");
+            if alternate {
+                out.push_str("\x1b[?1049h");
+            }
+        }
+        Some(previous) if previous != alternate => {
+            out.push_str(if alternate {
+                "\x1b[?1049h"
+            } else {
+                "\x1b[?1049l"
+            });
+        }
+        Some(_) => {}
+    }
+    // Keep rendering independent of any application margins/origin modes.
+    out.push_str("\x1b[?2026l\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[0m\x1b]8;;\x1b\\");
+    let (rows, cols) = screen.size();
+    let cols = cols.min(view_cols);
+    if !alternate && history_lines > 0 {
+        // The bounded 65,536-cell screen needs < 8 MiB even with per-cell
+        // RGB/attribute changes and the maximum combining-character bytes.
+        const HISTORY_BYTE_BUDGET: usize = pterm_proto::MAX_SERVER_PAYLOAD - 8 * 1024 * 1024;
+        push_view_history(
+            &mut out,
+            screen,
+            cols,
+            view_rows,
+            history_lines,
+            HISTORY_BYTE_BUDGET,
+        );
+    }
+    // Neovim sizes its terminal renderer to the largest window showing the
+    // buffer, but a shorter active window follows the bottom of that buffer.
+    // Bottom-align the canonical screen so that window sees every live row,
+    // leaving blank padding above it in taller passive windows. A physically
+    // smaller viewer retains the top-left crop; it never reflows the screen.
+    let row_offset = view_rows.saturating_sub(rows);
+    out.push_str("\x1b[2J");
+    for row in 0..rows.min(view_rows) {
+        let _ = write!(out, "\x1b[{};1H\x1b[2K", row_offset + row + 1);
+        push_view_row(&mut out, screen, row, cols);
+    }
+    // input_mode_formatted assumes defaults for mouse modes. Reset them
+    // first so disabling/changing a previously active mode works too.
+    out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(&screen.input_mode_formatted());
+    // The renderer may be much taller than the application. Use SGR on this
+    // transport so its padded coordinates cannot overflow legacy X10 bytes.
+    // The daemon translates/re-encodes mouse reports for the application's
+    // original encoding; this does not enable mouse tracking by itself.
+    bytes.extend_from_slice(b"\x1b[?1005l\x1b[?1006h");
+    bytes.extend_from_slice(&screen.attributes_formatted());
+    // cursor_state_formatted can repaint a cell to recreate pending wrap.
+    // A view cursor must only position, and must stay inside its viewport.
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_col = cursor_col.min(screen.size().1.saturating_sub(1));
+    let cursor_visible = !screen.hide_cursor() && cursor_row < view_rows && cursor_col < view_cols;
+    bytes.extend_from_slice(
+        format!(
+            "\x1b[{};{}H{}",
+            row_offset + cursor_row.min(rows - 1).min(view_rows - 1) + 1,
+            cursor_col.min(view_cols - 1) + 1,
+            if cursor_visible {
+                "\x1b[?25h"
+            } else {
+                "\x1b[?25l"
+            }
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Replay state needed for input and presentation without replaying raw
+/// passthrough commands (which can query, resize windows, or copy clipboard
+/// data every time an unrelated screen cell changes).
+fn append_canonical_tracked_state(
+    out: &mut Vec<u8>,
+    screen: &vt100::Screen,
+    callbacks: &SessionCallbacks,
+) {
+    if let Some(title) = &callbacks.window_title {
+        out.extend_from_slice(b"\x1b]2;");
+        out.extend_from_slice(title.as_bytes());
+        out.extend_from_slice(b"\x1b\\");
+    }
+    let keyboard = if screen.alternate_screen() {
+        &callbacks.kitty_keyboard_states.alternate
+    } else {
+        &callbacks.kitty_keyboard_states.main
+    };
+    KittyKeyboardState::push_set_mode(out, keyboard.flags);
+    out.extend_from_slice(if callbacks.focus_tracking {
+        b"\x1b[?1004h"
+    } else {
+        b"\x1b[?1004l"
+    });
+    if let Some(blink) = callbacks
+        .passthrough_sequences
+        .iter()
+        .rev()
+        .find(|seq| seq.as_slice() == b"\x1b[?12h" || seq.as_slice() == b"\x1b[?12l")
+    {
+        out.extend_from_slice(blink);
+    }
+    if let Some(shape) = callbacks.cursor_shape {
+        out.extend_from_slice(format!("\x1b[{} q", shape).as_bytes());
+    }
+}
+
 /// Render the scrollback history (everything above the live screen) as a raw
 /// escape-sequence stream suitable for sequential replay into a terminal.
 ///
@@ -985,6 +1214,14 @@ impl KittyKeyboardState {
 }
 
 impl vt100::Callbacks for SessionCallbacks {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.push_canonical_event(b"\x07");
+    }
+
+    fn visual_bell(&mut self, _: &mut vt100::Screen) {
+        self.push_canonical_event(b"\x1bg");
+    }
+
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.window_title = Some(String::from_utf8_lossy(title).into_owned());
     }
@@ -997,6 +1234,40 @@ impl vt100::Callbacks for SessionCallbacks {
         params: &[&[u16]],
         c: char,
     ) {
+        let single_param = params.len() == 1 && params[0].len() == 1;
+        if single_param && i2.is_none() && c == 'n' && (i1.is_none() || i1 == Some(b'?')) {
+            match Self::first_param(params) {
+                Some(5) if i1.is_none() => {
+                    self.push_terminal_response(b"\x1b[0n");
+                    return;
+                }
+                Some(6) => {
+                    // Capture the canonical cursor when queried, before any
+                    // following output in this read advances it. Pending wrap
+                    // is reported at the last real cell, never width + 1.
+                    let (row, col) = screen.cursor_position();
+                    let response = format!(
+                        "\x1b[{}{};{}R",
+                        if i1.is_some() { "?" } else { "" },
+                        row + 1,
+                        col.min(screen.size().1 - 1) + 1
+                    );
+                    self.push_terminal_response(response.as_bytes());
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if single_param
+            && i1.is_none()
+            && i2.is_none()
+            && c == 't'
+            && Self::first_param(params) == Some(18)
+        {
+            let (rows, cols) = screen.size();
+            self.push_terminal_response(format!("\x1b[8;{};{}t", rows, cols).as_bytes());
+            return;
+        }
         if i1 == Some(b' ') && i2.is_none() && c == 'q' {
             self.cursor_shape =
                 Self::first_param(params).and_then(|param| u8::try_from(param).ok());
@@ -1075,12 +1346,26 @@ impl vt100::Callbacks for SessionCallbacks {
             return;
         }
         if Self::is_passthrough_osc(params) {
-            self.push_passthrough_sequence(Self::format_unhandled_osc(params));
+            let sequence = Self::format_unhandled_osc(params);
+            // Preserve non-rendering color changes once. Never forward
+            // arbitrary OSC commands: OSC 51 is the bridge/plugin control
+            // channel and must not be spoofable by application output.
+            if params.first().is_some_and(|code| {
+                matches!(
+                    *code,
+                    b"4" | b"10" | b"11" | b"12" | b"104" | b"110" | b"111" | b"112"
+                )
+            }) {
+                self.push_canonical_event(&sequence);
+            }
+            self.push_passthrough_sequence(sequence);
         }
     }
 
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
-        self.push_passthrough_sequence(Self::format_clipboard_copy(ty, data));
+        let sequence = Self::format_clipboard_copy(ty, data);
+        self.push_canonical_event(&sequence);
+        self.push_passthrough_sequence(sequence);
     }
 }
 
@@ -1171,10 +1456,25 @@ impl TerminalOutputFilter {
     }
 
     fn is_terminal_query_csi(seq: &[u8]) -> bool {
-        if !seq.starts_with(b"\x1b[") || seq.last() != Some(&b'c') {
+        if !seq.starts_with(b"\x1b[") {
             return false;
         }
-        matches!(&seq[2..seq.len() - 1], b"" | b"0" | b">" | b">0")
+        let params = &seq[2..seq.len() - 1];
+        let numeric = |params: &[u8]| -> Option<u16> {
+            if params.is_empty() || !params.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            std::str::from_utf8(params).ok()?.parse().ok()
+        };
+        match seq.last() {
+            Some(b'c') => matches!(params, b"" | b"0" | b">" | b">0"),
+            Some(b'n') => {
+                matches!(numeric(params), Some(5 | 6))
+                    || params.strip_prefix(b"?").and_then(numeric) == Some(6)
+            }
+            Some(b't') => numeric(params) == Some(18),
+            _ => false,
+        }
     }
 
     fn is_terminal_query_osc(seq: &[u8]) -> bool {
@@ -1285,6 +1585,51 @@ impl Session {
         build_history(self.parser.screen_mut(), max_lines)
     }
 
+    pub fn canonical_view_state(&self) -> (u64, u64, bool) {
+        let screen = self.parser.screen();
+        (
+            screen.scrollback_generation(),
+            screen.reset_generation(),
+            screen.alternate_screen(),
+        )
+    }
+
+    pub fn input_geometry(
+        &self,
+    ) -> (
+        u16,
+        u16,
+        vt100::MouseProtocolMode,
+        vt100::MouseProtocolEncoding,
+    ) {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (
+            cols,
+            rows,
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
+    }
+
+    pub fn canonical_view(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        previous_alternate: Option<bool>,
+        history_lines: usize,
+    ) -> Vec<u8> {
+        let mut view = build_canonical_view(
+            self.parser.screen_mut(),
+            cols,
+            rows,
+            previous_alternate,
+            history_lines,
+        );
+        append_canonical_tracked_state(&mut view, self.parser.screen(), self.parser.callbacks());
+        view
+    }
+
     /// Build a structured diagnostic dump of the daemon-side terminal state.
     pub fn dump(&self) -> SessionDump {
         let snapshot = self.snapshot();
@@ -1319,6 +1664,14 @@ impl Session {
         self.parser.callbacks_mut().take_pending_da_queries()
     }
 
+    pub fn take_terminal_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.parser.callbacks_mut().terminal_responses)
+    }
+
+    pub fn take_canonical_events(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.parser.callbacks_mut().canonical_events)
+    }
+
     /// Get the master fd for polling.
     pub fn master_fd(&self) -> i32 {
         self.pty.master.as_raw_fd()
@@ -1350,11 +1703,328 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_text, build_history, build_snapshot, build_snapshot_ansi, build_snapshot_text,
-        dump_screen, BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
+        append_canonical_tracked_state, build_canonical_view, build_full_text, build_history,
+        build_snapshot, build_snapshot_ansi, build_snapshot_text, dump_screen, push_view_history,
+        BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
+
+    #[test]
+    fn managed_mouse_transport_uses_sgr_without_changing_application_mode() {
+        for (sequence, mode, encoding) in [
+            (
+                b"\x1b[?1000h".as_slice(),
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            (
+                b"\x1b[?1002h\x1b[?1005h".as_slice(),
+                vt100::MouseProtocolMode::ButtonMotion,
+                vt100::MouseProtocolEncoding::Utf8,
+            ),
+            (
+                b"\x1b[?1003h\x1b[?1006h".as_slice(),
+                vt100::MouseProtocolMode::AnyMotion,
+                vt100::MouseProtocolEncoding::Sgr,
+            ),
+        ] {
+            let mut source = vt100::Parser::new(2, 8, 100);
+            source.process(sequence);
+            let mut managed = vt100::Parser::new(8, 12, 100);
+            managed.process(&build_canonical_view(source.screen_mut(), 12, 8, None, 0));
+            assert_eq!(managed.screen().mouse_protocol_mode(), mode);
+            assert_eq!(
+                managed.screen().mouse_protocol_encoding(),
+                vt100::MouseProtocolEncoding::Sgr
+            );
+            assert_eq!(source.screen().mouse_protocol_encoding(), encoding);
+            let mut standalone = vt100::Parser::new(2, 8, 100);
+            standalone.process(&source.screen().state_formatted());
+            assert_eq!(standalone.screen().mouse_protocol_mode(), mode);
+            assert_eq!(standalone.screen().mouse_protocol_encoding(), encoding);
+        }
+    }
+
+    #[test]
+    fn canonical_history_byte_budget_does_not_discard_source_history() {
+        let mut source = vt100::Parser::new(2, 20, 100);
+        source.process(b"oldest\r\nmiddle\r\nnewest\r\nvisible\r\nlast");
+        let original = build_full_text(source.screen_mut());
+        let mut limited = String::new();
+        push_view_history(&mut limited, source.screen_mut(), 20, 2, usize::MAX, 30);
+        assert!(limited.len() <= 30);
+        assert!(limited.contains("newest"));
+        assert!(!limited.contains("oldest"));
+        assert_eq!(build_full_text(source.screen_mut()), original);
+        let mut restored = String::new();
+        push_view_history(&mut restored, source.screen_mut(), 20, 2, usize::MAX, 4096);
+        assert!(restored.contains("oldest"));
+        assert!(restored.contains("middle"));
+        assert!(restored.contains("newest"));
+        assert_eq!(source.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn canonical_queries_capture_cursor_once_and_are_filtered_for_legacy_clients() {
+        let mut parser = vt100::Parser::new_with_callbacks(4, 8, 100, SessionCallbacks::default());
+        let input = b"\x1b[2;4H\x1b[006nHELLO\x1b[5n\x1b[?6n\x1b[18t";
+        parser.process(input);
+        let replies = std::mem::take(&mut parser.callbacks_mut().terminal_responses);
+        assert_eq!(replies, b"\x1b[2;4R\x1b[0n\x1b[?2;8R\x1b[8;4;8t");
+        assert!(parser.callbacks().terminal_responses.is_empty());
+        let mut filter = TerminalOutputFilter::default();
+        let mut filtered = Vec::new();
+        for chunk in input.chunks(3) {
+            filter.filter(chunk, &mut filtered);
+        }
+        assert_eq!(filtered, b"\x1b[2;4HHELLO");
+        let mut view = build_canonical_view(parser.screen_mut(), 12, 6, None, 0);
+        append_canonical_tracked_state(&mut view, parser.screen(), parser.callbacks());
+        assert!(parser.callbacks().terminal_responses.is_empty());
+    }
+
+    #[test]
+    fn canonical_bells_and_clipboard_are_one_shot_and_unknown_osc_is_not_forwarded() {
+        let mut parser = vt100::Parser::new_with_callbacks(4, 8, 100, SessionCallbacks::default());
+        parser.process(
+            b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]1337;Custom=1\x07",
+        );
+        let events = std::mem::take(&mut parser.callbacks_mut().canonical_events);
+        assert_eq!(events, b"\x07\x1bg\x1b]52;c;SGVsbG8=\x1b\\");
+        let mut view = build_canonical_view(parser.screen_mut(), 8, 4, None, 0);
+        append_canonical_tracked_state(&mut view, parser.screen(), parser.callbacks());
+        let view = String::from_utf8_lossy(&view);
+        assert!(!view.contains("]52;"));
+        assert!(!view.contains("]51;"));
+        assert!(!view.contains("Custom"));
+        assert!(parser.callbacks().canonical_events.is_empty());
+    }
+
+    #[test]
+    fn canonical_event_and_response_queues_are_bounded() {
+        let mut callbacks = SessionCallbacks::default();
+        callbacks.push_canonical_event(&vec![b'x'; SessionCallbacks::MAX_CANONICAL_EVENT_BYTES]);
+        callbacks.push_canonical_event(b"overflow");
+        assert_eq!(
+            callbacks.canonical_events.len(),
+            SessionCallbacks::MAX_CANONICAL_EVENT_BYTES
+        );
+        callbacks
+            .push_terminal_response(&vec![b'x'; SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES]);
+        callbacks.push_terminal_response(b"overflow");
+        assert_eq!(
+            callbacks.terminal_responses.len(),
+            SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn canonical_width_one_uses_a_safe_placeholder_without_losing_wide_text() {
+        let mut source = vt100::Parser::new(2, 4, 100);
+        source.process("界".as_bytes());
+        source.screen_mut().set_size(2, 1);
+        let view = build_canonical_view(source.screen_mut(), 8, 4, None, 0);
+        assert!(String::from_utf8_lossy(&view).contains('\u{fffd}'));
+        assert!(!String::from_utf8_lossy(&view).contains('界'));
+        source.screen_mut().set_size(2, 4);
+        let view = build_canonical_view(source.screen_mut(), 8, 4, None, 0);
+        assert!(String::from_utf8_lossy(&view).contains('界'));
+    }
+
+    #[test]
+    fn canonical_view_crops_and_pads_without_creating_history() {
+        let mut source = vt100::Parser::new(3, 8, 100);
+        source.process(b"abcdefgh\r\n12345678\r\nlast");
+        for (rows, cols, expected) in [
+            (2, 5, "abcde\n12345"),
+            (5, 12, "\n\nabcdefgh\n12345678\nlast"),
+        ] {
+            let mut client = vt100::Parser::new(rows, cols, 100);
+            for row in 1..=rows {
+                client.process(
+                    format!("\x1b[{};1H{}", row, "x".repeat(usize::from(cols))).as_bytes(),
+                );
+            }
+            let view = build_canonical_view(source.screen_mut(), cols, rows, None, 0);
+            client.process(&view);
+            assert_eq!(client.screen().contents(), expected);
+            for _ in 0..4 {
+                client.process(&build_canonical_view(
+                    source.screen_mut(),
+                    cols,
+                    rows,
+                    Some(false),
+                    0,
+                ));
+            }
+            assert_eq!(client.screen().contents(), expected);
+            client.screen_mut().set_scrollback(usize::MAX);
+            assert_eq!(client.screen().scrollback(), 0);
+        }
+    }
+
+    #[test]
+    fn canonical_view_bottom_aligns_rows_and_cursor_for_short_active_window() {
+        for alternate in [false, true] {
+            let mut source = vt100::Parser::new(3, 8, 100);
+            if alternate {
+                source.process(b"\x1b[?1049h");
+            }
+            source.process(b"top\x1b[2;1Hmiddle\x1b[3;1Hbottom\x1b[2;3H");
+            let mut client = vt100::Parser::new(7, 12, 100);
+            let mut previous_alternate = None;
+
+            // The shared physical renderer stays tall while the active
+            // horizontal split shrinks and grows. Neovim shows its last
+            // source_rows lines, so those must exactly match the live grid.
+            for source_rows in [3, 2, 5, 1, 3] {
+                source.screen_mut().set_size(source_rows, 8);
+                let offset = 7 - source_rows;
+                let mut expected = vec![String::new(); usize::from(offset)];
+                expected.extend(source.screen().rows(0, 8));
+                let (cursor_row, cursor_col) = source.screen().cursor_position();
+                client.process(&build_canonical_view(
+                    source.screen_mut(),
+                    12,
+                    7,
+                    previous_alternate,
+                    0,
+                ));
+                previous_alternate = Some(alternate);
+
+                assert_eq!(client.screen().rows(0, 12).collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    client.screen().cursor_position(),
+                    (offset + cursor_row, cursor_col.min(7))
+                );
+                assert!(!client.screen().hide_cursor());
+                assert_eq!(client.screen().scrollback_rows(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_view_smaller_physical_view_crops_top_left_and_hides_clipped_cursor() {
+        let mut source = vt100::Parser::new(4, 8, 100);
+        source.process(b"top-left\x1b[2;1Hsecond\x1b[3;1Hthird\x1b[4;1Hbottom");
+        let mut client = vt100::Parser::new(2, 5, 100);
+        for (cursor, visible, position) in [
+            (b"\x1b[4;1H".as_slice(), false, (1, 0)),
+            (b"\x1b[1;8H".as_slice(), false, (0, 4)),
+            (b"\x1b[2;3H".as_slice(), true, (1, 2)),
+        ] {
+            source.process(cursor);
+            client.process(&build_canonical_view(
+                source.screen_mut(),
+                5,
+                2,
+                Some(false),
+                0,
+            ));
+            assert_eq!(
+                client.screen().rows(0, 5).collect::<Vec<_>>(),
+                vec!["top-l", "secon"]
+            );
+            assert_eq!(client.screen().cursor_position(), position);
+            assert_eq!(client.screen().hide_cursor(), !visible);
+            assert_eq!(client.screen().scrollback_rows(), 0);
+        }
+    }
+
+    #[test]
+    fn canonical_view_archives_only_requested_rows_at_physical_height() {
+        let mut source = vt100::Parser::new(2, 8, 100);
+        source.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let mut client = vt100::Parser::new(5, 12, 100);
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            None,
+            usize::MAX,
+        ));
+        assert_eq!(client.screen().contents(), "\n\n\nthree\nfour");
+        assert_eq!(client.screen().scrollback_rows(), 2);
+        assert_eq!(
+            build_full_text(client.screen_mut())
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "", "", "", "three", "four"]
+        );
+        source.process(b"\r\nfive");
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            Some(false),
+            1,
+        ));
+        assert_eq!(client.screen().scrollback_rows(), 3);
+        assert_eq!(client.screen().contents(), "\n\n\nfour\nfive");
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            Some(false),
+            0,
+        ));
+        assert_eq!(client.screen().scrollback_rows(), 3);
+    }
+
+    #[test]
+    fn canonical_view_crops_wide_glyphs_and_preserves_styles() {
+        let mut source = vt100::Parser::new(2, 8, 100);
+        source.process("\x1b[31;44;1mabc界z\x1b[0m\r\nnext".as_bytes());
+        let mut client = vt100::Parser::new(2, 4, 100);
+        client.process(&build_canonical_view(source.screen_mut(), 4, 2, None, 0));
+        assert_eq!(client.screen().contents(), "abc\nnext");
+        let cell = client.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.fgcolor(), vt100::Color::Idx(1));
+        assert_eq!(cell.bgcolor(), vt100::Color::Idx(4));
+        assert!(cell.bold());
+        assert!(!client.screen().cell(0, 3).unwrap().has_contents());
+        assert_eq!(client.screen().scrollback_rows(), 0);
+    }
+
+    #[test]
+    fn canonical_view_alternate_transition_preserves_main_history() {
+        let mut source = vt100::Parser::new(2, 8, 100);
+        source.process(b"one\r\ntwo\r\nthree");
+        let mut client = vt100::Parser::new(3, 10, 100);
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            None,
+            usize::MAX,
+        ));
+        source.process(b"\x1b[?1049halt");
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            Some(false),
+            0,
+        ));
+        assert!(client.screen().alternate_screen());
+        let update = build_canonical_view(source.screen_mut(), 10, 3, Some(true), 0);
+        assert!(!String::from_utf8_lossy(&update).contains("?1049"));
+        client.process(&update);
+        source.process(b"\x1b[?1049l");
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            Some(true),
+            0,
+        ));
+        assert!(!client.screen().alternate_screen());
+        assert_eq!(client.screen().contents(), "\ntwo\nthree");
+        assert_eq!(client.screen().scrollback_rows(), 1);
+        client.screen_mut().set_scrollback(1);
+        assert_eq!(client.screen().rows(0, 10).next().as_deref(), Some("one"));
+    }
 
     /// Replay `bytes` into a fresh parser and return the visible plain text,
     /// so history streams are verified by their effect on a real terminal.
@@ -2087,7 +2757,15 @@ mod tests {
 
         assert!(snapshot_str.contains("\x1b[14t"));
         assert!(snapshot_str.contains("\x1b[16t"));
-        assert!(snapshot_str.contains("\x1b[18t"));
+        assert!(!snapshot_str.contains("\x1b[18t"));
+        assert_eq!(
+            parser.callbacks().terminal_responses,
+            format!(
+                "\x1b[8;{};{}t",
+                DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS
+            )
+            .as_bytes()
+        );
     }
 
     #[test]

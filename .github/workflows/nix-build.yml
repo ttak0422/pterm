@@ -26,7 +26,7 @@ jobs:
         run: nix build
 
       - name: Check with Nix
-        run: nix flake check
+        run: nix flake check -L --keep-going
 
   build-darwin:
     runs-on: macos-15
@@ -50,4 +50,4 @@ jobs:
         run: nix build
 
       - name: Check with Nix
-        run: nix flake check
+        run: nix flake check -L --keep-going

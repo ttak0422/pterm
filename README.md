@@ -66,6 +66,29 @@ pterm kill parent          # kills parent and parent/child
 
 The Lua module also exports functions for programmatic use: `open`, `attach`, `detach`, `list`, `kill`, `redraw`, `dump`.
 
+### Shared-session window size
+
+The most recently focused pterm window chooses the shared session's terminal
+width and height. Switching between differently sized splits resizes the shell
+or TUI to the newly active window's text area. Background mirrors do not acquire
+resize authority merely because their layout changes. Switching back to another
+Neovim instance reclaims authority when that editor reports `FocusGained`.
+
+Other windows show the same canonical terminal screen: larger windows have
+padding, and smaller windows clip the view instead of rewrapping the application.
+The plugin sends explicit size-control requests and uses a `--no-resize` bridge
+so Neovim's automatic largest-window terminal sizing, including delayed bridge
+startup, cannot overwrite the active window's dimensions.
+Standalone CLI attachments retain their normal SIGWINCH behavior. Managed Neovim
+attachments require protocol version 2; restart an older daemon session before
+using this plugin version. Extremely large windows are capped at the daemon's
+512-column, 256-row and 65,536-cell limits.
+
+When resized history is replayed, a scrollback-reset handshake retains one blank
+sentinel line before the refreshed history. This also supports Neovim 0.11 and
+older, which cannot clear terminal history with CSI 3 J. Previous history content
+is replaced rather than duplicated, and the user's `scrollback` setting is restored.
+
 ## Requirements
 
 - Neovim 0.10+
@@ -155,13 +178,17 @@ preview.
 Run the Lua linter from the repository root with the pinned Nix toolchain:
 
 ```sh
-nix develop -c selene lua tests/neovim_regressions.lua nix/apps/nvim
+nix develop -c selene lua tests/neovim_regressions.lua tests/neovim_resize_regressions.lua nix/apps/nvim
 nix flake check
 ```
 
 `vim.yml` defines the Neovim APIs used here, including argument checks. Extend it
 when adding API calls. Selene also runs in the pre-commit check; `nix flake check`
-includes that check and the headless Neovim regressions.
+includes that check and the mocked headless Neovim plugin regressions.
+The Rust checks include session/server and CLI integration tests using Unix
+sockets. The real Neovim/PTY and tig fixtures in
+`tests/neovim_resize_regressions.lua` and `tests/neovim_tig_regressions.lua`
+are opt-in development tests and are not run by `nix flake check`.
 
 ## License
 

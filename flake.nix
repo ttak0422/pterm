@@ -64,6 +64,7 @@
               rustFiles
               ./docs
               ./tests
+              ./vendor
               (fileset.maybeMissing ./target)
             ]
           );
@@ -91,7 +92,10 @@
                 statix.enable = true;
                 stylua.enable = true;
                 selene.enable = true;
-                rustfmt.enable = true;
+                rustfmt = {
+                  enable = true;
+                  excludes = [ "^vendor/" ];
+                };
               };
             };
             cargo-check = buildPackage { mode = "check"; };
@@ -100,12 +104,19 @@
               cargoTestOptions = opts: opts ++ [ "--workspace" ];
             };
             clippy = buildPackage { mode = "clippy"; };
-            neovim = pkgs.runCommand "pterm-neovim-regressions" { nativeBuildInputs = [ pkgs.neovim ]; } ''
-              export NVIM_LOG_FILE="$TMPDIR/nvim.log"
-              cd ${./.}
-              nvim --headless -u NONE -l tests/neovim_regressions.lua
-              touch "$out"
-            '';
+            neovim =
+              pkgs.runCommand "pterm-neovim-regressions"
+                {
+                  # Preserve the existing mocked plugin suite in CI. Real
+                  # Neovim/PTY/tig fixtures remain opt-in development tests.
+                  nativeBuildInputs = [ pkgs.neovim ];
+                }
+                ''
+                  export NVIM_LOG_FILE="$TMPDIR/nvim.log"
+                  cd ${./.}
+                  nvim --headless -u NONE -l tests/neovim_regressions.lua
+                  touch "$out"
+                '';
           };
 
           apps = import ./nix/apps {
