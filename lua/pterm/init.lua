@@ -529,10 +529,14 @@ local function start_terminal(session_name, cmd)
 				-- scrollback value below 1 means unlimited. The bridge first
 				-- scrolls a blank row into history. Keep that one sentinel row
 				-- while dropping all old content, then restore the user's limit.
-				-- Reducing this option synchronously calls refresh_terminal(),
-				-- so the ACK cannot race ahead of the native history cleanup.
+				-- Only numeric decreases synchronously refresh native capacity.
+				-- Restoring 1 -> limit alone leaves capacity at one until a timer,
+				-- which would truncate the replay sent immediately after the ACK.
+				-- Setting -1 forces a refresh that expands to Neovim's unlimited
+				-- sentinel; restoring the saved limit then refreshes immediately.
 				local scrollback = vim.api.nvim_get_option_value("scrollback", { buf = buf })
 				vim.api.nvim_set_option_value("scrollback", 1, { buf = buf })
+				vim.api.nvim_set_option_value("scrollback", -1, { buf = buf })
 				vim.api.nvim_set_option_value("scrollback", scrollback, { buf = buf })
 				vim.fn.chansend(conn.job_id, "\27]51;pterm-history-ready\7")
 			end)

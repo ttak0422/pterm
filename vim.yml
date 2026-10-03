@@ -136,6 +136,10 @@ globals:
     args: [{ type: [error, force, keep] }, { type: table }, { type: "..." }]
   vim.tbl_filter:
     args: [{ type: function }, { type: table }]
+  vim.version:
+    args: []
+  vim.inspect:
+    args: [{ type: any }, { type: table, required: false }]
   vim.trim:
     args: [{ type: string }]
   vim.uv.fs_scandir:
