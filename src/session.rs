@@ -1000,6 +1000,11 @@ fn build_canonical_view(
     out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
     let mut bytes = out.into_bytes();
     bytes.extend_from_slice(&screen.input_mode_formatted());
+    // The renderer may be much taller than the application. Use SGR on this
+    // transport so its padded coordinates cannot overflow legacy X10 bytes.
+    // The daemon translates/re-encodes mouse reports for the application's
+    // original encoding; this does not enable mouse tracking by itself.
+    bytes.extend_from_slice(b"\x1b[?1005l\x1b[?1006h");
     bytes.extend_from_slice(&screen.attributes_formatted());
     // cursor_state_formatted can repaint a cell to recreate pending wrap.
     // A view cursor must only position, and must stay inside its viewport.
@@ -1589,6 +1594,24 @@ impl Session {
         )
     }
 
+    pub fn input_geometry(
+        &self,
+    ) -> (
+        u16,
+        u16,
+        vt100::MouseProtocolMode,
+        vt100::MouseProtocolEncoding,
+    ) {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (
+            cols,
+            rows,
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
+    }
+
     pub fn canonical_view(
         &mut self,
         cols: u16,
@@ -1686,6 +1709,42 @@ mod tests {
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
+
+    #[test]
+    fn managed_mouse_transport_uses_sgr_without_changing_application_mode() {
+        for (sequence, mode, encoding) in [
+            (
+                b"\x1b[?1000h".as_slice(),
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            (
+                b"\x1b[?1002h\x1b[?1005h".as_slice(),
+                vt100::MouseProtocolMode::ButtonMotion,
+                vt100::MouseProtocolEncoding::Utf8,
+            ),
+            (
+                b"\x1b[?1003h\x1b[?1006h".as_slice(),
+                vt100::MouseProtocolMode::AnyMotion,
+                vt100::MouseProtocolEncoding::Sgr,
+            ),
+        ] {
+            let mut source = vt100::Parser::new(2, 8, 100);
+            source.process(sequence);
+            let mut managed = vt100::Parser::new(8, 12, 100);
+            managed.process(&build_canonical_view(source.screen_mut(), 12, 8, None, 0));
+            assert_eq!(managed.screen().mouse_protocol_mode(), mode);
+            assert_eq!(
+                managed.screen().mouse_protocol_encoding(),
+                vt100::MouseProtocolEncoding::Sgr
+            );
+            assert_eq!(source.screen().mouse_protocol_encoding(), encoding);
+            let mut standalone = vt100::Parser::new(2, 8, 100);
+            standalone.process(&source.screen().state_formatted());
+            assert_eq!(standalone.screen().mouse_protocol_mode(), mode);
+            assert_eq!(standalone.screen().mouse_protocol_encoding(), encoding);
+        }
+    }
 
     #[test]
     fn canonical_history_byte_budget_does_not_discard_source_history() {

@@ -1,3 +1,4 @@
+use crate::input::MouseInput;
 use crate::session::Session;
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
@@ -44,6 +45,8 @@ struct Client {
     canonical_view: bool,
     /// Physical renderer dimensions, independent of the authoritative PTY.
     view_size: Option<(u16, u16)>,
+    mouse_input: MouseInput,
+    mouse_pending_since: Option<Instant>,
     view_history_generation: u64,
     view_reset_generation: u64,
     view_alternate: Option<bool>,
@@ -240,8 +243,14 @@ impl Server {
                 break;
             }
 
-            self.poll
-                .poll(&mut events, Some(Duration::from_millis(100)))?;
+            let mouse_pending = self
+                .clients
+                .values()
+                .any(|client| client.mouse_input.has_pending());
+            self.poll.poll(
+                &mut events,
+                Some(Duration::from_millis(if mouse_pending { 25 } else { 100 })),
+            )?;
 
             self.refresh_cwd();
 
@@ -281,6 +290,22 @@ impl Server {
                     }
                     _ => {}
                 }
+            }
+
+            // Only ambiguous escape prefixes wait, never an unbounded lone
+            // Escape key. Preserve incomplete/malformed bytes on timeout.
+            let mut expired_input = Vec::new();
+            for client in self.clients.values_mut() {
+                if client
+                    .mouse_pending_since
+                    .is_some_and(|since| since.elapsed() >= Duration::from_millis(25))
+                {
+                    expired_input.extend(client.mouse_input.flush_pending());
+                    client.mouse_pending_since = None;
+                }
+            }
+            if !expired_input.is_empty() {
+                self.queue_pty_input(&expired_input)?;
             }
 
             // No timer-based snapshot deferral. Snapshots are sent either:
@@ -380,6 +405,8 @@ impl Server {
                             wants_history: false,
                             canonical_view: false,
                             view_size: None,
+                            mouse_input: MouseInput::new(),
+                            mouse_pending_since: None,
                             view_history_generation: 0,
                             view_reset_generation: 0,
                             view_alternate: None,
@@ -864,8 +891,10 @@ impl Server {
             };
             match client.stream.read(buf) {
                 Ok(0) => {
+                    let pending = client.mouse_input.flush_pending();
                     log::info!("Client {} disconnected", client_id);
                     self.clients.remove(&client_id);
+                    self.queue_pty_input(&pending)?;
                     return Ok(());
                 }
                 Ok(n) => {
@@ -926,7 +955,56 @@ impl Server {
                     }
                 },
                 proto::client::INPUT => {
-                    self.queue_pty_input(&frame.payload)?;
+                    let (cols, rows, mode, encoding) = self.session.input_geometry();
+                    let input = if let Some(client) = self.clients.get_mut(&client_id) {
+                        if client.canonical_view {
+                            let physical_rows = client.view_size.map_or(rows, |(_, rows)| rows);
+                            let input = client.mouse_input.transform(
+                                &frame.payload,
+                                cols,
+                                rows,
+                                physical_rows,
+                                mode,
+                                encoding,
+                            );
+                            if client.mouse_input.has_pending() {
+                                client.mouse_pending_since.get_or_insert_with(Instant::now);
+                            } else {
+                                client.mouse_pending_since = None;
+                            }
+                            input
+                        } else {
+                            frame.payload
+                        }
+                    } else {
+                        continue;
+                    };
+                    self.queue_pty_input(&input)?;
+                }
+                proto::client::INPUT_ORIGIN => {
+                    if frame.payload.len() != 8 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid mouse origin",
+                        ));
+                    }
+                    let row_base = i32::from_le_bytes(frame.payload[..4].try_into().unwrap());
+                    let leftcol = i32::from_le_bytes(frame.payload[4..].try_into().unwrap());
+                    let mut preceding = Vec::new();
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        if client.canonical_view {
+                            // A new origin starts a new UI event. Never join
+                            // an earlier partial report across this boundary.
+                            preceding = client.mouse_input.flush_pending();
+                            client.mouse_pending_since = None;
+                            if row_base == i32::MIN || !(0..=1_000_000).contains(&leftcol) {
+                                client.mouse_input.invalidate_origin();
+                            } else {
+                                client.mouse_input.set_origin(row_base, leftcol);
+                            }
+                        }
+                    }
+                    self.queue_pty_input(&preceding)?;
                 }
                 proto::client::RESIZE | proto::client::SET_SIZE => {
                     let (cols, rows) = match proto::parse_resize(&frame.payload) {

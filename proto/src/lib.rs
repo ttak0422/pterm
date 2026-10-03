@@ -60,6 +60,11 @@ pub mod client {
     /// Set authoritative dimensions from a one-shot controller. The server
     /// replies with RESIZE_ACK only after processing this request.
     pub const SET_SIZE: u8 = 0x0b;
+
+    /// Managed mouse origin, ordered before the native mouse reports.
+    /// Payload: row_base:i32, leftcol:i32 (little endian). row_base=i32::MIN
+    /// invalidates the origin while the native display is being reset.
+    pub const INPUT_ORIGIN: u8 = 0x0c;
 }
 
 /// Flags carried in the client HELLO payload.

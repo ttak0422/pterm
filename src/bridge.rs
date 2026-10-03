@@ -5,6 +5,7 @@
 //! libvterm processes escape sequences natively in C -- no Lua intermediary.
 
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
+use crate::input::{InputEvent, ManagedInput};
 use crate::server::SendQueue;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 
 const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
+const INPUT_PREFIX_TIMEOUT: Duration = Duration::from_millis(25);
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -118,6 +120,37 @@ impl HistoryReset {
             }
         }
         forwarded
+    }
+}
+
+fn queue_managed_input(
+    events: Vec<InputEvent>,
+    reset: &mut HistoryReset,
+    output: &mut SendQueue,
+    socket: &mut SendQueue,
+) {
+    for event in events {
+        match event {
+            InputEvent::Bytes(bytes) => {
+                let bytes = reset.input(&bytes, output);
+                if !bytes.is_empty() {
+                    socket.push(&proto::encode(proto::client::INPUT, &bytes));
+                }
+            }
+            InputEvent::Origin { row_base, leftcol } => {
+                // Mouse clicks during a blank/resetting display have no
+                // reliable origin. Invalidate rather than remapping them to
+                // unrelated application rows; active releases remain safe.
+                let row_base = if reset.deadline.is_some() {
+                    i32::MIN
+                } else {
+                    row_base
+                };
+                let mut payload = row_base.to_le_bytes().to_vec();
+                payload.extend_from_slice(&leftcol.to_le_bytes());
+                socket.push(&proto::encode(proto::client::INPUT_ORIGIN, &payload));
+            }
+        }
     }
 }
 
@@ -307,6 +340,8 @@ pub fn run(
     let mut recv_buf = Vec::new();
     let mut output = SendQueue::default();
     let mut history_reset = HistoryReset::default();
+    let mut managed_input = ManagedInput::new();
+    let mut input_pending_since = None;
     let mut exit_code = 0;
     // A daemon predating HELLO_ACK is detected at the first STATE_SYNC.
     let mut daemon_proto = None;
@@ -315,6 +350,16 @@ pub fn run(
     let mut socket_open = true;
     let mut cleanup_queued = false;
     loop {
+        if input_pending_since.is_some_and(|since: Instant| since.elapsed() >= INPUT_PREFIX_TIMEOUT)
+        {
+            queue_managed_input(
+                managed_input.flush_pending(),
+                &mut history_reset,
+                &mut output,
+                &mut send_buf,
+            );
+            input_pending_since = None;
+        }
         if history_reset
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -368,7 +413,9 @@ pub fn run(
             poll_fd(wake_read.as_raw_fd(), libc::POLLIN),
             poll_fd(stdout_fd, if output.is_empty() { 0 } else { libc::POLLOUT }),
         ];
-        let timeout = if history_reset.deadline.is_some() {
+        let timeout = if managed_input.has_pending() {
+            25
+        } else if history_reset.deadline.is_some() {
             100
         } else {
             -1
@@ -384,13 +431,30 @@ pub fn run(
         if fds[0].revents != 0 {
             match nix::unistd::read(&stdin, &mut stdin_buf) {
                 Ok(0) => {
+                    queue_managed_input(
+                        managed_input.flush_pending(),
+                        &mut history_reset,
+                        &mut output,
+                        &mut send_buf,
+                    );
                     running = false;
                     send_buf.push(&proto::encode(proto::client::DETACH, &[]));
                 }
                 Ok(n) => {
-                    let input = history_reset.input(&stdin_buf[..n], &mut output);
-                    if !input.is_empty() {
-                        send_buf.push(&proto::encode(proto::client::INPUT, &input));
+                    if propagate_resize {
+                        send_buf.push(&proto::encode(proto::client::INPUT, &stdin_buf[..n]));
+                    } else {
+                        queue_managed_input(
+                            managed_input.decode(&stdin_buf[..n]),
+                            &mut history_reset,
+                            &mut output,
+                            &mut send_buf,
+                        );
+                        if managed_input.has_pending() {
+                            input_pending_since.get_or_insert_with(Instant::now);
+                        } else {
+                            input_pending_since = None;
+                        }
                     }
                 }
                 Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {}
@@ -626,8 +690,10 @@ mod tests {
 
 #[cfg(test)]
 mod history_reset_tests {
-    use super::{HistoryReset, HISTORY_RESET_ACK, HISTORY_RESET_REQUEST};
+    use super::{queue_managed_input, HistoryReset, HISTORY_RESET_ACK, HISTORY_RESET_REQUEST};
+    use crate::input::{InputEvent, ManagedInput};
     use crate::server::SendQueue;
+    use pterm_proto as proto;
 
     fn drain(queue: &mut SendQueue) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -638,6 +704,53 @@ mod history_reset_tests {
             })
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn mouse_origin_is_ordered_before_native_reports_and_never_reaches_pty_text() {
+        let mut decoder = ManagedInput::default();
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        let mut socket = SendQueue::default();
+        let events = decoder.decode(b"key\x1b]51;pterm-input-origin;-40;3\x07\x1b[<4;5;31M");
+        queue_managed_input(events, &mut reset, &mut output, &mut socket);
+        let frames =
+            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.msg_type)
+                .collect::<Vec<_>>(),
+            vec![
+                proto::client::INPUT,
+                proto::client::INPUT_ORIGIN,
+                proto::client::INPUT
+            ]
+        );
+        assert_eq!(frames[0].payload, b"key");
+        assert_eq!(&frames[1].payload[..4], &(-40i32).to_le_bytes());
+        assert_eq!(&frames[1].payload[4..], &3i32.to_le_bytes());
+        assert_eq!(frames[2].payload, b"\x1b[<4;5;31M");
+    }
+
+    #[test]
+    fn mouse_origin_during_blank_history_reset_is_invalidated() {
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        let mut socket = SendQueue::default();
+        reset.queue_view(b"\x01screen", &mut output).unwrap();
+        queue_managed_input(
+            vec![InputEvent::Origin {
+                row_base: -40,
+                leftcol: 0,
+            }],
+            &mut reset,
+            &mut output,
+            &mut socket,
+        );
+        let frames =
+            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+        assert_eq!(&frames[0].payload[..4], &i32::MIN.to_le_bytes());
     }
 
     #[test]

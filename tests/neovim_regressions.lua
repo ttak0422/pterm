@@ -10,6 +10,12 @@ local last_command
 local last_terminal_command
 local resize_requests = {}
 local complete_resizes = true
+local mouse_key_listener
+-- selene: allow(incorrect_standard_library_use)
+vim.on_key = function(callback)
+	mouse_key_listener = callback
+	return 1
+end
 -- Selene allowances below cover deliberate Neovim function mocks and restoration.
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.executable = function()
@@ -481,6 +487,64 @@ check("ANSI preview uses the xterm 256-color cube", function()
 		local highlight = vim.api.nvim_get_hl(0, { name = ansi.hl_group(run.attrs) })
 		assert(highlight.fg == color[2], "incorrect xterm palette color " .. color[1])
 	end
+end)
+
+check("mouse origin follows the clicked mirror without consuming keys or changing focus", function()
+	pterm.open("mouse-origin")
+	local job = next_job
+	local buf = vim.api.nvim_get_current_buf()
+	local active = vim.api.nvim_get_current_win()
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two", "three", "four", "five" })
+	vim.cmd("vsplit")
+	local passive = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_current_win(active)
+	local old_mode, old_mouse, old_view, old_send =
+		vim.api.nvim_get_mode, vim.fn.getmousepos, vim.api.nvim_win_call, vim.fn.chansend
+	local mode, mouse_win, topline, leftcol = "t", passive, 3, 4
+	local sent = {}
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_get_mode = function()
+		return { mode = mode }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.getmousepos = function()
+		return { winid = mouse_win }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_call = function(win)
+		assert(win == mouse_win, "origin was read from the active window instead of the clicked mirror")
+		return { topline = topline, leftcol = leftcol }
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.fn.chansend = function(channel, text)
+		assert(channel == job, "mouse origin reached another terminal job")
+		sent[#sent + 1] = text
+		return #text
+	end
+	local ok, err = pcall(function()
+		local function mouse_key(name)
+			return vim.api.nvim_replace_termcodes(name, true, false, true)
+		end
+		assert(type(mouse_key_listener) == "function", "mouse observer was not registered")
+		assert(mouse_key_listener(mouse_key("<LeftMouse>")) == nil, "mouse key was consumed")
+		assert(sent[1] == "\27]51;pterm-input-origin;-3;4\7", "incorrect passive window origin")
+		assert(vim.api.nvim_get_current_win() == active, "mouse metadata changed focus")
+		mouse_win, topline, leftcol = active, 1, 0
+		mouse_key_listener(mouse_key("<C-LeftDrag>"))
+		assert(sent[2] == "\27]51;pterm-input-origin;-5;0\7", "active window origin was stale")
+		mouse_key_listener("x")
+		mode = "n"
+		mouse_key_listener(mouse_key("<LeftMouse>"))
+		mode, mouse_win = "t", 0
+		mouse_key_listener(mouse_key("<LeftRelease>"))
+		assert(#sent == 2, "ordinary keys or non-terminal/outside clicks emitted metadata")
+	end)
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_get_mode, vim.fn.getmousepos, vim.api.nvim_win_call, vim.fn.chansend =
+		old_mode, old_mouse, old_view, old_send
+	pterm.detach("mouse-origin")
+	vim.cmd("silent! only")
+	assert(ok, err)
 end)
 
 assert(#failures == 0, table.concat(failures, "\n"))

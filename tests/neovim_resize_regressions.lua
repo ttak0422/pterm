@@ -47,6 +47,7 @@ draw "$size_file"
 while :; do
   if IFS= read -r command; then
     case "$command" in
+      probe) draw "$size_file" ;;
       history)
         i=1
         while [ "$i" -le "$history_lines" ]; do
@@ -97,17 +98,28 @@ end
 
 local function expect_size()
 	local cols, rows = current_size()
+	local job = vim.api.nvim_get_option_value("channel", { buf = vim.api.nvim_get_current_buf() })
+	local probed = false
+	local observed = "unavailable"
+	local matched = vim.wait(4000, function()
+		local size = daemon_size()
+		observed = size and ("%dx%d"):format(size.cols, size.rows) or "unavailable"
+		if not size or size.cols ~= cols or size.rows ~= rows then
+			return false
+		end
+		if not probed then
+			-- Noninteractive Bash can defer WINCH traps while blocked in read.
+			-- Wake the fixture only after the daemon reports the requested size;
+			-- stty still independently verifies the actual child PTY below.
+			vim.fn.chansend(job, "probe\n")
+			probed = true
+		end
+		local actual_rows, actual_cols = read_file(size_file):match("(%d+)%s+(%d+)")
+		return tonumber(actual_cols) == cols and tonumber(actual_rows) == rows
+	end, 25)
 	assert(
-		vim.wait(4000, function()
-			local size = daemon_size()
-			local actual_rows, actual_cols = read_file(size_file):match("(%d+)%s+(%d+)")
-			return size
-				and size.cols == cols
-				and size.rows == rows
-				and tonumber(actual_cols) == cols
-				and tonumber(actual_rows) == rows
-		end, 25),
-		("daemon/parser or actual child PTY did not adopt active window %dx%d"):format(cols, rows)
+		matched,
+		("active window %dx%d: daemon=%s, actual child PTY=%q"):format(cols, rows, observed, read_file(size_file))
 	)
 end
 

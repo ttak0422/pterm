@@ -1,5 +1,6 @@
 mod bridge;
 mod constants;
+mod input;
 mod paths;
 mod pty;
 mod server;

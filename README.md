@@ -184,7 +184,11 @@ nix flake check
 
 `vim.yml` defines the Neovim APIs used here, including argument checks. Extend it
 when adding API calls. Selene also runs in the pre-commit check; `nix flake check`
-includes that check and the headless Neovim regressions.
+includes that check and the mocked headless Neovim plugin regressions.
+The Rust checks include session/server and CLI integration tests using Unix
+sockets. The real Neovim/PTY and tig fixtures in
+`tests/neovim_resize_regressions.lua` and `tests/neovim_tig_regressions.lua`
+are opt-in development tests and are not run by `nix flake check`.
 
 ## License
 

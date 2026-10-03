@@ -16,6 +16,7 @@ local redraw_timers = {}
 local cached_binary = nil
 local editor_focused = true
 local focus_autocmds_initialized = false
+local mouse_listener_initialized = false
 
 --- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
@@ -70,6 +71,56 @@ local function configure_views(buf)
 			vim.api.nvim_set_option_value("wrap", false, { win = win, scope = "local" })
 		end
 	end
+end
+
+local function initialize_mouse_listener()
+	if mouse_listener_initialized then
+		return
+	end
+	mouse_listener_initialized = true
+	-- Observe keys after user mappings, before Neovim forwards a native mouse
+	-- report. Never replace mappings, consume keys, or move the active window.
+	vim.on_key(function(key)
+		if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "t" then
+			return
+		end
+		local name = vim.fn.keytrans(key)
+		if
+			not (
+				name:find("Mouse", 1, true)
+				or name:find("Drag", 1, true)
+				or name:find("Release", 1, true)
+				or name:find("ScrollWheel", 1, true)
+			)
+		then
+			return
+		end
+		local buf = vim.api.nvim_get_current_buf()
+		local conn
+		for _, candidate in pairs(connections) do
+			if candidate.buf == buf then
+				conn = candidate
+				break
+			end
+		end
+		if not conn then
+			return
+		end
+		-- A mouse-enabled application can receive a click in a passive mirror
+		-- without WinEnter. Record that clicked window's displayed buffer origin.
+		pcall(function()
+			local mouse = vim.fn.getmousepos()
+			local win = mouse.winid
+			if win == 0 or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+				return
+			end
+			local view = vim.api.nvim_win_call(win, vim.fn.winsaveview)
+			local row_base = view.topline - vim.api.nvim_buf_line_count(buf) - 1
+			-- Native reports are window-relative. The daemon adds the visible
+			-- canonical height, accounting for top padding and clipped mirrors.
+			vim.fn.chansend(conn.job_id, ("\27]51;pterm-input-origin;%d;%d\7"):format(row_base, view.leftcol))
+		end)
+	end, vim.api.nvim_create_namespace("pterm_mouse_origin"))
 end
 
 local function window_size(win)
@@ -433,6 +484,7 @@ end
 --- `cmd` is the full argv for jobstart (e.g. {"pterm","open","main"}).
 local function start_terminal(session_name, cmd)
 	initialize_focus_autocmds()
+	initialize_mouse_listener()
 	teardown_connection(session_name)
 
 	-- Clean up any stale buffer with the same name from a previous connection
@@ -533,7 +585,8 @@ local function start_terminal(session_name, cmd)
 				-- Restoring 1 -> limit alone leaves capacity at one until a timer,
 				-- which would truncate the replay sent immediately after the ACK.
 				-- Setting -1 forces a refresh that expands to Neovim's unlimited
-				-- sentinel; restoring the saved limit then refreshes immediately.
+				-- sentinel before replay. Restore the option before acknowledging;
+				-- normal refresh then reapplies any smaller saved limit.
 				local scrollback = vim.api.nvim_get_option_value("scrollback", { buf = buf })
 				vim.api.nvim_set_option_value("scrollback", 1, { buf = buf })
 				vim.api.nvim_set_option_value("scrollback", -1, { buf = buf })
