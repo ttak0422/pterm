@@ -76,8 +76,9 @@ Neovim instance reclaims authority when that editor reports `FocusGained`.
 
 Other windows show the same canonical terminal screen: larger windows have
 padding, and smaller windows clip the view instead of rewrapping the application.
-The plugin uses an explicitly sized `--no-resize` bridge so Neovim's automatic
-largest-window terminal sizing cannot overwrite the active window's dimensions.
+The plugin sends explicit size-control requests and uses a `--no-resize` bridge
+so Neovim's automatic largest-window terminal sizing, including delayed bridge
+startup, cannot overwrite the active window's dimensions.
 Standalone CLI attachments retain their normal SIGWINCH behavior. Managed Neovim
 attachments require protocol version 2; restart an older daemon session before
 using this plugin version. Extremely large windows are capped at the daemon's

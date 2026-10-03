@@ -7,6 +7,7 @@ local stopped_jobs = {}
 local expected_socket_dir
 local expected_shell
 local last_command
+local last_terminal_command
 local resize_requests = {}
 local complete_resizes = true
 -- Selene allowances below cover deliberate Neovim function mocks and restoration.
@@ -17,6 +18,9 @@ end
 -- selene: allow(incorrect_standard_library_use)
 vim.fn.jobstart = function(cmd, opts)
 	last_command = cmd
+	if opts.term then
+		last_terminal_command = cmd
+	end
 	if expected_socket_dir then
 		assert(opts.env and opts.env.PTERM_SOCKET_DIR == expected_socket_dir, "job uses the wrong socket directory")
 		assert(opts.env.SHELL == expected_shell, "job ignores the configured shell")
@@ -204,7 +208,7 @@ check("focus chooses the active window rather than an arbitrary mirror", functio
 	pterm.setup({ auto_redraw = false })
 	pterm.open("active-window")
 	local first_win = vim.api.nvim_get_current_win()
-	local initial = last_command
+	local initial = last_terminal_command
 	assert(initial[4] == "--no-resize", "native SIGWINCH still controls the shared session")
 	assert(tonumber(initial[6]) == vim.api.nvim_win_get_width(first_win), "initial width is not explicit")
 	assert(tonumber(initial[8]) == vim.api.nvim_win_get_height(first_win), "initial height is not explicit")
@@ -355,23 +359,54 @@ pterm.detach("stale-size")
 settle_resizes()
 vim.cmd("silent! only")
 
+local real_window_width = vim.api.nvim_win_get_width
+local real_window_height = vim.api.nvim_win_get_height
 check("large window sizes stay inside the daemon resource limits", function()
-	local columns = vim.api.nvim_get_option_value("columns", {})
-	local lines = vim.api.nvim_get_option_value("lines", {})
-	vim.api.nvim_set_option_value("columns", 1000, {})
-	vim.api.nvim_set_option_value("lines", 400, {})
+	-- Headless 'columns'/'lines' changes need not resize the current window.
+	-- Exercise the dimension guard directly, independent of UI attachment.
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_get_width = function()
+		return 1000
+	end
+	-- selene: allow(incorrect_standard_library_use)
+	vim.api.nvim_win_get_height = function()
+		return 400
+	end
 	pterm.open("large-size")
-	assert(tonumber(last_command[6]) == 512, "initial width exceeds the daemon maximum")
-	assert(tonumber(last_command[8]) == 128, "initial dimensions exceed the cell budget")
+	assert(tonumber(last_terminal_command[6]) == 512, "initial width exceeds the daemon maximum")
+	assert(tonumber(last_terminal_command[8]) == 128, "initial dimensions exceed the cell budget")
 	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
 	settle_resizes()
 	local resize = resize_requests[#resize_requests]
 	assert(resize.cols == 512 and resize.rows == 128, "focused resize exceeds the daemon budget")
-	pterm.detach("large-size")
-	vim.api.nvim_set_option_value("columns", columns, {})
-	vim.api.nvim_set_option_value("lines", lines, {})
 end)
+-- selene: allow(incorrect_standard_library_use)
+vim.api.nvim_win_get_width = real_window_width
+-- selene: allow(incorrect_standard_library_use)
+vim.api.nvim_win_get_height = real_window_height
 pterm.detach("large-size")
+settle_resizes()
+
+check("startup resize failure retries without another focus event", function()
+	complete_resizes = false
+	pterm.open("startup-retry")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local count = #resize_requests
+	local failed = resize_requests[count]
+	assert(failed.session == "startup-retry", "initial retry request missing")
+	failed.on_exit(failed.job, 1, "exit")
+	assert(vim.wait(500, function()
+		return #resize_requests > count
+	end, 10), "failed resize was lost without a later focus event")
+	local retried = resize_requests[#resize_requests]
+	assert(retried.session == "startup-retry", "retry targeted another session")
+	assert(retried.cols == vim.api.nvim_win_get_width(0), "retry used stale dimensions")
+	retried.on_exit(retried.job, 0, "exit")
+	settle_resizes()
+end)
+complete_resizes = true
+pterm.detach("startup-retry")
 settle_resizes()
 
 check("managed history reset restores scrollback before acknowledging the bridge", function()

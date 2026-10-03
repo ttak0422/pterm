@@ -973,11 +973,15 @@ fn build_canonical_view(
         const HISTORY_BYTE_BUDGET: usize = pterm_proto::MAX_SERVER_PAYLOAD - 8 * 1024 * 1024;
         push_view_history(&mut out, screen, cols, view_rows, history_lines, HISTORY_BYTE_BUDGET);
     }
-    // Clear the physical viewport as well as painting the canonical subset,
-    // leaving deterministic blank padding in larger passive windows.
+    // Neovim sizes its terminal renderer to the largest window showing the
+    // buffer, but a shorter active window follows the bottom of that buffer.
+    // Bottom-align the canonical screen so that window sees every live row,
+    // leaving blank padding above it in taller passive windows. A physically
+    // smaller viewer retains the top-left crop; it never reflows the screen.
+    let row_offset = view_rows.saturating_sub(rows);
     out.push_str("\x1b[2J");
     for row in 0..rows.min(view_rows) {
-        let _ = write!(out, "\x1b[{};1H\x1b[2K", row + 1);
+        let _ = write!(out, "\x1b[{};1H\x1b[2K", row_offset + row + 1);
         push_view_row(&mut out, screen, row, cols);
     }
     // input_mode_formatted assumes defaults for mouse modes. Reset them
@@ -996,7 +1000,7 @@ fn build_canonical_view(
     bytes.extend_from_slice(
         format!(
             "\x1b[{};{}H{}",
-            cursor_row.min(view_rows - 1) + 1,
+            row_offset + cursor_row.min(rows - 1).min(view_rows - 1) + 1,
             cursor_col.min(view_cols - 1) + 1,
             if cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" }
         )
@@ -1731,7 +1735,7 @@ mod tests {
         source.process(b"abcdefgh\r\n12345678\r\nlast");
         for (rows, cols, expected) in [
             (2, 5, "abcde\n12345"),
-            (5, 12, "abcdefgh\n12345678\nlast"),
+            (5, 12, "\n\nabcdefgh\n12345678\nlast"),
         ] {
             let mut client = vt100::Parser::new(rows, cols, 100);
             for row in 1..=rows {
@@ -1752,19 +1756,71 @@ mod tests {
     }
 
     #[test]
+    fn canonical_view_bottom_aligns_rows_and_cursor_for_short_active_window() {
+        for alternate in [false, true] {
+            let mut source = vt100::Parser::new(3, 8, 100);
+            if alternate {
+                source.process(b"\x1b[?1049h");
+            }
+            source.process(b"top\x1b[2;1Hmiddle\x1b[3;1Hbottom\x1b[2;3H");
+            let mut client = vt100::Parser::new(7, 12, 100);
+            let mut previous_alternate = None;
+
+            // The shared physical renderer stays tall while the active
+            // horizontal split shrinks and grows. Neovim shows its last
+            // source_rows lines, so those must exactly match the live grid.
+            for source_rows in [3, 2, 5, 1, 3] {
+                source.screen_mut().set_size(source_rows, 8);
+                let offset = 7 - source_rows;
+                let mut expected = vec![String::new(); usize::from(offset)];
+                expected.extend(source.screen().rows(0, 8));
+                let (cursor_row, cursor_col) = source.screen().cursor_position();
+                client.process(&build_canonical_view(
+                    source.screen_mut(), 12, 7, previous_alternate, 0,
+                ));
+                previous_alternate = Some(alternate);
+
+                assert_eq!(client.screen().rows(0, 12).collect::<Vec<_>>(), expected);
+                assert_eq!(client.screen().cursor_position(), (offset + cursor_row, cursor_col.min(7)));
+                assert!(!client.screen().hide_cursor());
+                assert_eq!(client.screen().scrollback_rows(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_view_smaller_physical_view_crops_top_left_and_hides_clipped_cursor() {
+        let mut source = vt100::Parser::new(4, 8, 100);
+        source.process(b"top-left\x1b[2;1Hsecond\x1b[3;1Hthird\x1b[4;1Hbottom");
+        let mut client = vt100::Parser::new(2, 5, 100);
+        for (cursor, visible, position) in [
+            (b"\x1b[4;1H".as_slice(), false, (1, 0)),
+            (b"\x1b[1;8H".as_slice(), false, (0, 4)),
+            (b"\x1b[2;3H".as_slice(), true, (1, 2)),
+        ] {
+            source.process(cursor);
+            client.process(&build_canonical_view(source.screen_mut(), 5, 2, Some(false), 0));
+            assert_eq!(client.screen().rows(0, 5).collect::<Vec<_>>(), vec!["top-l", "secon"]);
+            assert_eq!(client.screen().cursor_position(), position);
+            assert_eq!(client.screen().hide_cursor(), !visible);
+            assert_eq!(client.screen().scrollback_rows(), 0);
+        }
+    }
+
+    #[test]
     fn canonical_view_archives_only_requested_rows_at_physical_height() {
         let mut source = vt100::Parser::new(2, 8, 100);
         source.process(b"one\r\ntwo\r\nthree\r\nfour");
         let mut client = vt100::Parser::new(5, 12, 100);
         client.process(&build_canonical_view(source.screen_mut(), 12, 5, None, usize::MAX));
-        assert_eq!(client.screen().contents(), "three\nfour");
+        assert_eq!(client.screen().contents(), "\n\n\nthree\nfour");
         assert_eq!(client.screen().scrollback_rows(), 2);
         assert_eq!(build_full_text(client.screen_mut()).lines().collect::<Vec<_>>(),
-            vec!["one", "two", "three", "four", "", ""]);
+            vec!["one", "two", "", "", "", "three", "four"]);
         source.process(b"\r\nfive");
         client.process(&build_canonical_view(source.screen_mut(), 12, 5, Some(false), 1));
         assert_eq!(client.screen().scrollback_rows(), 3);
-        assert_eq!(client.screen().contents(), "four\nfive");
+        assert_eq!(client.screen().contents(), "\n\n\nfour\nfive");
         client.process(&build_canonical_view(source.screen_mut(), 12, 5, Some(false), 0));
         assert_eq!(client.screen().scrollback_rows(), 3);
     }
@@ -1799,7 +1855,7 @@ mod tests {
         source.process(b"\x1b[?1049l");
         client.process(&build_canonical_view(source.screen_mut(), 10, 3, Some(true), 0));
         assert!(!client.screen().alternate_screen());
-        assert_eq!(client.screen().contents(), "two\nthree");
+        assert_eq!(client.screen().contents(), "\ntwo\nthree");
         assert_eq!(client.screen().scrollback_rows(), 1);
         client.screen_mut().set_scrollback(1);
         assert_eq!(client.screen().rows(0, 10).next().as_deref(), Some("one"));

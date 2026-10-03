@@ -120,8 +120,25 @@ local function flush_resize(session_name, conn)
 				end
 				conn.resize_job = nil
 				if exit_code ~= 0 then
-					-- A failed command must not suppress the next layout retry.
 					conn.last_size = nil
+					conn.resize_failures = (conn.resize_failures or 0) + 1
+					-- The daemon socket may not exist yet during `pterm open`.
+					-- Retry briefly without requiring another focus/layout event.
+					if conn.resize_failures <= 3 then
+						vim.defer_fn(function()
+							if connections[session_name] ~= conn or conn.resize_job then
+								return
+							end
+							local current = vim.api.nvim_get_current_win()
+							if editor_focused and vim.api.nvim_win_get_buf(current) == conn.buf then
+								conn.pending_size = window_size(current)
+								flush_resize(session_name, conn)
+							end
+						end, 50 * 2 ^ (conn.resize_failures - 1))
+						return
+					end
+				else
+					conn.resize_failures = 0
 				end
 				flush_resize(session_name, conn)
 			end)
@@ -152,6 +169,7 @@ local function resize_active_window(session_name, force)
 		return
 	end
 	conn.pending_size = size
+	conn.resize_failures = 0
 	if conn.resize_scheduled then
 		return
 	end
@@ -561,6 +579,9 @@ local function start_terminal(session_name, cmd)
 		end,
 	})
 
+	-- Explicit control requests are the only source of managed size authority,
+	-- including first attach. The bridge must never race this with stale sizes.
+	resize_active_window(session_name, true)
 	vim.cmd("startinsert")
 end
 

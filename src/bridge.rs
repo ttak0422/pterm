@@ -280,8 +280,13 @@ pub fn run(
                     &proto::encode_resize(view_cols, view_rows)));
             }
         }
-        let resize_payload = proto::encode_resize(cols, rows);
-        msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
+        // Managed Neovim clients claim authority through SET_SIZE after the
+        // plugin has registered the connection. An independently delayed
+        // initial RESIZE here could overwrite a newer focus request.
+        if propagate_resize {
+            let resize_payload = proto::encode_resize(cols, rows);
+            msg.extend_from_slice(&proto::encode(proto::client::RESIZE, &resize_payload));
+        }
         send_buf.push(&msg);
     }
 

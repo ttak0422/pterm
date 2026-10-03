@@ -239,7 +239,11 @@ local ok, err = xpcall(function()
 	vim.fn.chansend(job, "normal\n")
 	expect_history(buf, true)
 	local first_line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
-	assert(first_line == "", "history reset did not preserve its single blank sentinel")
+	-- ED3-capable Neovim clears the sentinel; older versions retain it.
+	assert(
+		first_line == "" or (first_line and first_line:find("HISTORY-0001:", 1, true) == 1),
+		"history reset retained unexpected stale content before the first history row"
+	)
 	assert(
 		vim.api.nvim_get_option_value("scrollback", { buf = buf }) == 10000,
 		"alternate return changed user's history limit"

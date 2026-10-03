@@ -107,6 +107,8 @@
             neovim = pkgs.runCommand "pterm-neovim-regressions" {
               nativeBuildInputs = [
                 pkgs.neovim
+                pkgs.git
+                pkgs.tig
                 pterm-daemon
               ];
             } ''
@@ -114,6 +116,7 @@
               cd ${./.}
               nvim --headless -u NONE -l tests/neovim_regressions.lua
               nvim --headless -u NONE -l tests/neovim_resize_regressions.lua
+              nvim --headless -u NONE -l tests/neovim_tig_regressions.lua
               touch "$out"
             '';
           };

@@ -320,7 +320,18 @@ fn cmd_resize(args: &[String]) -> io::Result<()> {
     let options = parse_attach_options(args)?;
     let (cols, rows) = options.cols.zip(options.rows).ok_or_else(||
         io::Error::new(io::ErrorKind::InvalidInput, "resize requires --cols and --rows"))?;
-    let mut stream = std::os::unix::net::UnixStream::connect(session_socket_path(&options.name)?)?;
+    let socket_path = session_socket_path(&options.name)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(stream) => break stream,
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+                && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let payload = pterm_proto::encode_resize(cols, rows);
     stream.write_all(&pterm_proto::encode(pterm_proto::client::SET_SIZE, &payload))?;
     // Broadcast snapshots may precede our request under active PTY output.
