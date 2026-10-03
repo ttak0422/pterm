@@ -104,21 +104,24 @@
               cargoTestOptions = opts: opts ++ [ "--workspace" ];
             };
             clippy = buildPackage { mode = "clippy"; };
-            neovim = pkgs.runCommand "pterm-neovim-regressions" {
-              nativeBuildInputs = [
-                pkgs.neovim
-                pkgs.git
-                pkgs.tig
-                pterm-daemon
-              ];
-            } ''
-              export NVIM_LOG_FILE="$TMPDIR/nvim.log"
-              cd ${./.}
-              nvim --headless -u NONE -l tests/neovim_regressions.lua
-              nvim --headless -u NONE -l tests/neovim_resize_regressions.lua
-              nvim --headless -u NONE -l tests/neovim_tig_regressions.lua
-              touch "$out"
-            '';
+            neovim =
+              pkgs.runCommand "pterm-neovim-regressions"
+                {
+                  nativeBuildInputs = [
+                    pkgs.neovim
+                    pkgs.git
+                    pkgs.tig
+                    pterm-daemon
+                  ];
+                }
+                ''
+                  export NVIM_LOG_FILE="$TMPDIR/nvim.log"
+                  cd ${./.}
+                  nvim --headless -u NONE -l tests/neovim_regressions.lua
+                  nvim --headless -u NONE -l tests/neovim_resize_regressions.lua
+                  nvim --headless -u NONE -l tests/neovim_tig_regressions.lua
+                  touch "$out"
+                '';
           };
 
           apps = import ./nix/apps {

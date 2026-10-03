@@ -922,7 +922,7 @@ fn push_view_history(
         push_view_row(&mut row, screen, 0, cols);
         // The top row is exactly what should be archived. LF at the physical
         // bottom scrolls it out independently of the canonical screen height.
-        let _ = write!(row, "\x1b[{};1H\n", view_rows);
+        let _ = writeln!(row, "\x1b[{};1H", view_rows);
         if row.len() > max_bytes.saturating_sub(bytes) {
             break;
         }
@@ -959,7 +959,11 @@ fn build_canonical_view(
             }
         }
         Some(previous) if previous != alternate => {
-            out.push_str(if alternate { "\x1b[?1049h" } else { "\x1b[?1049l" });
+            out.push_str(if alternate {
+                "\x1b[?1049h"
+            } else {
+                "\x1b[?1049l"
+            });
         }
         Some(_) => {}
     }
@@ -971,7 +975,14 @@ fn build_canonical_view(
         // The bounded 65,536-cell screen needs < 8 MiB even with per-cell
         // RGB/attribute changes and the maximum combining-character bytes.
         const HISTORY_BYTE_BUDGET: usize = pterm_proto::MAX_SERVER_PAYLOAD - 8 * 1024 * 1024;
-        push_view_history(&mut out, screen, cols, view_rows, history_lines, HISTORY_BYTE_BUDGET);
+        push_view_history(
+            &mut out,
+            screen,
+            cols,
+            view_rows,
+            history_lines,
+            HISTORY_BYTE_BUDGET,
+        );
     }
     // Neovim sizes its terminal renderer to the largest window showing the
     // buffer, but a shorter active window follows the bottom of that buffer.
@@ -994,15 +1005,17 @@ fn build_canonical_view(
     // A view cursor must only position, and must stay inside its viewport.
     let (cursor_row, cursor_col) = screen.cursor_position();
     let cursor_col = cursor_col.min(screen.size().1.saturating_sub(1));
-    let cursor_visible = !screen.hide_cursor()
-        && cursor_row < view_rows
-        && cursor_col < view_cols;
+    let cursor_visible = !screen.hide_cursor() && cursor_row < view_rows && cursor_col < view_cols;
     bytes.extend_from_slice(
         format!(
             "\x1b[{};{}H{}",
             row_offset + cursor_row.min(rows - 1).min(view_rows - 1) + 1,
             cursor_col.min(view_cols - 1) + 1,
-            if cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" }
+            if cursor_visible {
+                "\x1b[?25h"
+            } else {
+                "\x1b[?25l"
+            }
         )
         .as_bytes(),
     );
@@ -1033,9 +1046,12 @@ fn append_canonical_tracked_state(
     } else {
         b"\x1b[?1004l"
     });
-    if let Some(blink) = callbacks.passthrough_sequences.iter().rev().find(|seq| {
-        seq.as_slice() == b"\x1b[?12h" || seq.as_slice() == b"\x1b[?12l"
-    }) {
+    if let Some(blink) = callbacks
+        .passthrough_sequences
+        .iter()
+        .rev()
+        .find(|seq| seq.as_slice() == b"\x1b[?12h" || seq.as_slice() == b"\x1b[?12l")
+    {
         out.extend_from_slice(blink);
     }
     if let Some(shape) = callbacks.cursor_shape {
@@ -1225,16 +1241,24 @@ impl vt100::Callbacks for SessionCallbacks {
                     // following output in this read advances it. Pending wrap
                     // is reported at the last real cell, never width + 1.
                     let (row, col) = screen.cursor_position();
-                    let response = format!("\x1b[{}{};{}R",
-                        if i1.is_some() { "?" } else { "" }, row + 1,
-                        col.min(screen.size().1 - 1) + 1);
+                    let response = format!(
+                        "\x1b[{}{};{}R",
+                        if i1.is_some() { "?" } else { "" },
+                        row + 1,
+                        col.min(screen.size().1 - 1) + 1
+                    );
                     self.push_terminal_response(response.as_bytes());
                     return;
                 }
                 _ => {}
             }
         }
-        if single_param && i1.is_none() && i2.is_none() && c == 't' && Self::first_param(params) == Some(18) {
+        if single_param
+            && i1.is_none()
+            && i2.is_none()
+            && c == 't'
+            && Self::first_param(params) == Some(18)
+        {
             let (rows, cols) = screen.size();
             self.push_terminal_response(format!("\x1b[8;{};{}t", rows, cols).as_bytes());
             return;
@@ -1321,9 +1345,12 @@ impl vt100::Callbacks for SessionCallbacks {
             // Preserve non-rendering color changes once. Never forward
             // arbitrary OSC commands: OSC 51 is the bridge/plugin control
             // channel and must not be spoofable by application output.
-            if params.first().is_some_and(|code| matches!(*code,
-                b"4" | b"10" | b"11" | b"12" | b"104" | b"110" | b"111" | b"112"))
-            {
+            if params.first().is_some_and(|code| {
+                matches!(
+                    *code,
+                    b"4" | b"10" | b"11" | b"12" | b"104" | b"110" | b"111" | b"112"
+                )
+            }) {
                 self.push_canonical_event(&sequence);
             }
             self.push_passthrough_sequence(sequence);
@@ -1429,13 +1456,17 @@ impl TerminalOutputFilter {
         }
         let params = &seq[2..seq.len() - 1];
         let numeric = |params: &[u8]| -> Option<u16> {
-            if params.is_empty() || !params.iter().all(u8::is_ascii_digit) { return None; }
+            if params.is_empty() || !params.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
             std::str::from_utf8(params).ok()?.parse().ok()
         };
         match seq.last() {
             Some(b'c') => matches!(params, b"" | b"0" | b">" | b">0"),
-            Some(b'n') => matches!(numeric(params), Some(5 | 6))
-                || params.strip_prefix(b"?").and_then(numeric) == Some(6),
+            Some(b'n') => {
+                matches!(numeric(params), Some(5 | 6))
+                    || params.strip_prefix(b"?").and_then(numeric) == Some(6)
+            }
             Some(b't') => numeric(params) == Some(18),
             _ => false,
         }
@@ -1551,7 +1582,11 @@ impl Session {
 
     pub fn canonical_view_state(&self) -> (u64, u64, bool) {
         let screen = self.parser.screen();
-        (screen.scrollback_generation(), screen.reset_generation(), screen.alternate_screen())
+        (
+            screen.scrollback_generation(),
+            screen.reset_generation(),
+            screen.alternate_screen(),
+        )
     }
 
     pub fn canonical_view(
@@ -1646,8 +1681,8 @@ impl Session {
 mod tests {
     use super::{
         append_canonical_tracked_state, build_canonical_view, build_full_text, build_history,
-        build_snapshot, build_snapshot_ansi, build_snapshot_text, dump_screen, BytesDump,
-        push_view_history, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
+        build_snapshot, build_snapshot_ansi, build_snapshot_text, dump_screen, push_view_history,
+        BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
@@ -1693,7 +1728,9 @@ mod tests {
     #[test]
     fn canonical_bells_and_clipboard_are_one_shot_and_unknown_osc_is_not_forwarded() {
         let mut parser = vt100::Parser::new_with_callbacks(4, 8, 100, SessionCallbacks::default());
-        parser.process(b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]1337;Custom=1\x07");
+        parser.process(
+            b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]1337;Custom=1\x07",
+        );
         let events = std::mem::take(&mut parser.callbacks_mut().canonical_events);
         assert_eq!(events, b"\x07\x1bg\x1b]52;c;SGVsbG8=\x1b\\");
         let mut view = build_canonical_view(parser.screen_mut(), 8, 4, None, 0);
@@ -1710,10 +1747,17 @@ mod tests {
         let mut callbacks = SessionCallbacks::default();
         callbacks.push_canonical_event(&vec![b'x'; SessionCallbacks::MAX_CANONICAL_EVENT_BYTES]);
         callbacks.push_canonical_event(b"overflow");
-        assert_eq!(callbacks.canonical_events.len(), SessionCallbacks::MAX_CANONICAL_EVENT_BYTES);
-        callbacks.push_terminal_response(&vec![b'x'; SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES]);
+        assert_eq!(
+            callbacks.canonical_events.len(),
+            SessionCallbacks::MAX_CANONICAL_EVENT_BYTES
+        );
+        callbacks
+            .push_terminal_response(&vec![b'x'; SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES]);
         callbacks.push_terminal_response(b"overflow");
-        assert_eq!(callbacks.terminal_responses.len(), SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES);
+        assert_eq!(
+            callbacks.terminal_responses.len(),
+            SessionCallbacks::MAX_TERMINAL_RESPONSE_BYTES
+        );
     }
 
     #[test]
@@ -1739,14 +1783,20 @@ mod tests {
         ] {
             let mut client = vt100::Parser::new(rows, cols, 100);
             for row in 1..=rows {
-                client.process(format!("\x1b[{};1H{}", row, "x".repeat(usize::from(cols))).as_bytes());
+                client.process(
+                    format!("\x1b[{};1H{}", row, "x".repeat(usize::from(cols))).as_bytes(),
+                );
             }
             let view = build_canonical_view(source.screen_mut(), cols, rows, None, 0);
             client.process(&view);
             assert_eq!(client.screen().contents(), expected);
             for _ in 0..4 {
                 client.process(&build_canonical_view(
-                    source.screen_mut(), cols, rows, Some(false), 0,
+                    source.screen_mut(),
+                    cols,
+                    rows,
+                    Some(false),
+                    0,
                 ));
             }
             assert_eq!(client.screen().contents(), expected);
@@ -1776,12 +1826,19 @@ mod tests {
                 expected.extend(source.screen().rows(0, 8));
                 let (cursor_row, cursor_col) = source.screen().cursor_position();
                 client.process(&build_canonical_view(
-                    source.screen_mut(), 12, 7, previous_alternate, 0,
+                    source.screen_mut(),
+                    12,
+                    7,
+                    previous_alternate,
+                    0,
                 ));
                 previous_alternate = Some(alternate);
 
                 assert_eq!(client.screen().rows(0, 12).collect::<Vec<_>>(), expected);
-                assert_eq!(client.screen().cursor_position(), (offset + cursor_row, cursor_col.min(7)));
+                assert_eq!(
+                    client.screen().cursor_position(),
+                    (offset + cursor_row, cursor_col.min(7))
+                );
                 assert!(!client.screen().hide_cursor());
                 assert_eq!(client.screen().scrollback_rows(), 0);
             }
@@ -1799,8 +1856,17 @@ mod tests {
             (b"\x1b[2;3H".as_slice(), true, (1, 2)),
         ] {
             source.process(cursor);
-            client.process(&build_canonical_view(source.screen_mut(), 5, 2, Some(false), 0));
-            assert_eq!(client.screen().rows(0, 5).collect::<Vec<_>>(), vec!["top-l", "secon"]);
+            client.process(&build_canonical_view(
+                source.screen_mut(),
+                5,
+                2,
+                Some(false),
+                0,
+            ));
+            assert_eq!(
+                client.screen().rows(0, 5).collect::<Vec<_>>(),
+                vec!["top-l", "secon"]
+            );
             assert_eq!(client.screen().cursor_position(), position);
             assert_eq!(client.screen().hide_cursor(), !visible);
             assert_eq!(client.screen().scrollback_rows(), 0);
@@ -1812,16 +1878,38 @@ mod tests {
         let mut source = vt100::Parser::new(2, 8, 100);
         source.process(b"one\r\ntwo\r\nthree\r\nfour");
         let mut client = vt100::Parser::new(5, 12, 100);
-        client.process(&build_canonical_view(source.screen_mut(), 12, 5, None, usize::MAX));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            None,
+            usize::MAX,
+        ));
         assert_eq!(client.screen().contents(), "\n\n\nthree\nfour");
         assert_eq!(client.screen().scrollback_rows(), 2);
-        assert_eq!(build_full_text(client.screen_mut()).lines().collect::<Vec<_>>(),
-            vec!["one", "two", "", "", "", "three", "four"]);
+        assert_eq!(
+            build_full_text(client.screen_mut())
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "", "", "", "three", "four"]
+        );
         source.process(b"\r\nfive");
-        client.process(&build_canonical_view(source.screen_mut(), 12, 5, Some(false), 1));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            Some(false),
+            1,
+        ));
         assert_eq!(client.screen().scrollback_rows(), 3);
         assert_eq!(client.screen().contents(), "\n\n\nfour\nfive");
-        client.process(&build_canonical_view(source.screen_mut(), 12, 5, Some(false), 0));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            Some(false),
+            0,
+        ));
         assert_eq!(client.screen().scrollback_rows(), 3);
     }
 
@@ -1845,15 +1933,33 @@ mod tests {
         let mut source = vt100::Parser::new(2, 8, 100);
         source.process(b"one\r\ntwo\r\nthree");
         let mut client = vt100::Parser::new(3, 10, 100);
-        client.process(&build_canonical_view(source.screen_mut(), 10, 3, None, usize::MAX));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            None,
+            usize::MAX,
+        ));
         source.process(b"\x1b[?1049halt");
-        client.process(&build_canonical_view(source.screen_mut(), 10, 3, Some(false), 0));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            Some(false),
+            0,
+        ));
         assert!(client.screen().alternate_screen());
         let update = build_canonical_view(source.screen_mut(), 10, 3, Some(true), 0);
         assert!(!String::from_utf8_lossy(&update).contains("?1049"));
         client.process(&update);
         source.process(b"\x1b[?1049l");
-        client.process(&build_canonical_view(source.screen_mut(), 10, 3, Some(true), 0));
+        client.process(&build_canonical_view(
+            source.screen_mut(),
+            10,
+            3,
+            Some(true),
+            0,
+        ));
         assert!(!client.screen().alternate_screen());
         assert_eq!(client.screen().contents(), "\ntwo\nthree");
         assert_eq!(client.screen().scrollback_rows(), 1);
@@ -2593,8 +2699,14 @@ mod tests {
         assert!(snapshot_str.contains("\x1b[14t"));
         assert!(snapshot_str.contains("\x1b[16t"));
         assert!(!snapshot_str.contains("\x1b[18t"));
-        assert_eq!(parser.callbacks().terminal_responses,
-            format!("\x1b[8;{};{}t", DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS).as_bytes());
+        assert_eq!(
+            parser.callbacks().terminal_responses,
+            format!(
+                "\x1b[8;{};{}t",
+                DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS
+            )
+            .as_bytes()
+        );
     }
 
     #[test]

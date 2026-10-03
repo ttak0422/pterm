@@ -133,7 +133,12 @@ impl Cell {
     /// marks do not change the width of their leading character.
     #[must_use]
     pub fn natural_width(&self) -> u16 {
-        self.contents().chars().next().and_then(|c| c.width()).unwrap_or(1).max(1) as u16
+        self.contents()
+            .chars()
+            .next()
+            .and_then(|c| c.width())
+            .unwrap_or(1)
+            .max(1) as u16
     }
 
     pub(crate) fn attrs(&self) -> &crate::attrs::Attrs {

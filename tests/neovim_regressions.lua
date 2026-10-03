@@ -387,6 +387,27 @@ vim.api.nvim_win_get_height = real_window_height
 pterm.detach("large-size")
 settle_resizes()
 
+check("focus loss cancels an in-flight resize controller", function()
+	complete_resizes = false
+	pterm.open("cancel-resize")
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	settle_resizes()
+	local count = #resize_requests
+	local pending = resize_requests[count]
+	assert(pending.session == "cancel-resize", "resize request missing")
+	vim.api.nvim_exec_autocmds("FocusLost", { modeline = false })
+	assert(stopped_jobs[pending.job], "unfocused resize process was left running")
+	pending.on_exit(pending.job, 143, "exit")
+	vim.wait(100)
+	assert(#resize_requests == count, "cancelled controller retried after focus loss")
+	complete_resizes = true
+	vim.api.nvim_exec_autocmds("FocusGained", { modeline = false })
+	expect_current_size("cancel-resize")
+end)
+complete_resizes = true
+pterm.detach("cancel-resize")
+settle_resizes()
+
 check("startup resize failure retries without another focus event", function()
 	complete_resizes = false
 	pterm.open("startup-retry")
@@ -396,9 +417,12 @@ check("startup resize failure retries without another focus event", function()
 	local failed = resize_requests[count]
 	assert(failed.session == "startup-retry", "initial retry request missing")
 	failed.on_exit(failed.job, 1, "exit")
-	assert(vim.wait(500, function()
-		return #resize_requests > count
-	end, 10), "failed resize was lost without a later focus event")
+	assert(
+		vim.wait(500, function()
+			return #resize_requests > count
+		end, 10),
+		"failed resize was lost without a later focus event"
+	)
 	local retried = resize_requests[#resize_requests]
 	assert(retried.session == "startup-retry", "retry targeted another session")
 	assert(retried.cols == vim.api.nvim_win_get_width(0), "retry used stale dimensions")

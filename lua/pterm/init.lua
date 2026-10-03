@@ -192,6 +192,14 @@ local function initialize_focus_autocmds()
 		group = group,
 		callback = function()
 			editor_focused = false
+			for _, conn in pairs(connections) do
+				conn.pending_size = nil
+				local resize_job = conn.resize_job
+				conn.resize_job = nil
+				if resize_job then
+					pcall(vim.fn.jobstop, resize_job)
+				end
+			end
 		end,
 	})
 	vim.api.nvim_create_autocmd("FocusGained", {

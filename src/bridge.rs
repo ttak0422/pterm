@@ -73,8 +73,9 @@ struct HistoryReset {
 
 impl HistoryReset {
     fn queue_view(&mut self, payload: &[u8], output: &mut SendQueue) -> io::Result<()> {
-        let (&flags, bytes) = payload.split_first().ok_or_else(||
-            io::Error::new(io::ErrorKind::InvalidData, "empty canonical view"))?;
+        let (&flags, bytes) = payload
+            .split_first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty canonical view"))?;
         if flags & 1 != 0 {
             self.pending.clear();
             if self.deadline.is_none() {
@@ -87,12 +88,17 @@ impl HistoryReset {
     }
 
     fn queue_bytes(&mut self, bytes: &[u8], output: &mut SendQueue) {
-        if self.deadline.is_some() { self.pending.extend_from_slice(bytes); }
-        else { output.push(bytes); }
+        if self.deadline.is_some() {
+            self.pending.extend_from_slice(bytes);
+        } else {
+            output.push(bytes);
+        }
     }
 
     fn input(&mut self, input: &[u8], output: &mut SendQueue) -> Vec<u8> {
-        if self.deadline.is_none() { return input.to_vec(); }
+        if self.deadline.is_none() {
+            return input.to_vec();
+        }
         let mut forwarded = Vec::new();
         for &byte in input {
             if self.deadline.is_none() {
@@ -270,14 +276,20 @@ pub fn run(
         // HELLO must precede RESIZE in a single write so the daemon records
         // the handshake before queueing the initial snapshot.
         let flags = proto::hello_flags::REQUEST_HISTORY
-            | if propagate_resize { 0 } else { proto::hello_flags::CANONICAL_VIEW };
+            | if propagate_resize {
+                0
+            } else {
+                proto::hello_flags::CANONICAL_VIEW
+            };
         let hello_payload = proto::encode_hello(proto::PROTO_VERSION, flags);
         let mut msg = proto::encode(proto::client::HELLO, &hello_payload);
         if !propagate_resize {
             let (view_cols, view_rows) = get_winsize(stdout_fd).unwrap_or((cols, rows));
             if view_cols > 0 && view_rows > 0 {
-                msg.extend_from_slice(&proto::encode(proto::client::VIEW_SIZE,
-                    &proto::encode_resize(view_cols, view_rows)));
+                msg.extend_from_slice(&proto::encode(
+                    proto::client::VIEW_SIZE,
+                    &proto::encode_resize(view_cols, view_rows),
+                ));
             }
         }
         // Managed Neovim clients claim authority through SET_SIZE after the
@@ -303,15 +315,24 @@ pub fn run(
     let mut socket_open = true;
     let mut cleanup_queued = false;
     loop {
-        if history_reset.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut,
-                "Neovim did not acknowledge the scrollback reset"));
+        if history_reset
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Neovim did not acknowledge the scrollback reset",
+            ));
         }
         if !running && history_reset.deadline.is_none() && !cleanup_queued {
             output.push(DETACH_CLEANUP_SEQUENCES);
             cleanup_queued = true;
         }
-        if !running && history_reset.deadline.is_none() && output.is_empty() && (!socket_open || send_buf.is_empty()) {
+        if !running
+            && history_reset.deadline.is_none()
+            && output.is_empty()
+            && (!socket_open || send_buf.is_empty())
+        {
             break;
         }
 
@@ -324,7 +345,8 @@ pub fn run(
             poll_fd(
                 stdin_fd,
                 if (running || history_reset.deadline.is_some())
-                    && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES {
+                    && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES
+                {
                     libc::POLLIN
                 } else {
                     0
@@ -346,7 +368,11 @@ pub fn run(
             poll_fd(wake_read.as_raw_fd(), libc::POLLIN),
             poll_fd(stdout_fd, if output.is_empty() { 0 } else { libc::POLLOUT }),
         ];
-        let timeout = if history_reset.deadline.is_some() { 100 } else { -1 };
+        let timeout = if history_reset.deadline.is_some() {
+            100
+        } else {
+            -1
+        };
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -366,7 +392,7 @@ pub fn run(
                     if !input.is_empty() {
                         send_buf.push(&proto::encode(proto::client::INPUT, &input));
                     }
-                },
+                }
                 Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -496,8 +522,11 @@ pub fn run(
                 if let Ok((cols, rows)) = get_winsize(stdout_fd) {
                     if cols > 0 && rows > 0 {
                         let payload = proto::encode_resize(cols, rows);
-                        let kind = if propagate_resize { proto::client::RESIZE }
-                            else { proto::client::VIEW_SIZE };
+                        let kind = if propagate_resize {
+                            proto::client::RESIZE
+                        } else {
+                            proto::client::VIEW_SIZE
+                        };
                         send_buf.push(&proto::encode(kind, &payload));
                     }
                 }
@@ -602,7 +631,12 @@ mod history_reset_tests {
 
     fn drain(queue: &mut SendQueue) -> Vec<u8> {
         let mut bytes = Vec::new();
-        queue.write_with(|part| { bytes.extend_from_slice(part); Ok(part.len()) }).unwrap();
+        queue
+            .write_with(|part| {
+                bytes.extend_from_slice(part);
+                Ok(part.len())
+            })
+            .unwrap();
         bytes
     }
 

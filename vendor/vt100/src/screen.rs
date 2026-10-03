@@ -109,20 +109,28 @@ impl Screen {
     /// This is independent of the archive counter, so consumers can detect a
     /// reset even if one input batch immediately fills fresh scrollback.
     #[must_use]
-    pub fn reset_generation(&self) -> u64 { self.reset_generation }
+    pub fn reset_generation(&self) -> u64 {
+        self.reset_generation
+    }
 
     /// Number of primary-buffer rows archived by output. Resizing does not
     /// advance this counter; consumers must reset their baseline after resize.
     #[must_use]
-    pub fn scrollback_generation(&self) -> u64 { self.grid.scrollback_generation() }
+    pub fn scrollback_generation(&self) -> u64 {
+        self.grid.scrollback_generation()
+    }
 
     /// Number of physical rows currently available in primary-buffer history.
     #[must_use]
-    pub fn scrollback_rows(&self) -> usize { self.grid.scrollback_rows() }
+    pub fn scrollback_rows(&self) -> usize {
+        self.grid.scrollback_rows()
+    }
 
     /// Returns whether DEC automatic wrapping (DECAWM, private mode 7) is enabled.
     #[must_use]
-    pub fn autowrap(&self) -> bool { self.mode(MODE_AUTOWRAP) }
+    pub fn autowrap(&self) -> bool {
+        self.mode(MODE_AUTOWRAP)
+    }
 
     /// Returns the current size of the terminal.
     ///
@@ -260,7 +268,11 @@ impl Screen {
         let mut contents = b"\x1b[?7h".to_vec();
         self.write_contents_formatted(&mut contents);
         self.write_input_mode_formatted(&mut contents);
-        contents.extend_from_slice(if self.autowrap() { b"\x1b[?7h" } else { b"\x1b[?7l" });
+        contents.extend_from_slice(if self.autowrap() {
+            b"\x1b[?7h"
+        } else {
+            b"\x1b[?7l"
+        });
         contents
     }
 
@@ -274,10 +286,16 @@ impl Screen {
         // Enabling wrapping cancels the no-wrap right-margin sentinel.
         // Match that cursor position when calculating relative cell updates.
         let mut previous = prev.clone();
-        if !previous.autowrap() { previous.grid_mut().cancel_pending_wrap(); }
+        if !previous.autowrap() {
+            previous.grid_mut().cancel_pending_wrap();
+        }
         self.write_contents_diff(&mut contents, &previous);
         self.write_input_mode_diff(&mut contents, prev);
-        contents.extend_from_slice(if self.autowrap() { b"\x1b[?7h" } else { b"\x1b[?7l" });
+        contents.extend_from_slice(if self.autowrap() {
+            b"\x1b[?7h"
+        } else {
+            b"\x1b[?7l"
+        });
         contents
     }
 
@@ -529,7 +547,14 @@ impl Screen {
     #[must_use]
     pub fn cursor_position(&self) -> (u16, u16) {
         let pos = self.grid().pos();
-        (pos.row, if self.autowrap() { pos.col } else { pos.col.min(self.grid().size().cols - 1) })
+        (
+            pos.row,
+            if self.autowrap() {
+                pos.col
+            } else {
+                pos.col.min(self.grid().size().cols - 1)
+            },
+        )
     }
 
     /// Returns terminal escape sequences sufficient to set the current
@@ -708,8 +733,11 @@ impl Screen {
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
-        if self.saved_autowrap { self.set_mode(MODE_AUTOWRAP); }
-        else { self.clear_mode(MODE_AUTOWRAP); }
+        if self.saved_autowrap {
+            self.set_mode(MODE_AUTOWRAP);
+        } else {
+            self.clear_mode(MODE_AUTOWRAP);
+        }
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -791,10 +819,15 @@ impl Screen {
                 wrap = true;
             } else if width == 2 && pos.col == size.cols - 1 {
                 wrap = true;
-                self.grid_mut().drawing_row_mut(pos.row).unwrap().set_reflow_padding(1);
+                self.grid_mut()
+                    .drawing_row_mut(pos.row)
+                    .unwrap()
+                    .set_reflow_padding(1);
             }
         }
-        if self.autowrap() { self.grid_mut().col_wrap(width, wrap); }
+        if self.autowrap() {
+            self.grid_mut().col_wrap(width, wrap);
+        }
         let pos = self.grid().pos();
 
         if width == 0 {
@@ -1201,7 +1234,9 @@ impl Screen {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(true),
                 [7] => {
-                    if !self.autowrap() { self.grid_mut().cancel_pending_wrap(); }
+                    if !self.autowrap() {
+                        self.grid_mut().cancel_pending_wrap();
+                    }
                     self.set_mode(MODE_AUTOWRAP);
                 }
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),

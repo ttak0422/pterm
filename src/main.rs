@@ -257,19 +257,30 @@ fn parse_attach_options(args: &[String]) -> io::Result<AttachOptions> {
                     i += 1;
                     options.name = args.get(i).cloned().unwrap_or_default();
                 }
-                options.command.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+                options
+                    .command
+                    .extend_from_slice(args.get(i + 1..).unwrap_or_default());
                 break;
             }
             "--no-resize" => options.no_resize = true,
             "--cols" | "--rows" => {
                 let flag = &args[i];
                 i += 1;
-                let value = args.get(i).and_then(|s| s.parse::<u16>().ok())
+                let value = args
+                    .get(i)
+                    .and_then(|s| s.parse::<u16>().ok())
                     .filter(|&n| n != 0)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
-                        format!("{flag} requires a positive integer")))?;
-                if flag == "--cols" { options.cols = Some(value); }
-                else { options.rows = Some(value); }
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{flag} requires a positive integer"),
+                        )
+                    })?;
+                if flag == "--cols" {
+                    options.cols = Some(value);
+                } else {
+                    options.rows = Some(value);
+                }
             }
             _ if options.name.is_empty() => options.name = args[i].clone(),
             _ => {
@@ -281,14 +292,25 @@ fn parse_attach_options(args: &[String]) -> io::Result<AttachOptions> {
         i += 1;
     }
     if options.name.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "session name required"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name required",
+        ));
     }
-    if options.cols.is_some_and(|n| n > constants::MAX_TERMINAL_COLS)
-        || options.rows.is_some_and(|n| n > constants::MAX_TERMINAL_ROWS)
-        || options.cols.zip(options.rows).is_some_and(|(cols, rows)|
-            usize::from(cols) * usize::from(rows) > constants::MAX_TERMINAL_CELLS)
+    if options
+        .cols
+        .is_some_and(|n| n > constants::MAX_TERMINAL_COLS)
+        || options
+            .rows
+            .is_some_and(|n| n > constants::MAX_TERMINAL_ROWS)
+        || options.cols.zip(options.rows).is_some_and(|(cols, rows)| {
+            usize::from(cols) * usize::from(rows) > constants::MAX_TERMINAL_CELLS
+        })
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "terminal dimensions exceed the supported limits"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal dimensions exceed the supported limits",
+        ));
     }
     Ok(options)
 }
@@ -307,9 +329,18 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
         let mut new_args = vec![options.name.clone(), "--".to_string()];
         new_args.extend(options.command);
         cmd_new(&new_args, true)?;
-        if !wait_for_socket(&sock, Duration::from_millis(3000), Duration::from_millis(50))? {
-            return Err(io::Error::new(io::ErrorKind::TimedOut,
-                format!("session '{}' was created but socket did not appear in time", options.name)));
+        if !wait_for_socket(
+            &sock,
+            Duration::from_millis(3000),
+            Duration::from_millis(50),
+        )? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "session '{}' was created but socket did not appear in time",
+                    options.name
+                ),
+            ));
         }
     }
     let exit_code = bridge::run(&sock, options.cols, options.rows, !options.no_resize)?;
@@ -318,28 +349,46 @@ fn cmd_open(args: &[String]) -> io::Result<()> {
 
 fn cmd_resize(args: &[String]) -> io::Result<()> {
     let options = parse_attach_options(args)?;
-    let (cols, rows) = options.cols.zip(options.rows).ok_or_else(||
-        io::Error::new(io::ErrorKind::InvalidInput, "resize requires --cols and --rows"))?;
+    let (cols, rows) = options.cols.zip(options.rows).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resize requires --cols and --rows",
+        )
+    })?;
     let socket_path = session_socket_path(&options.name)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut stream = loop {
         match std::os::unix::net::UnixStream::connect(&socket_path) {
             Ok(stream) => break stream,
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
-                && Instant::now() < deadline => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => return Err(error),
         }
     };
     let payload = pterm_proto::encode_resize(cols, rows);
-    stream.write_all(&pterm_proto::encode(pterm_proto::client::SET_SIZE, &payload))?;
+    stream.write_all(&pterm_proto::encode(
+        pterm_proto::client::SET_SIZE,
+        &payload,
+    ))?;
     // Broadcast snapshots may precede our request under active PTY output.
     // Only the dedicated response to this controller connection acknowledges
     // completion, so serialized focus changes cannot overtake one another.
-    let ack = read_single_response(&mut stream, pterm_proto::server::RESIZE_ACK, Duration::from_secs(3))?;
+    let ack = read_single_response(
+        &mut stream,
+        pterm_proto::server::RESIZE_ACK,
+        Duration::from_secs(3),
+    )?;
     if ack != payload {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "resize acknowledgement does not match request"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resize acknowledgement does not match request",
+        ));
     }
     Ok(())
 }
@@ -519,7 +568,19 @@ mod resize_options_tests {
 
     #[test]
     fn managed_options_do_not_leak_into_the_child_command() {
-        let parsed = parse_attach_options(&args(&["dev", "--no-resize", "--cols", "1", "--rows", "24", "--", "sh", "-c", "echo ok"])).unwrap();
+        let parsed = parse_attach_options(&args(&[
+            "dev",
+            "--no-resize",
+            "--cols",
+            "1",
+            "--rows",
+            "24",
+            "--",
+            "sh",
+            "-c",
+            "echo ok",
+        ]))
+        .unwrap();
         assert_eq!(parsed.name, "dev");
         assert_eq!(parsed.cols, Some(1));
         assert_eq!(parsed.rows, Some(24));
@@ -529,7 +590,10 @@ mod resize_options_tests {
 
     #[test]
     fn legacy_command_arguments_and_separator_remain_supported() {
-        for input in [args(&["dev", "sh", "-c", "echo ok"]), args(&["--", "dev", "sh", "-c", "echo ok"])] {
+        for input in [
+            args(&["dev", "sh", "-c", "echo ok"]),
+            args(&["--", "dev", "sh", "-c", "echo ok"]),
+        ] {
             let parsed = parse_attach_options(&input).unwrap();
             assert_eq!(parsed.name, "dev");
             assert_eq!(parsed.command, args(&["sh", "-c", "echo ok"]));
@@ -539,7 +603,14 @@ mod resize_options_tests {
 
     #[test]
     fn invalid_dimensions_are_rejected_before_contacting_a_daemon() {
-        for input in [vec!["dev", "--cols", "0"], vec!["dev", "--cols"], vec!["dev", "--rows", "abc"], vec!["dev", "--cols", "513"], vec!["dev", "--rows", "257"], vec!["dev", "--cols", "512", "--rows", "256"]] {
+        for input in [
+            vec!["dev", "--cols", "0"],
+            vec!["dev", "--cols"],
+            vec!["dev", "--rows", "abc"],
+            vec!["dev", "--cols", "513"],
+            vec!["dev", "--rows", "257"],
+            vec!["dev", "--cols", "512", "--rows", "256"],
+        ] {
             assert!(parse_attach_options(&args(&input)).is_err());
         }
     }

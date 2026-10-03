@@ -7,12 +7,16 @@ fn full_text(screen: &Screen) -> String {
     for index in 0..history {
         screen.set_scrollback(history - index);
         text.push_str(&screen.rows(0, u16::MAX).next().unwrap());
-        if !screen.row_wrapped(0) { text.push('\n'); }
+        if !screen.row_wrapped(0) {
+            text.push('\n');
+        }
     }
     screen.set_scrollback(0);
     for (index, row) in screen.rows(0, u16::MAX).enumerate() {
         text.push_str(&row);
-        if !screen.row_wrapped(index as u16) { text.push('\n'); }
+        if !screen.row_wrapped(index as u16) {
+            text.push('\n');
+        }
     }
     text.trim_end_matches('\n').to_owned()
 }
@@ -21,7 +25,10 @@ fn full_text(screen: &Screen) -> String {
 fn history_and_live_text_survive_repeated_width_one_roundtrips() {
     let mut parser = Parser::new(4, 20, 100);
     for line in 0..20 {
-        parser.process(format!("line-{line:02}:abcdefghijklmnopqrstuvwxyz\r\n").as_bytes());
+        parser.process(
+            format!("line-{line:02}:abcdefghijklmnopqrstuvwxyz\r\n")
+                .as_bytes(),
+        );
     }
     parser.process(b"last-prompt> ");
     let text = full_text(parser.screen());
@@ -172,12 +179,20 @@ fn continuation_cell_cursor_offsets_recover_after_one_column_compression() {
         let mut parser = Parser::new(2, 4, 100);
         parser.process("A界B\x1b[1;3H".as_bytes());
         assert_eq!(parser.screen().cursor_position(), (0, 2));
-        if saved { parser.process(b"\x1b7\x1b[1;1H"); }
+        if saved {
+            parser.process(b"\x1b7\x1b[1;1H");
+        }
         for (rows, cols) in [(2, 1), (1, 1), (2, 2), (2, 1), (2, 4)] {
             parser.screen_mut().set_size(rows, cols);
         }
-        if saved { parser.process(b"\x1b8"); }
-        assert_eq!(parser.screen().cursor_position(), (0, 2), "saved={saved}");
+        if saved {
+            parser.process(b"\x1b8");
+        }
+        assert_eq!(
+            parser.screen().cursor_position(),
+            (0, 2),
+            "saved={saved}"
+        );
         assert_eq!(full_text(parser.screen()), "A界B");
     }
 }

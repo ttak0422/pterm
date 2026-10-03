@@ -12,6 +12,15 @@ pterm.setup({ socket_dir = temp_root .. "/sockets", auto_redraw = false, shell =
 local session = "resize-live"
 local payload = string.rep("abcdefghij", 16) .. "漢字界e\204\129-tail"
 local history_lines = 30
+local term_requests = {}
+vim.api.nvim_create_autocmd("TermRequest", {
+	callback = function(event)
+		local sequence = event.data and event.data.sequence or vim.v.termrequest
+		if sequence:find("pterm", 1, true) then
+			table.insert(term_requests, sequence)
+		end
+	end,
+})
 local fixture = [=[
 stty -echo
 alt=0
@@ -119,24 +128,62 @@ local function history_intact(text)
 			or not marker_start
 			or text:find(marker, marker_end + 1, true)
 		then
-			return false
+			local reason = ("record %04d: full=%s marker=%s duplicate_full=%s duplicate_marker=%s"):format(
+				i,
+				tostring(start),
+				tostring(marker_start),
+				tostring(start and text:find(expected, finish + 1, true)),
+				tostring(marker_start and text:find(marker, marker_end + 1, true))
+			)
+			return false, reason
 		end
 	end
 	return true
 end
 
-local function expect_history(buf, native)
-	assert(
-		vim.wait(4000, function()
-			local text = pterm.full_text(session)
-			if not text or not history_intact(text) then
-				return false
-			end
-			return not native or history_intact(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
-		end, 25),
-		native and "native history was truncated or duplicated after resize"
-			or "daemon history lost content after resize"
-	)
+local function history_diagnostics(buf, stage)
+	-- This fixture contains only generated text. Keep failure output bounded,
+	-- but include actual bytes/rows so CI can distinguish parser loss, replay
+	-- duplication, Unicode differences, and an unacknowledged reset handshake.
+	local daemon_text = pterm.full_text(session) or ""
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local native_text = table.concat(lines, "\n")
+	local daemon_ok, daemon_reason = history_intact(daemon_text)
+	local native_ok, native_reason = history_intact(native_text)
+	local details = {
+		stage = stage,
+		version = vim.version(),
+		daemon_size = daemon_size(),
+		pty_size = read_file(size_file),
+		windows = vim.fn.getwininfo(),
+		term_requests = term_requests,
+		scrollback = vim.api.nvim_get_option_value("scrollback", { buf = buf }),
+		daemon = { intact = daemon_ok, reason = daemon_reason, bytes = #daemon_text },
+		native = { intact = native_ok, reason = native_reason, bytes = #native_text, rows = #lines },
+	}
+	print("History diagnostics: " .. vim.inspect(details))
+	print("Native compact prefix: " .. vim.inspect(compact(native_text):sub(1, 1200)))
+	for i, line in ipairs(lines) do
+		if i <= 35 or i > #lines - 35 then
+			print(("native[%d]=%s"):format(i, vim.inspect(line)))
+		elseif i == 36 then
+			print("... middle native rows omitted ...")
+		end
+	end
+end
+
+local function expect_history(buf, native, stage)
+	local intact = vim.wait(4000, function()
+		local text = pterm.full_text(session)
+		if not text or not history_intact(text) then
+			return false
+		end
+		return not native or history_intact(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+	end, 25)
+	if not intact then
+		history_diagnostics(buf, stage)
+	end
+	assert(intact, native and "native history was truncated or duplicated" or "daemon history lost content")
 end
 
 local function expect_alt_screen(buf)
@@ -183,7 +230,7 @@ local ok, err = xpcall(function()
 	expect_size()
 	vim.api.nvim_set_option_value("scrollback", 10000, { buf = buf })
 	vim.fn.chansend(job, "history\n")
-	expect_history(buf, true)
+	expect_history(buf, true, "initial history before resize")
 
 	vim.cmd("vnew")
 	local narrow = vim.api.nvim_get_current_win()

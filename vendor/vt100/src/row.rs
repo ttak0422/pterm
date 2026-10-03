@@ -41,7 +41,9 @@ impl Row {
     }
 
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
-        if usize::from(col) >= self.cells.len().saturating_sub(self.reflow_padding) {
+        if usize::from(col)
+            >= self.cells.len().saturating_sub(self.reflow_padding)
+        {
             self.reflow_padding = 0;
         }
         self.cells.get_mut(usize::from(col))
@@ -85,7 +87,9 @@ impl Row {
         // Grid-style alternate-screen shrinking must not leave a wide lead
         // cell without its continuation, which later editing would index.
         if let Some(last) = self.cells.last_mut() {
-            if last.is_wide() { last.clear(*last.attrs()); }
+            if last.is_wide() {
+                last.clear(*last.attrs());
+            }
         }
         self.wrapped = false;
         self.reflow_padding = 0;
@@ -93,7 +97,9 @@ impl Row {
 
     pub fn wrap(&mut self, wrap: bool) {
         self.wrapped = wrap;
-        if !wrap { self.reflow_padding = 0; }
+        if !wrap {
+            self.reflow_padding = 0;
+        }
     }
 
     pub(crate) fn set_reflow_padding(&mut self, padding: usize) {
@@ -106,19 +112,38 @@ impl Row {
 
     pub(crate) fn used_len(&self) -> usize {
         let empty = crate::Cell::new();
-        self.reflow_cells().iter().rposition(|cell| cell != &empty).map_or(0, |i| i + 1)
+        self.reflow_cells()
+            .iter()
+            .rposition(|cell| cell != &empty)
+            .map_or(0, |i| i + 1)
     }
 
     pub(crate) fn retained_cells(&self) -> usize {
-        let len = if self.wrapped { self.reflow_cells().len() } else { self.used_len() };
-        self.reflow_cells()[..len].iter().filter(|cell| !cell.is_wide_continuation())
-            .map(|cell| usize::from(cell.natural_width())).sum::<usize>().max(1)
+        let len = if self.wrapped {
+            self.reflow_cells().len()
+        } else {
+            self.used_len()
+        };
+        self.reflow_cells()[..len]
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(|cell| usize::from(cell.natural_width()))
+            .sum::<usize>()
+            .max(1)
     }
 
-    pub(crate) fn from_reflow(mut cells: Vec<crate::Cell>, cols: u16, wrapped: bool) -> Self {
+    pub(crate) fn from_reflow(
+        mut cells: Vec<crate::Cell>,
+        cols: u16,
+        wrapped: bool,
+    ) -> Self {
         let padding = usize::from(cols) - cells.len();
         cells.resize(usize::from(cols), crate::Cell::new());
-        Self { cells, wrapped, reflow_padding: if wrapped { padding } else { 0 } }
+        Self {
+            cells,
+            wrapped,
+            reflow_padding: if wrapped { padding } else { 0 },
+        }
     }
 
     pub fn wrapped(&self) -> bool {

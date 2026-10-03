@@ -122,21 +122,37 @@ impl Grid {
     /// Reflow the primary buffer without serializing through the VT parser.
     /// In particular, this retains parser state, the other buffer, and attributes.
     pub fn set_size_reflow(&mut self, size: Size) {
-        if size == self.size { return; }
-        if self.rows.is_empty() { self.set_size(size); return; }
+        if size == self.size {
+            return;
+        }
+        if self.rows.is_empty() {
+            self.set_size(size);
+            return;
+        }
         self.history_width = self.history_width.max(size.cols);
         self.history_view_rows = self.history_view_rows.max(size.rows);
         let old_rows = self.size.rows;
         let old_history = self.scrollback.len();
-        let cursor = self.reflow_pos.unwrap_or((old_history + usize::from(self.pos.row), self.pos.col));
-        let saved = self.reflow_saved_pos.unwrap_or((old_history + usize::from(self.saved_pos.row), self.saved_pos.col));
-        let anchor_withins = [self.reflow_pos_within, self.reflow_saved_pos_within];
+        let cursor = self.reflow_pos.unwrap_or((
+            old_history + usize::from(self.pos.row),
+            self.pos.col,
+        ));
+        let saved = self.reflow_saved_pos.unwrap_or((
+            old_history + usize::from(self.saved_pos.row),
+            self.saved_pos.col,
+        ));
+        let anchor_withins =
+            [self.reflow_pos_within, self.reflow_saved_pos_within];
         let old_scroll_offset = self.scrollback_offset;
         let mut source: Vec<_> = self.scrollback.drain(..).collect();
         source.append(&mut self.rows);
         // Unused rows below both cursor anchors are viewport padding, not output.
-        let last_used = source.iter().rposition(|row| row.used_len() > 0 || row.wrapped()).unwrap_or(0);
-        let keep = (last_used.max(cursor.0).max(saved.0) + 1).min(source.len());
+        let last_used = source
+            .iter()
+            .rposition(|row| row.used_len() > 0 || row.wrapped())
+            .unwrap_or(0);
+        let keep =
+            (last_used.max(cursor.0).max(saved.0) + 1).min(source.len());
         source.truncate(keep);
 
         let mut output = Vec::new();
@@ -145,9 +161,15 @@ impl Grid {
         let mut positions = [(0usize, 0u16); 2];
         let mut position_withins = [0u16; 2];
         for (row_index, row) in source.iter().enumerate() {
-            let mut len = if row.wrapped() { row.reflow_cells().len() } else { row.used_len() };
+            let mut len = if row.wrapped() {
+                row.reflow_cells().len()
+            } else {
+                row.used_len()
+            };
             for anchor in [cursor, saved] {
-                if anchor.0 == row_index { len = len.max(usize::from(anchor.1)); }
+                if anchor.0 == row_index {
+                    len = len.max(usize::from(anchor.1));
+                }
             }
             len = len.min(row.reflow_cells().len());
             for col in 0..=len {
@@ -155,19 +177,36 @@ impl Grid {
                     if anchor.0 == row_index && usize::from(anchor.1) == col {
                         // A position in the second half of a wide cell follows
                         // its lead cell when that cell temporarily has width 1.
-                        let continuation = row.reflow_cells().get(col).is_some_and(crate::Cell::is_wide_continuation);
+                        let continuation = row
+                            .reflow_cells()
+                            .get(col)
+                            .is_some_and(crate::Cell::is_wide_continuation);
                         anchors[index] = Some((
-                            logical.len().saturating_sub(usize::from(continuation)),
-                            u16::from(continuation).max(anchor_withins[index]),
+                            logical
+                                .len()
+                                .saturating_sub(usize::from(continuation)),
+                            u16::from(continuation)
+                                .max(anchor_withins[index]),
                         ));
                     }
                 }
-                if let Some(cell) = row.reflow_cells().get(col).filter(|_| col < len) {
-                    if !cell.is_wide_continuation() { logical.push(cell.clone()); }
+                if let Some(cell) =
+                    row.reflow_cells().get(col).filter(|_| col < len)
+                {
+                    if !cell.is_wide_continuation() {
+                        logical.push(cell.clone());
+                    }
                 }
             }
             if !row.wrapped() || row_index + 1 == source.len() {
-                Self::reflow_line(&mut output, &logical, &anchors, &mut positions, &mut position_withins, size.cols);
+                Self::reflow_line(
+                    &mut output,
+                    &logical,
+                    &anchors,
+                    &mut positions,
+                    &mut position_withins,
+                    size.cols,
+                );
                 logical.clear();
                 anchors = [None, None];
             }
@@ -176,34 +215,56 @@ impl Grid {
         self.rows = output.split_off(start);
         self.scrollback = output.into();
         self.size = size;
-        self.rows.resize_with(usize::from(size.rows), || crate::row::Row::new(size.cols));
-        self.scrollback_cells = self.scrollback.iter().map(crate::row::Row::retained_cells).sum();
-        self.scrollback_lines = self.scrollback.iter().filter(|row| !row.wrapped()).count();
+        self.rows.resize_with(usize::from(size.rows), || {
+            crate::row::Row::new(size.cols)
+        });
+        self.scrollback_cells = self
+            .scrollback
+            .iter()
+            .map(crate::row::Row::retained_cells)
+            .sum();
+        self.scrollback_lines =
+            self.scrollback.iter().filter(|row| !row.wrapped()).count();
         // Budget the complete retained buffer, including its live contents,
         // so a resize only moves content across the seam, never spends a new
         // history allowance and never evicts just because that seam moved.
-        self.pos.row = positions[0].0.saturating_sub(start).min(usize::from(size.rows - 1)) as u16;
-        self.saved_pos.row = positions[1].0.saturating_sub(start).min(usize::from(size.rows - 1)) as u16;
+        self.pos.row = positions[0]
+            .0
+            .saturating_sub(start)
+            .min(usize::from(size.rows - 1)) as u16;
+        self.saved_pos.row = positions[1]
+            .0
+            .saturating_sub(start)
+            .min(usize::from(size.rows - 1))
+            as u16;
         let removed = self.trim_scrollback();
-        for pos in &mut positions { pos.0 = pos.0.saturating_sub(removed); }
+        for pos in &mut positions {
+            pos.0 = pos.0.saturating_sub(removed);
+        }
         let start = self.scrollback.len();
         let visible = |pos: (usize, u16)| Pos {
-            row: pos.0.saturating_sub(start).min(usize::from(size.rows - 1)) as u16,
+            row: pos.0.saturating_sub(start).min(usize::from(size.rows - 1))
+                as u16,
             col: pos.1.min(size.cols),
         };
         self.pos = visible(positions[0]);
         self.saved_pos = visible(positions[1]);
         self.reflow_pos = (positions[0].0 < start).then_some(positions[0]);
-        self.reflow_saved_pos = (positions[1].0 < start).then_some(positions[1]);
+        self.reflow_saved_pos =
+            (positions[1].0 < start).then_some(positions[1]);
         self.reflow_pos_within = position_withins[0];
         self.reflow_saved_pos_within = position_withins[1];
         self.scrollback_offset = old_scroll_offset.min(self.scrollback.len());
         // A full-screen region remains full-screen. A partial region is clamped
         // exactly as with the upstream grid resize.
-        if self.scroll_bottom >= size.rows || self.scroll_bottom == old_rows - 1 {
+        if self.scroll_bottom >= size.rows
+            || self.scroll_bottom == old_rows - 1
+        {
             self.scroll_bottom = size.rows - 1;
         }
-        if self.scroll_top >= self.scroll_bottom { self.scroll_top = 0; }
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
+        }
     }
 
     fn reflow_line(
@@ -218,13 +279,21 @@ impl Grid {
         for (index, cell) in cells.iter().enumerate() {
             let width = cell.natural_width().min(cols);
             if row.len() + usize::from(width) > usize::from(cols) {
-                output.push(crate::row::Row::from_reflow(std::mem::take(&mut row), cols, true));
+                output.push(crate::row::Row::from_reflow(
+                    std::mem::take(&mut row),
+                    cols,
+                    true,
+                ));
             }
             for (which, anchor) in anchors.iter().enumerate() {
                 if let Some((at, within)) = anchor {
                     if *at == index {
-                        let natural_within = (*within).min(cell.natural_width() - 1);
-                        positions[which] = (output.len(), row.len() as u16 + natural_within.min(width - 1));
+                        let natural_within =
+                            (*within).min(cell.natural_width() - 1);
+                        positions[which] = (
+                            output.len(),
+                            row.len() as u16 + natural_within.min(width - 1),
+                        );
                         position_withins[which] = natural_within;
                     }
                 }
@@ -251,38 +320,59 @@ impl Grid {
     fn trim_scrollback(&mut self) -> usize {
         // Reserve one maximum-sized viewport so moving live contents into
         // history during a shrink does not evict otherwise-retained output.
-        let line_limit = if self.scrollback_len == 0 { 0 } else {
-            self.scrollback_len.saturating_add(usize::from(self.history_view_rows))
+        let line_limit = if self.scrollback_len == 0 {
+            0
+        } else {
+            self.scrollback_len
+                .saturating_add(usize::from(self.history_view_rows))
         };
-        let budget = line_limit.saturating_mul(usize::from(self.history_width));
+        let budget =
+            line_limit.saturating_mul(usize::from(self.history_width));
         // Most archives are far below both limits. Avoid scanning the entire
         // live grid for every output row in that common case. The factor of
         // two for a one-column viewport accounts for compressed wide glyphs.
-        let max_live_cells = self.rows.len().saturating_mul(usize::from(self.size.cols.max(2)));
+        let max_live_cells = self
+            .rows
+            .len()
+            .saturating_mul(usize::from(self.size.cols.max(2)));
         if self.scrollback_lines.saturating_add(self.rows.len()) <= line_limit
-            && self.scrollback_cells.saturating_add(max_live_cells) <= budget {
+            && self.scrollback_cells.saturating_add(max_live_cells) <= budget
+        {
             return 0;
         }
-        let live_end = self.rows.iter().rposition(|row| row.used_len() > 0 || row.wrapped())
-            .unwrap_or(0).max(usize::from(self.pos.row)).max(usize::from(self.saved_pos.row));
+        let live_end = self
+            .rows
+            .iter()
+            .rposition(|row| row.used_len() > 0 || row.wrapped())
+            .unwrap_or(0)
+            .max(usize::from(self.pos.row))
+            .max(usize::from(self.saved_pos.row));
         let live = &self.rows[..(live_end + 1).min(self.rows.len())];
-        let live_cells: usize = live.iter().map(crate::row::Row::retained_cells).sum();
+        let live_cells: usize =
+            live.iter().map(crate::row::Row::retained_cells).sum();
         let live_lines = live.iter().filter(|row| !row.wrapped()).count();
         let mut removed = 0;
         while self.scrollback_lines.saturating_add(live_lines) > line_limit
-            || self.scrollback_cells.saturating_add(live_cells) > budget {
-
-            let Some(row) = self.scrollback.pop_front() else { break; };
+            || self.scrollback_cells.saturating_add(live_cells) > budget
+        {
+            let Some(row) = self.scrollback.pop_front() else {
+                break;
+            };
             self.scrollback_cells -= row.retained_cells();
             self.scrollback_lines -= usize::from(!row.wrapped());
             removed += 1;
         }
-        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
+        self.scrollback_offset =
+            self.scrollback_offset.min(self.scrollback.len());
         removed
     }
 
-    pub fn scrollback_generation(&self) -> u64 { self.scrollback_generation }
-    pub fn scrollback_rows(&self) -> usize { self.scrollback.len() }
+    pub fn scrollback_generation(&self) -> u64 {
+        self.scrollback_generation
+    }
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
 
     pub fn cancel_pending_wrap(&mut self) {
         if self.pos.col >= self.size.cols {
@@ -776,7 +866,8 @@ impl Grid {
                 self.scrollback_cells += removed.retained_cells();
                 self.scrollback_lines += usize::from(!removed.wrapped());
                 self.scrollback.push_back(removed);
-                self.scrollback_generation = self.scrollback_generation.wrapping_add(1);
+                self.scrollback_generation =
+                    self.scrollback_generation.wrapping_add(1);
                 self.trim_scrollback();
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset =

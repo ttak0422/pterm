@@ -414,7 +414,11 @@ impl Server {
         {
             return;
         }
-        if self.clients.get(&client_id).is_some_and(|client| client.canonical_view) {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.canonical_view)
+        {
             self.send_view_to_client(client_id, replace_send_buf);
             return;
         }
@@ -516,7 +520,11 @@ impl Server {
         let history_lines = if alternate {
             0
         } else if reset_history {
-            if client.wants_history { history_replay_limit() } else { 0 }
+            if client.wants_history {
+                history_replay_limit()
+            } else {
+                0
+            }
         } else {
             usize::try_from(generation.saturating_sub(client.view_history_generation))
                 .unwrap_or(usize::MAX)
@@ -551,7 +559,11 @@ impl Server {
             }
         }
         if let Err(e) = self.flush_client_send_buf(client_id) {
-            log::warn!("Client {} flush error during canonical view: {}", client_id, e);
+            log::warn!(
+                "Client {} flush error during canonical view: {}",
+                client_id,
+                e
+            );
             self.clients.remove(&client_id);
         }
     }
@@ -626,8 +638,13 @@ impl Server {
         if !terminal_responses.is_empty() {
             match self.session.echo_enabled() {
                 Ok(false) => self.queue_pty_input(&terminal_responses)?,
-                Ok(true) => log::debug!("Dropping terminal query responses while PTY ECHO is enabled"),
-                Err(e) => log::warn!("Dropping terminal query responses after checking PTY ECHO: {}", e),
+                Ok(true) => {
+                    log::debug!("Dropping terminal query responses while PTY ECHO is enabled")
+                }
+                Err(e) => log::warn!(
+                    "Dropping terminal query responses after checking PTY ECHO: {}",
+                    e
+                ),
             }
         }
         let (pending_da1, pending_da2) = self.session.take_pending_da_queries();
@@ -710,22 +727,32 @@ impl Server {
             self.send_snapshot_to_client(*id, true);
         }
 
-        let view_ids: Vec<usize> = self.clients.iter().filter_map(|(&id, client)| {
-            (client.canonical_view && !client.diagnostic && !snapshot_ids.contains(&id))
-                .then_some(id)
-        }).collect();
+        let view_ids: Vec<usize> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, client)| {
+                (client.canonical_view && !client.diagnostic && !snapshot_ids.contains(&id))
+                    .then_some(id)
+            })
+            .collect();
         for id in view_ids {
             self.send_view_to_client(id, false);
         }
 
         if !events.is_empty() {
             let frame = proto::encode(proto::server::VIEW_EVENT, &events);
-            let event_ids: Vec<usize> = self.clients.iter_mut().filter_map(|(&id, client)| {
-                if client.canonical_view && !client.diagnostic {
-                    client.queue_frame(&frame);
-                    Some(id)
-                } else { None }
-            }).collect();
+            let event_ids: Vec<usize> = self
+                .clients
+                .iter_mut()
+                .filter_map(|(&id, client)| {
+                    if client.canonical_view && !client.diagnostic {
+                        client.queue_frame(&frame);
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             for id in event_ids {
                 if self.flush_client_send_buf(id).is_err() {
                     self.clients.remove(&id);
@@ -925,7 +952,10 @@ impl Server {
                     self.send_snapshot_to_all_clients(true);
                     if acknowledge {
                         if let Some(client) = self.clients.get_mut(&client_id) {
-                            client.queue_frame(&proto::encode(proto::server::RESIZE_ACK, &frame.payload));
+                            client.queue_frame(&proto::encode(
+                                proto::server::RESIZE_ACK,
+                                &frame.payload,
+                            ));
                         }
                         flush_all = true;
                     }
@@ -939,7 +969,10 @@ impl Server {
                         }
                     };
                     if cols == 0 || rows == 0 {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid view size"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid view size",
+                        ));
                     }
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         if client.canonical_view {
@@ -969,9 +1002,13 @@ impl Server {
                         }
                         client.queue_frame(&msg);
                     }
-                    let view_ids: Vec<usize> = self.clients.iter().filter_map(|(&id, client)| {
-                        (client.canonical_view && !client.diagnostic).then_some(id)
-                    }).collect();
+                    let view_ids: Vec<usize> = self
+                        .clients
+                        .iter()
+                        .filter_map(|(&id, client)| {
+                            (client.canonical_view && !client.diagnostic).then_some(id)
+                        })
+                        .collect();
                     for id in view_ids {
                         self.send_view_to_client(id, false);
                     }
@@ -1106,63 +1143,112 @@ mod tests {
     #[test]
     fn canonical_view_size_is_independent_and_managed_output_is_not_raw() {
         let dir = std::env::temp_dir().join(format!("pterm-canonical-view-{}", std::process::id()));
-        let session = Session::new("canonical-view".into(), "sh", &["sh", "-c", "exec sleep 30"])
-            .unwrap();
+        let session = Session::new(
+            "canonical-view".into(),
+            "sh",
+            &["sh", "-c", "exec sleep 30"],
+        )
+        .unwrap();
         let mut server = Server::new(&dir, session).unwrap();
         let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         server.accept_client().unwrap();
-        client.write_all(&proto::encode(proto::client::HELLO, &proto::encode_hello(
-            proto::PROTO_VERSION,
-            proto::hello_flags::CANONICAL_VIEW | proto::hello_flags::REQUEST_HISTORY,
-        ))).unwrap();
+        client
+            .write_all(&proto::encode(
+                proto::client::HELLO,
+                &proto::encode_hello(
+                    proto::PROTO_VERSION,
+                    proto::hello_flags::CANONICAL_VIEW | proto::hello_flags::REQUEST_HISTORY,
+                ),
+            ))
+            .unwrap();
         server.handle_client_data(0, &mut [0; 4096]).unwrap();
         assert!(server.clients[&0].pending_snapshot);
         assert!(server.clients[&0].send_buf.is_empty());
 
         // The native renderer can be larger than the bounded canonical PTY.
-        client.write_all(&proto::encode(proto::client::VIEW_SIZE, &proto::encode_resize(1024, 300)))
+        client
+            .write_all(&proto::encode(
+                proto::client::VIEW_SIZE,
+                &proto::encode_resize(1024, 300),
+            ))
             .unwrap();
         server.handle_client_data(0, &mut [0; 4096]).unwrap();
         let mut recv_buf = Vec::new();
-        let initial = read_frames_until(&mut client, &mut recv_buf, |frame| frame.msg_type == proto::server::VIEW);
+        let initial = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
         assert_eq!(initial[0].msg_type, proto::server::HELLO_ACK);
         assert_eq!(initial.last().unwrap().payload[0], 1);
-        let original_size = serde_json::to_value(server.session.dump()).unwrap()["screen"]["size"].clone();
+        let original_size =
+            serde_json::to_value(server.session.dump()).unwrap()["screen"]["size"].clone();
 
         // An independently sized passive view must never resize the shell.
-        client.write_all(&proto::encode(proto::client::VIEW_SIZE, &proto::encode_resize(50, 10)))
+        client
+            .write_all(&proto::encode(
+                proto::client::VIEW_SIZE,
+                &proto::encode_resize(50, 10),
+            ))
             .unwrap();
         server.handle_client_data(0, &mut [0; 4096]).unwrap();
-        read_frames_until(&mut client, &mut recv_buf, |frame| frame.msg_type == proto::server::VIEW);
-        assert_eq!(serde_json::to_value(server.session.dump()).unwrap()["screen"]["size"], original_size);
+        read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
+        assert_eq!(
+            serde_json::to_value(server.session.dump()).unwrap()["screen"]["size"],
+            original_size
+        );
 
-        client.write_all(&proto::encode(proto::client::RESIZE, &proto::encode_resize(70, 20)))
+        client
+            .write_all(&proto::encode(
+                proto::client::RESIZE,
+                &proto::encode_resize(70, 20),
+            ))
             .unwrap();
         server.handle_client_data(0, &mut [0; 4096]).unwrap();
-        let resized = read_frames_until(&mut client, &mut recv_buf, |frame| frame.msg_type == proto::server::VIEW);
-        assert!(resized.iter().all(|frame| frame.msg_type != proto::server::RESIZE_ACK));
+        let resized = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
+        assert!(resized
+            .iter()
+            .all(|frame| frame.msg_type != proto::server::RESIZE_ACK));
         assert_eq!(resized.last().unwrap().payload[0], 1);
         assert_eq!(server.clients[&0].view_size, Some((50, 10)));
         let size = serde_json::to_value(server.session.dump()).unwrap();
         assert_eq!(size["screen"]["size"]["cols"], 70);
         assert_eq!(size["screen"]["size"]["rows"], 20);
 
-        server.pending_pty_output.extend_from_slice(b"RAW-OUTPUT-MUST-NOT-LEAK");
+        server
+            .pending_pty_output
+            .extend_from_slice(b"RAW-OUTPUT-MUST-NOT-LEAK");
         server.flush_pty_output();
-        let update = read_frames_until(&mut client, &mut recv_buf, |frame| frame.msg_type == proto::server::VIEW);
-        assert!(update.iter().all(|frame| frame.msg_type != proto::server::OUTPUT));
-        let view = update.iter().find(|frame| frame.msg_type == proto::server::VIEW).unwrap();
+        let update = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
+        assert!(update
+            .iter()
+            .all(|frame| frame.msg_type != proto::server::OUTPUT));
+        let view = update
+            .iter()
+            .find(|frame| frame.msg_type == proto::server::VIEW)
+            .unwrap();
         assert_eq!(view.payload[0], 0);
         assert!(!String::from_utf8_lossy(&view.payload).contains("RAW-OUTPUT-MUST-NOT-LEAK"));
 
         // One-shot authority changes acknowledge only their own completed
         // SET_SIZE, never a previous unsolicited snapshot or PTY update.
-        client.write_all(&proto::encode(proto::client::SET_SIZE, &proto::encode_resize(60, 15)))
+        client
+            .write_all(&proto::encode(
+                proto::client::SET_SIZE,
+                &proto::encode_resize(60, 15),
+            ))
             .unwrap();
         server.handle_client_data(0, &mut [0; 4096]).unwrap();
-        let acknowledged = read_frames_until(&mut client, &mut recv_buf,
-            |frame| frame.msg_type == proto::server::RESIZE_ACK);
+        let acknowledged = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::RESIZE_ACK
+        });
         assert_eq!(acknowledged.len(), 1);
         assert_eq!(acknowledged[0].msg_type, proto::server::RESIZE_ACK);
         assert_eq!(acknowledged[0].payload, proto::encode_resize(60, 15));
