@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-10-11
+
+### Bug Fixes
+
+- Address resize startup and viewport regressions in CI
+- Apply CI formatting and diagnose native history replay
+- Restore native scrollback capacity before replay
+- Preserve mouse origins across resized terminal views
+
+### Documentation
+
+- Clarify Intel macOS is unsupported
+
+### Testing
+
+- Add live terminal exit investigation harnesses
+
+### Wip
+
+- Prototype terminal reflow and active-window canonical views
 ## [2.1.0] - 2026-09-23
 
 ### Features
@@ -614,6 +634,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.2.0]: https://github.com/ttak0422/pterm/compare/v2.1.0..v2.2.0
 [2.1.0]: https://github.com/ttak0422/pterm/compare/v2.0.1..v2.1.0
 [2.0.1]: https://github.com/ttak0422/pterm/compare/v2.0.0..v2.0.1
 [2.0.0]: https://github.com/ttak0422/pterm/compare/v1.2.0..v2.0.0
