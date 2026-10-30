@@ -74,7 +74,24 @@ struct HistoryReset {
 }
 
 impl HistoryReset {
-    fn queue_view(&mut self, payload: &[u8], output: &mut SendQueue) -> io::Result<()> {
+    fn waiting(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn queue_view(
+        &mut self,
+        payload: &[u8],
+        output: &mut SendQueue,
+        now: Instant,
+    ) -> io::Result<()> {
         let (&flags, bytes) = payload
             .split_first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty canonical view"))?;
@@ -82,7 +99,7 @@ impl HistoryReset {
             self.pending.clear();
             if self.deadline.is_none() {
                 output.push(HISTORY_RESET_REQUEST);
-                self.deadline = Some(Instant::now() + Duration::from_secs(30));
+                self.deadline = Some(now + Duration::from_secs(30));
             }
         }
         self.queue_bytes(bytes, output);
@@ -141,11 +158,7 @@ fn queue_managed_input(
                 // Mouse clicks during a blank/resetting display have no
                 // reliable origin. Invalidate rather than remapping them to
                 // unrelated application rows; active releases remain safe.
-                let row_base = if reset.deadline.is_some() {
-                    i32::MIN
-                } else {
-                    row_base
-                };
+                let row_base = if reset.waiting() { i32::MIN } else { row_base };
                 let mut payload = row_base.to_le_bytes().to_vec();
                 payload.extend_from_slice(&leftcol.to_le_bytes());
                 socket.push(&proto::encode(proto::client::INPUT_ORIGIN, &payload));
@@ -360,21 +373,18 @@ pub fn run(
             );
             input_pending_since = None;
         }
-        if history_reset
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if history_reset.expired(Instant::now()) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Neovim did not acknowledge the scrollback reset",
             ));
         }
-        if !running && history_reset.deadline.is_none() && !cleanup_queued {
+        if !running && !history_reset.waiting() && !cleanup_queued {
             output.push(DETACH_CLEANUP_SEQUENCES);
             cleanup_queued = true;
         }
         if !running
-            && history_reset.deadline.is_none()
+            && !history_reset.waiting()
             && output.is_empty()
             && (!socket_open || send_buf.is_empty())
         {
@@ -385,11 +395,11 @@ pub fn run(
         // Pause only socket reads at the output watermark; input, socket writes,
         // and SIGWINCH remain responsive while the display is stopped.
         let read_socket = running
-            && output.pending_bytes() + history_reset.pending.len() < MAX_PENDING_OUTPUT_BYTES;
+            && output.pending_bytes() + history_reset.pending_bytes() < MAX_PENDING_OUTPUT_BYTES;
         let mut fds = [
             poll_fd(
                 stdin_fd,
-                if (running || history_reset.deadline.is_some())
+                if (running || history_reset.waiting())
                     && send_buf.pending_bytes() < MAX_PENDING_INPUT_BYTES
                 {
                     libc::POLLIN
@@ -415,7 +425,7 @@ pub fn run(
         ];
         let timeout = if managed_input.has_pending() {
             25
-        } else if history_reset.deadline.is_some() {
+        } else if history_reset.waiting() {
             100
         } else {
             -1
@@ -484,7 +494,11 @@ pub fn run(
                                     history_reset.queue_bytes(&output_batch, &mut output);
                                     output_batch.clear();
                                 }
-                                history_reset.queue_view(&frame.payload, &mut output)?;
+                                history_reset.queue_view(
+                                    &frame.payload,
+                                    &mut output,
+                                    Instant::now(),
+                                )?;
                             }
                             proto::server::OUTPUT => {
                                 output_batch.extend_from_slice(&frame.payload);
@@ -694,6 +708,7 @@ mod history_reset_tests {
     use crate::input::{InputEvent, ManagedInput};
     use crate::server::SendQueue;
     use pterm_proto as proto;
+    use std::time::{Duration, Instant};
 
     fn drain(queue: &mut SendQueue) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -738,7 +753,9 @@ mod history_reset_tests {
         let mut reset = HistoryReset::default();
         let mut output = SendQueue::default();
         let mut socket = SendQueue::default();
-        reset.queue_view(b"\x01screen", &mut output).unwrap();
+        reset
+            .queue_view(b"\x01screen", &mut output, Instant::now())
+            .unwrap();
         queue_managed_input(
             vec![InputEvent::Origin {
                 row_base: -40,
@@ -757,9 +774,13 @@ mod history_reset_tests {
     fn replacement_waits_for_split_ack_and_preserves_keyboard_input() {
         let mut reset = HistoryReset::default();
         let mut output = SendQueue::default();
-        reset.queue_view(b"\x01history", &mut output).unwrap();
+        reset
+            .queue_view(b"\x01history", &mut output, Instant::now())
+            .unwrap();
         assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
-        reset.queue_view(b"\x00screen", &mut output).unwrap();
+        reset
+            .queue_view(b"\x00screen", &mut output, Instant::now())
+            .unwrap();
         assert!(output.is_empty());
         let mut keyboard = b"before".to_vec();
         keyboard.extend_from_slice(HISTORY_RESET_ACK);
@@ -770,15 +791,20 @@ mod history_reset_tests {
         }
         assert_eq!(forwarded, b"beforeafter");
         assert_eq!(drain(&mut output), b"\x1b[3Jhistoryscreen");
-        assert!(reset.deadline.is_none());
+        assert!(!reset.waiting());
+        assert_eq!(reset.pending_bytes(), 0);
     }
 
     #[test]
     fn repeated_resizes_keep_only_latest_replacement_before_ack() {
         let mut reset = HistoryReset::default();
         let mut output = SendQueue::default();
-        reset.queue_view(b"\x01old", &mut output).unwrap();
-        reset.queue_view(b"\x01new", &mut output).unwrap();
+        reset
+            .queue_view(b"\x01old", &mut output, Instant::now())
+            .unwrap();
+        reset
+            .queue_view(b"\x01new", &mut output, Instant::now())
+            .unwrap();
         assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
         reset.input(HISTORY_RESET_ACK, &mut output);
         assert_eq!(drain(&mut output), b"\x1b[3Jnew");
@@ -788,8 +814,72 @@ mod history_reset_tests {
     fn ordinary_escape_input_is_not_eaten_by_reset_handshake() {
         let mut reset = HistoryReset::default();
         let mut output = SendQueue::default();
-        reset.queue_view(b"\x01screen", &mut output).unwrap();
+        reset
+            .queue_view(b"\x01screen", &mut output, Instant::now())
+            .unwrap();
         assert_eq!(reset.input(b"\x1b[Ahello", &mut output), b"\x1b[Ahello");
-        assert!(reset.queue_view(&[], &mut output).is_err());
+        assert!(reset.queue_view(&[], &mut output, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn reset_expires_at_the_original_deadline_after_replacement() {
+        let start = Instant::now();
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        reset.queue_view(b"\x01old", &mut output, start).unwrap();
+        reset
+            .queue_view(b"\x01new", &mut output, start + Duration::from_secs(29))
+            .unwrap();
+
+        assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
+        assert_eq!(reset.pending_bytes(), 3);
+        assert!(!reset.expired(start + Duration::from_millis(29_999)));
+        assert!(reset.expired(start + Duration::from_secs(30)));
+        assert!(reset.expired(start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn completed_ack_clears_the_deadline_and_next_reset_gets_a_fresh_one() {
+        let start = Instant::now();
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        reset
+            .queue_view(b"\x01history", &mut output, start)
+            .unwrap();
+        drain(&mut output);
+
+        let split = HISTORY_RESET_ACK.len() - 1;
+        assert!(reset
+            .input(&HISTORY_RESET_ACK[..split], &mut output)
+            .is_empty());
+        assert!(reset.waiting());
+        assert_eq!(reset.pending_bytes(), 7);
+        assert!(output.is_empty());
+        assert!(reset
+            .input(&HISTORY_RESET_ACK[split..], &mut output)
+            .is_empty());
+        assert!(!reset.waiting());
+        assert_eq!(reset.pending_bytes(), 0);
+        assert!(!reset.expired(start + Duration::from_secs(60)));
+        assert_eq!(drain(&mut output), b"\x1b[3Jhistory");
+
+        let next = start + Duration::from_secs(60);
+        reset.queue_view(b"\x01next", &mut output, next).unwrap();
+        assert!(!reset.expired(next + Duration::from_secs(29)));
+        assert!(reset.expired(next + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn ordinary_or_invalid_views_do_not_start_reset_waiting() {
+        let now = Instant::now();
+        let mut reset = HistoryReset::default();
+        let mut output = SendQueue::default();
+        assert!(reset.queue_view(&[], &mut output, now).is_err());
+        reset.queue_view(b"\x00screen", &mut output, now).unwrap();
+
+        assert_eq!(drain(&mut output), b"screen");
+        assert!(!reset.waiting());
+        assert_eq!(reset.pending_bytes(), 0);
+        assert!(!reset.expired(now + Duration::from_secs(60)));
     }
 }
