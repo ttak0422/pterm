@@ -430,10 +430,13 @@ pub fn run(
             25
         } else if history_reset.deadline.is_some() {
             100
-        } else if !propagate_resize && daemon_proto.is_none() {
-            100
         } else {
             -1
+        };
+        let timeout = if timeout < 0 && !propagate_resize && daemon_proto.is_none() {
+            100
+        } else {
+            timeout
         };
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             let error = io::Error::last_os_error();
