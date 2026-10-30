@@ -42,6 +42,16 @@
         }:
         let
           naersk' = pkgs.callPackage inputs.naersk { };
+          # Keep the terminal test version independent of the Rust toolchain.
+          neovimPackage = pkgs.neovim-unwrapped.overrideAttrs {
+            version = "0.12.6";
+            src = pkgs.fetchFromGitHub {
+              owner = "neovim";
+              repo = "neovim";
+              tag = "v0.12.6";
+              hash = "sha256-lK1gbJyESMN3C/i8cyPFzzlJDYZHzEXugGhCwPVEbNk=";
+            };
+          };
           buildPackage =
             args:
             naersk'.buildPackage (
@@ -109,7 +119,7 @@
                 {
                   # Preserve the existing mocked plugin suite in CI. Real
                   # Neovim/PTY/tig fixtures remain opt-in development tests.
-                  nativeBuildInputs = [ pkgs.neovim ];
+                  nativeBuildInputs = [ neovimPackage ];
                 }
                 ''
                   export NVIM_LOG_FILE="$TMPDIR/nvim.log"
@@ -120,7 +130,7 @@
           };
 
           apps = import ./nix/apps {
-            inherit self' pkgs;
+            inherit self' pkgs neovimPackage;
           };
 
           packages = {
