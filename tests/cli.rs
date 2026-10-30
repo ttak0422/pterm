@@ -128,6 +128,111 @@ fn bridge_preserves_fragmented_history_before_snapshot_and_exit() {
 }
 
 #[test]
+fn managed_bridge_ignores_raw_frames_sent_before_hello_ack() {
+    let dir = TestDir::new();
+    let session = dir.0.join("sessions/negotiation");
+    std::fs::create_dir_all(&session).unwrap();
+    let listener = UnixListener::bind(session.join("socket")).unwrap();
+    let mut child = dir
+        .command()
+        .args(["attach", "negotiation", "--no-resize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // A current daemon can broadcast these before processing this client's
+    // HELLO when another client resizes/redraws or the child produces output.
+    let mut stale = pterm_proto::encode(pterm_proto::server::STATE_SYNC, b"stale-snapshot");
+    stale.extend(pterm_proto::encode(
+        pterm_proto::server::OUTPUT,
+        b"stale-output",
+    ));
+    stale.extend(pterm_proto::encode(
+        pterm_proto::server::HISTORY,
+        b"stale-history",
+    ));
+    stream.write_all(&stale).unwrap();
+    // This is a protocol barrier, not a scheduling sleep: receive the bridge's
+    // complete HELLO before acknowledging it. Split the ACK header as well.
+    let mut hello = [0; 13];
+    stream.read_exact(&mut hello).unwrap();
+    assert_eq!(hello[0], pterm_proto::client::HELLO);
+    let ack = pterm_proto::encode(
+        pterm_proto::server::HELLO_ACK,
+        &pterm_proto::encode_hello_ack(pterm_proto::PROTO_VERSION, "test"),
+    );
+    stream.write_all(&ack[..2]).unwrap();
+    stream.write_all(&ack[2..]).unwrap();
+    let mut frames = pterm_proto::encode(pterm_proto::server::VIEW, b"\x00canonical-view");
+    frames.extend(pterm_proto::encode(
+        pterm_proto::server::EXIT,
+        &pterm_proto::encode_exit(17),
+    ));
+    stream.write_all(&frames).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(17), "{:?}", output);
+    assert!(output.stdout.starts_with(b"canonical-view"), "{:?}", output);
+    assert!(!output.stdout.windows(6).any(|bytes| bytes == b"stale-"));
+}
+
+#[test]
+fn managed_bridge_bounds_hello_ack_wait_for_an_old_daemon() {
+    let dir = TestDir::new();
+    let session = dir.0.join("sessions/old-daemon");
+    std::fs::create_dir_all(&session).unwrap();
+    let listener = UnixListener::bind(session.join("socket")).unwrap();
+    let mut child = dir
+        .command()
+        .args(["attach", "old-daemon", "--no-resize"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take().unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .write_all(&pterm_proto::encode(
+            pterm_proto::server::STATE_SYNC,
+            b"legacy-screen",
+        ))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut timed_out = false;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !timed_out,
+        "managed bridge waited indefinitely for HELLO_ACK"
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("HELLO_ACK"),
+        "{:?}",
+        output
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "legacy bytes leaked: {:?}",
+        output
+    );
+}
+
+#[test]
 fn session_paths_reject_traversal_and_symlinks_before_deleting() {
     let dir = TestDir::new();
     let root = dir.0.join("sessions");

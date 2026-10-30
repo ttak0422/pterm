@@ -123,6 +123,24 @@ Daemon -> client:
 - `EXIT` (`0x02`): `exit_code:i32`
 - `STATE_SYNC` (`0x80`): terminal state snapshot on attach/redraw; built from `vt100::Screen::state_formatted()` plus replayed terminal metadata such as passthrough control sequences and window-title state
 
+### Managed connection negotiation
+
+A newly accepted socket uses the legacy output path until its `HELLO` is
+processed. A concurrent resize/redraw request from another client, or PTY
+output, can send `STATE_SYNC`/`OUTPUT` before that point. Their arrival alone
+does not prove that the daemon lacks canonical rendering support.
+
+A managed (`--no-resize`) bridge discards raw `STATE_SYNC`, `OUTPUT` and
+`HISTORY` frames until `HELLO_ACK` arrives. The subsequent canonical `VIEW`
+reconstructs the current display and retained history. Waiting for the ACK is
+bounded to three seconds; if an old daemon never acknowledges, the bridge
+returns a restart/upgrade error. A protocol version below 2 in the ACK, or `STATE_SYNC`
+after negotiation, still fails immediately. Standalone bridges and passive
+legacy socket clients keep their existing output behavior.
+
+Regression coverage: `managed_bridge_ignores_raw_frames_sent_before_hello_ack`
+and `managed_bridge_bounds_hello_ack_wait_for_an_old_daemon` in `tests/cli.rs`.
+
 ## Socket and Session Layout
 
 Socket root directory resolution order:

@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 const MAX_PENDING_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_OUTPUT_BYTES: usize = 1024 * 1024;
 const INPUT_PREFIX_TIMEOUT: Duration = Duration::from_millis(25);
+// Before HELLO is processed, even a current daemon can broadcast legacy frames
+// to this connection. Wait for its explicit ACK, but bound old-daemon failure.
+const MANAGED_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -343,13 +346,23 @@ pub fn run(
     let mut managed_input = ManagedInput::new();
     let mut input_pending_since = None;
     let mut exit_code = 0;
-    // A daemon predating HELLO_ACK is detected at the first STATE_SYNC.
+    // Standalone clients detect an old daemon at the first STATE_SYNC. Managed
+    // clients must wait for HELLO_ACK: unsolicited STATE_SYNC can precede HELLO.
+    let managed_hello_deadline = Instant::now() + MANAGED_HELLO_TIMEOUT;
     let mut daemon_proto = None;
     let mut proto_checked = false;
     let mut running = true;
     let mut socket_open = true;
     let mut cleanup_queued = false;
     loop {
+        if !propagate_resize
+            && daemon_proto.is_none()
+            && running
+            && Instant::now() >= managed_hello_deadline
+        {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,
+                "daemon did not send HELLO_ACK for managed rendering; restart this session to upgrade"));
+        }
         if input_pending_since.is_some_and(|since: Instant| since.elapsed() >= INPUT_PREFIX_TIMEOUT)
         {
             queue_managed_input(
@@ -415,7 +428,8 @@ pub fn run(
         ];
         let timeout = if managed_input.has_pending() {
             25
-        } else if history_reset.deadline.is_some() {
+        } else if history_reset.deadline.is_some() || (!propagate_resize && daemon_proto.is_none())
+        {
             100
         } else {
             -1
@@ -475,6 +489,22 @@ pub fn run(
                     for frame in proto::decode_frames(&mut recv_buf, proto::MAX_SERVER_PAYLOAD)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                     {
+                        // The daemon treats a newly accepted socket as legacy
+                        // until it decodes HELLO. Other clients' resize/redraw
+                        // requests and PTY output can therefore precede our ACK.
+                        // Never feed that stale raw rendering into a managed
+                        // terminal; the canonical VIEW after ACK replaces it.
+                        if !propagate_resize
+                            && daemon_proto.is_none()
+                            && matches!(
+                                frame.msg_type,
+                                proto::server::OUTPUT
+                                    | proto::server::HISTORY
+                                    | proto::server::STATE_SYNC
+                            )
+                        {
+                            continue;
+                        }
                         match frame.msg_type {
                             proto::server::VIEW_EVENT if !propagate_resize => {
                                 history_reset.queue_bytes(&frame.payload, &mut output);
