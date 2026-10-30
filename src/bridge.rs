@@ -24,6 +24,10 @@ const INPUT_PREFIX_TIMEOUT: Duration = Duration::from_millis(25);
 // Before HELLO is processed, even a current daemon can broadcast legacy frames
 // to this connection. Wait for its explicit ACK, but bound old-daemon failure.
 const MANAGED_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+const INPUT_PREFIX_POLL_TIMEOUT_MS: libc::c_int = 25;
+const HISTORY_RESET_POLL_TIMEOUT_MS: libc::c_int = 100;
+const MANAGED_HELLO_POLL_TIMEOUT_MS: libc::c_int = 100;
+const POLL_WAIT_INDEFINITELY: libc::c_int = -1;
 
 // Some interactive programs enable xterm/kitty keyboard enhancement modes.
 // Reset them on detach so the next shell prompt does not inherit CSI-u style
@@ -427,14 +431,14 @@ pub fn run(
             poll_fd(stdout_fd, if output.is_empty() { 0 } else { libc::POLLOUT }),
         ];
         let timeout = if managed_input.has_pending() {
-            25
+            INPUT_PREFIX_POLL_TIMEOUT_MS
         } else if history_reset.deadline.is_some() {
-            100
+            HISTORY_RESET_POLL_TIMEOUT_MS
         } else {
-            -1
+            POLL_WAIT_INDEFINITELY
         };
         let timeout = if timeout < 0 && !propagate_resize && daemon_proto.is_none() {
-            100
+            MANAGED_HELLO_POLL_TIMEOUT_MS
         } else {
             timeout
         };
