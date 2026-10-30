@@ -1,11 +1,12 @@
 {
   self',
   pkgs,
+  neovimPackage,
   ...
 }:
 
 let
-  neovim = pkgs.wrapNeovimUnstable pkgs.neovim-unwrapped {
+  neovim = pkgs.wrapNeovimUnstable neovimPackage {
     plugins = [
       {
         plugin = self'.packages.pterm;
