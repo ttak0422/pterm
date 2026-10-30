@@ -428,8 +428,9 @@ pub fn run(
         ];
         let timeout = if managed_input.has_pending() {
             25
-        } else if history_reset.deadline.is_some() || (!propagate_resize && daemon_proto.is_none())
-        {
+        } else if history_reset.deadline.is_some() {
+            100
+        } else if !propagate_resize && daemon_proto.is_none() {
             100
         } else {
             -1
