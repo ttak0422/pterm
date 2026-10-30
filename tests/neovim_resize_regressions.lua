@@ -27,9 +27,8 @@ alt=0
 draw() {
   size=$(stty size)
   printf '%s\n' "$size" > "$1"
-  set -- $size
-  rows=$1
-  cols=$2
+  rows=${size%% *}
+  cols=${size##* }
   if [ "$alt" = 1 ]; then
     printf '\033[H\033[2Jsize:%sx%s\033[2;1H' "$cols" "$rows"
     i=1
