@@ -1,28 +1,41 @@
 # ADR-0001: Rendering Corruption Mitigations
 
-**Status**: Completed  
-**Branch**: `fix/rendering-corruption`
+**Status**: Implemented (original mitigations)
+
+**Original branch**: `fix/rendering-corruption`
 
 ---
 
 ## Context
 
-pterm uses a two-layer snapshot model:
+This ADR records the original raw/snapshot-path corruption mitigations. That
+path uses a two-layer snapshot model:
 
 1. `vt100::Screen::state_formatted()` — reconstructs terminal state from what the `vt100` crate tracks internally
 2. `SessionCallbacks::passthrough_sequences` — bounded queue (256 seqs / 16 KiB) capturing sequences `vt100` does not handle
 
-On client attach/reconnect, `build_snapshot()` combines both layers and replays the byte stream into the Neovim terminal buffer. This design exposes several correctness risks when terminal state cannot be fully reconstructed from these two sources alone.
+On attach/reconnect, `build_snapshot()` combines these layers. The original risks
+were stale-size snapshots, conflicting clients and state lost from bounded raw
+sequence retention. Managed Neovim attachments now use canonical views instead
+of this raw replay path; see [current architecture](../DESIGN.md).
 
 ---
 
-## Decisions and TODOs
+## Original Decisions and Current Implementation
 
 ### ✅ DONE — RESIZE stale-buffer ordering (PR #43)
 
 **Problem**: After `RESIZE`, stale `OUTPUT` frames or an old-size snapshot could remain queued in the client's send buffer ahead of the new-size snapshot, causing the bridge to replay bytes sized for the wrong terminal dimensions.
 
-**Decision**: `send_snapshot_to_client` now clears the client's `send_buf` before enqueuing the fresh snapshot. `RESIZE` always issues a replacement snapshot regardless of `pending_snapshot` state.
+**Implementation**: `Server::send_snapshot_to_client` replaces unsent queued
+state before enqueuing the new snapshot; partially sent frames keep their framing.
+Managed clients dispatch to `send_view_to_client`, which also replaces stale
+queued views. Resize updates all render clients, not only those awaiting their
+first snapshot. Diagnostic query responses are excluded from replacement.
+
+**Coverage**: `src/server.rs` tests
+`resize_during_output_backlog_keeps_frame_stream_valid` and
+`resize_does_not_drop_queued_diagnostic_response`.
 
 ---
 
@@ -37,59 +50,77 @@ On client attach/reconnect, `build_snapshot()` combines both layers and replays 
 ### ✅ DONE — Multi-client resize contention (TODO-1)
 
 **Severity**: High  
-**Status**: Decided — not yet implemented
+**Status**: Implemented; managed size authority is now separate from view size.
 
-**Problem**: The session has a single shared PTY. Any client's `RESIZE` changes the PTY dimensions for all clients. Only the resizing client receives a fresh replacement snapshot; other attached clients silently end up with a mismatched terminal size.
+**Original problem**: The session has a single shared PTY, but only the resizing
+client used to receive the replacement snapshot.
 
-**Decision**: Last-write-wins. The most recent `RESIZE` from any client becomes the authoritative PTY size. All other attached clients receive a replacement snapshot at the new dimensions immediately after the resize.
+**Implementation**: `RESIZE` and one-shot `SET_SIZE` change shared PTY dimensions
+and send replacement state to every render client. The focused managed window
+chooses `SET_SIZE` through the Lua plugin's `pterm resize` command; its bridge's
+`VIEW_SIZE` reports only physical renderer size. Passive managed views crop/pad
+canonical state without acquiring PTY size authority. Standalone CLI `RESIZE`
+requests still change the shared size; the latest processed authority request wins.
 
-**Files to change**: `src/server.rs` (RESIZE handler — broadcast replacement snapshot to all clients, not only the resizing one)
+**Coverage**: `src/server.rs::canonical_view_size_is_independent_and_managed_output_is_not_raw`
+and `tests/neovim_resize_regressions.lua`.
 
 ---
 
 ### ✅ DONE — DA1/DA2 queries unanswered while client is attached (TODO-2)
 
 **Severity**: Medium  
-**Status**: Not yet fixed
+**Status**: Implemented, with PTY ECHO checks.
 
-**Problem**: Daemon auto-answers DA1/DA2 only when `clients.is_empty()`. When a client is attached, the query is silently dropped. Applications that probe terminal identity after attach or after a reset receive no reply, which can cause hangs or incorrect behavior.
+**Original problem**: DA1/DA2 replies depended on `clients.is_empty()`, so attached
+applications could lose replies to terminal-identity probes.
 
-**Decision**: Always reply to DA1/DA2 from the daemon, regardless of client attachment state. The daemon intercepts these queries anyway; there is no reason to suppress the reply when clients are present.
+**Implementation**: `Server::drain_pty_output` queues DA1/DA2 replies regardless
+of client attachment state when PTY ECHO is disabled. Replies are deliberately
+dropped when ECHO is enabled or its state cannot be read, to avoid echoed query
+responses leaking into terminal output. Session callbacks count queries and the
+output filter removes reply-generating queries from the raw client stream.
 
-**Files to change**: `src/server.rs` (`handle_pty_output`, DA reply block)
+**Evidence**: `src/server.rs::drain_pty_output`,
+`src/session.rs::SessionCallbacks::unhandled_csi` and the
+`terminal_output_filter_strips_reply_generating_queries` regression.
 
 ---
 
 ### ✅ DONE — Stateful sequences relying solely on passthrough replay (TODO-3)
 
 **Severity**: Medium  
-**Status**: Ongoing / gradual improvement
+**Status**: The listed high-value modes have structured state; support for other
+terminal extensions remains incremental.
 
-**Problem**: Several long-lived terminal modes survive reconnect only because their raw escape sequences are still in the bounded passthrough queue. If they are evicted (queue full) or if the open/close pair is split across eviction boundaries, the replayed state is inconsistent.
+**Original problem**: Long-lived modes depended on raw sequences surviving the
+bounded passthrough queue, including both ends of state-changing pairs.
 
-Modes currently at risk:
-- Cursor shape (`DECSCUSR`) — already in passthrough allowlist, but raw replay only
-- Kitty keyboard protocol (`CSI > Ps u` etc.)
-- Focus tracking (`?1004`)
-- Synchronized output (`?2026`)
-- OSC 8 hyperlinks — open/close pairs can be split by eviction
-- Hyperlink state, OSC 7 (working directory)
+**Implementation**: `SessionCallbacks` explicitly stores cursor shape, separate
+main/alternate Kitty keyboard flags and stacks, focus tracking, synchronized
+output and the currently open OSC 8 URI. `build_snapshot` reconstructs that
+state rather than depending on queue retention. Managed views use
+`append_canonical_tracked_state`; one-shot events are delivered separately and
+are not replayed as persistent state.
 
-**Decision**: Promote high-value modes to explicit state fields in `SessionCallbacks`, rather than relying on raw byte retention. Priority order:
-
-1. Cursor shape — track as `Option<u8>` (DECSCUSR `Ps` value)
-2. Kitty keyboard flags — track as bitmask
-3. Focus tracking / synchronized output — track as `bool`
-4. OSC 8 hyperlinks — track as `Option<String>` (current open URI)
-
-**Files to change**: `src/session.rs` (`SessionCallbacks`, `build_snapshot`)
+**Coverage**: `src/session.rs` tests
+`snapshot_preserves_decscusr_cursor_shape`,
+`snapshot_preserves_focus_tracking_and_synchronized_output`,
+`snapshot_replays_kitty_keyboard_stack_and_current_flags`,
+`snapshot_preserves_distinct_main_and_alternate_kitty_keyboard_states` and
+`snapshot_replays_open_hyperlink_only`.
 
 ---
 
-## Priority Order
+## Current Boundaries
 
-| # | TODO | Severity | Effort | Suggested PR |
-|---|------|----------|--------|--------------|
-| 1 | TODO-2: DA query reply | Medium | Small | Add to `fix/rendering-corruption` |
-| 2 | TODO-1: Multi-client resize broadcast | High | Medium | Separate PR |
-| 3 | TODO-3: Structured state for top modes | Medium | Medium–Large | Separate PR per mode |
+- The original TODO numbers above are historical identifiers, not open work.
+- The bounded passthrough queue still cannot guarantee reconstruction of every
+  unmodelled terminal extension. Working-directory display uses the daemon's
+  process-CWD lookup (`src/paths.rs`); this ADR does not promise OSC 7 restoration.
+- Managed history replacement belongs to the daemon/bridge/Lua handshake
+  described in [Design](../DESIGN.md#managed-history-replacement). Neovim's local
+  scrollback is a rendering copy, not the canonical history store.
+- Managed attachments require protocol 2. Upgrading the plugin/binary does not
+  migrate an existing daemon; neither automatic restart nor preservation of its
+  child process across restart is provided.
