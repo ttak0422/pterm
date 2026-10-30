@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.0] - 2026-10-30
+
+### Bug Fixes
+
+- *(bridge)* Wait for managed negotiation before rejecting raw frames
+- *(bridge)* Keep handshake polling independent of reset refactor
+- *(bridge)* Bound handshake polling without duplicate branches
+- *(tests)* Parse PTY dimensions independently of trap IFS
+
+### Refactor
+
+- *(bridge)* Name poll timeout constants by purpose
+- *(bridge)* Encapsulate history reset waiting and clock
+
+### Documentation
+
+- Align terminal architecture with managed canonical views
+
+### Miscellaneous Tasks
+
+- *(test)* Use Neovim 0.12.6 without changing Rust toolchain
+- *(deps)* Update mio and serde_json patch releases
+- *(deps)* Port canonical reflow to vt100 0.18.1
+- *(vendor)* Omit standalone verification lockfile
 ## [2.2.0] - 2026-10-11
 
 ### Bug Fixes
@@ -634,6 +658,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.3.0]: https://github.com/ttak0422/pterm/compare/v2.2.0..v2.3.0
 [2.2.0]: https://github.com/ttak0422/pterm/compare/v2.1.0..v2.2.0
 [2.1.0]: https://github.com/ttak0422/pterm/compare/v2.0.1..v2.1.0
 [2.0.1]: https://github.com/ttak0422/pterm/compare/v2.0.0..v2.0.1
