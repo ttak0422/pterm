@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
+use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
 
 #[derive(Default)]
@@ -14,7 +15,6 @@ struct SessionCallbacks {
     window_title_stack: Vec<String>,
     pending_da1_queries: usize,
     pending_da2_queries: usize,
-    cursor_shape: Option<u8>,
     kitty_keyboard_states: ScreenKittyKeyboardStates,
     focus_tracking: bool,
     synchronized_output: bool,
@@ -460,13 +460,13 @@ impl SessionCallbacks {
         true
     }
 
-    fn dump(&self) -> TrackedStateDump {
+    fn dump(&self, screen: &vt100::Screen) -> TrackedStateDump {
         TrackedStateDump {
             window_title: self.window_title.clone(),
             window_title_stack: self.window_title_stack.clone(),
             pending_da1_queries: self.pending_da1_queries,
             pending_da2_queries: self.pending_da2_queries,
-            cursor_shape: self.cursor_shape,
+            cursor_shape: Some(cursor_shape(screen)),
             kitty_keyboard: ScreenKittyKeyboardStatesDump {
                 main: self.kitty_keyboard_states.main.dump(),
                 alternate: self.kitty_keyboard_states.alternate.dump(),
@@ -582,6 +582,7 @@ fn format_bytes_hex(bytes: &[u8]) -> String {
 
 fn dump_screen(screen: &vt100::Screen) -> ScreenDump {
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let (cursor_row, cursor_col) = screen.cursor_position();
     let default_attrs = CellAttrsDump::default();
     let text_rows: Vec<String> = screen.rows(0, cols).collect();
@@ -639,9 +640,21 @@ fn dump_screen(screen: &vt100::Screen) -> ScreenDump {
     }
 }
 
+fn cursor_shape(screen: &vt100::Screen) -> u8 {
+    match screen.cursor_style() {
+        vt100::CursorStyle::Default => 0,
+        vt100::CursorStyle::BlinkBlock => 1,
+        vt100::CursorStyle::SteadyBlock => 2,
+        vt100::CursorStyle::BlinkUnderline => 3,
+        vt100::CursorStyle::SteadyUnderline => 4,
+        vt100::CursorStyle::BlinkVerticalBar => 5,
+        vt100::CursorStyle::SteadyVerticalBar => 6,
+    }
+}
+
 fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u8> {
     let passthrough = callbacks.passthrough_sequences_formatted();
-    let mut snapshot = screen.state_formatted();
+    let mut snapshot = screen.state_formatted().into_bytes();
     let mut prefix = Vec::new();
 
     // Rebuild the window title stack so subsequent ESC[23;0t restores work
@@ -686,22 +699,18 @@ fn build_snapshot(screen: &vt100::Screen, callbacks: &SessionCallbacks) -> Vec<u
         snapshot = prefix;
     }
 
-    // Passthrough sequences (e.g. DECSCUSR cursor shape) must come after
+    // Passthrough sequences and the upstream cursor style must come after
     // state_formatted() so they are not overwritten by cursor-positioning
     // sequences that state_formatted() emits at the end.
     if !passthrough.is_empty() {
         snapshot.extend_from_slice(&passthrough);
     }
-    if let Some(ps) = callbacks.cursor_shape {
-        snapshot.extend_from_slice(b"\x1b[");
-        snapshot.extend_from_slice(ps.to_string().as_bytes());
-        snapshot.extend_from_slice(b" q");
-    }
+    snapshot.extend_from_slice(format!("\x1b[{} q", cursor_shape(screen)).as_bytes());
     snapshot
 }
 
 fn build_snapshot_text(screen: &vt100::Screen) -> String {
-    let (_, cols) = screen.size();
+    let cols = screen.size().1.get();
     screen.rows(0, cols).collect::<Vec<_>>().join("\n")
 }
 
@@ -805,6 +814,7 @@ fn push_sgr_diff(out: &mut String, from: &SgrState, to: &SgrState) {
 /// trailing blank cells are trimmed like `build_snapshot_text`.
 fn build_snapshot_ansi(screen: &vt100::Screen) -> String {
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let mut out = String::new();
 
     for row in 0..rows {
@@ -970,6 +980,7 @@ fn build_canonical_view(
     // Keep rendering independent of any application margins/origin modes.
     out.push_str("\x1b[?2026l\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[0m\x1b]8;;\x1b\\");
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let cols = cols.min(view_cols);
     if !alternate && history_lines > 0 {
         // The bounded 65,536-cell screen needs < 8 MiB even with per-cell
@@ -999,17 +1010,17 @@ fn build_canonical_view(
     // first so disabling/changing a previously active mode works too.
     out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
     let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(&screen.input_mode_formatted());
+    bytes.extend_from_slice(screen.input_mode_formatted().as_bytes());
     // The renderer may be much taller than the application. Use SGR on this
     // transport so its padded coordinates cannot overflow legacy X10 bytes.
     // The daemon translates/re-encodes mouse reports for the application's
     // original encoding; this does not enable mouse tracking by itself.
     bytes.extend_from_slice(b"\x1b[?1005l\x1b[?1006h");
-    bytes.extend_from_slice(&screen.attributes_formatted());
+    bytes.extend_from_slice(screen.attributes_formatted().as_bytes());
     // cursor_state_formatted can repaint a cell to recreate pending wrap.
     // A view cursor must only position, and must stay inside its viewport.
     let (cursor_row, cursor_col) = screen.cursor_position();
-    let cursor_col = cursor_col.min(screen.size().1.saturating_sub(1));
+    let cursor_col = cursor_col.min(screen.size().1.get().saturating_sub(1));
     let cursor_visible = !screen.hide_cursor() && cursor_row < view_rows && cursor_col < view_cols;
     bytes.extend_from_slice(
         format!(
@@ -1059,9 +1070,7 @@ fn append_canonical_tracked_state(
     {
         out.extend_from_slice(blink);
     }
-    if let Some(shape) = callbacks.cursor_shape {
-        out.extend_from_slice(format!("\x1b[{} q", shape).as_bytes());
-    }
+    out.extend_from_slice(format!("\x1b[{} q", cursor_shape(screen)).as_bytes());
 }
 
 /// Render the scrollback history (everything above the live screen) as a raw
@@ -1082,7 +1091,7 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
     if screen.alternate_screen() {
         return Vec::new();
     }
-    let (rows, _) = screen.size();
+    let rows = screen.size().0.get();
 
     screen.set_scrollback(usize::MAX);
     let total = screen.scrollback();
@@ -1102,7 +1111,7 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
         // Scrollback rows retain their original width after a resize.
         // Read the entire stored row, including columns outside the current viewport.
         for (i, row) in screen.rows_formatted(0, u16::MAX).take(take).enumerate() {
-            out.extend_from_slice(&row);
+            out.extend_from_slice(row.as_bytes());
             out.extend_from_slice(b"\x1b[0m");
             if !screen.row_wrapped(i as u16) {
                 out.extend_from_slice(b"\r\n");
@@ -1125,6 +1134,7 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
 /// visible screen is rendered (vt100's scrollback belongs to the main screen).
 fn build_full_text(screen: &mut vt100::Screen) -> String {
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     let mut lines: Vec<String> = Vec::new();
     let mut pending = String::new();
 
@@ -1250,7 +1260,7 @@ impl vt100::Callbacks for SessionCallbacks {
                         "\x1b[{}{};{}R",
                         if i1.is_some() { "?" } else { "" },
                         row + 1,
-                        col.min(screen.size().1 - 1) + 1
+                        col.min(screen.size().1.get() - 1) + 1
                     );
                     self.push_terminal_response(response.as_bytes());
                     return;
@@ -1265,15 +1275,10 @@ impl vt100::Callbacks for SessionCallbacks {
             && Self::first_param(params) == Some(18)
         {
             let (rows, cols) = screen.size();
+            let (rows, cols) = (rows.get(), cols.get());
             self.push_terminal_response(format!("\x1b[8;{};{}t", rows, cols).as_bytes());
             return;
         }
-        if i1 == Some(b' ') && i2.is_none() && c == 'q' {
-            self.cursor_shape =
-                Self::first_param(params).and_then(|param| u8::try_from(param).ok());
-            return;
-        }
-
         if i1 == Some(b'?') && i2.is_none() && self.update_private_mode_state(params, c) {
             if Self::is_passthrough_private_mode(i1, i2, params, c) {
                 self.push_passthrough_sequence(Self::format_unhandled_csi(i1, i2, params, c));
@@ -1506,8 +1511,8 @@ impl Session {
             name,
             pty,
             parser: vt100::Parser::new_with_callbacks(
-                rows,
-                cols,
+                NonZeroU16::new(rows).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
                 10_000,
                 SessionCallbacks::default(),
             ),
@@ -1569,7 +1574,10 @@ impl Session {
             ));
         }
         self.pty.resize(cols, rows)?;
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser.set_size(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+        );
         Ok(())
     }
 
@@ -1604,6 +1612,7 @@ impl Session {
     ) {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
+        let (rows, cols) = (rows.get(), cols.get());
         (
             cols,
             rows,
@@ -1637,7 +1646,7 @@ impl Session {
             schema_version: 1,
             session: self.name.clone(),
             screen: dump_screen(self.parser.screen()),
-            tracked: self.parser.callbacks().dump(),
+            tracked: self.parser.callbacks().dump(self.parser.screen()),
             snapshot: BytesDump::new(&snapshot),
         }
     }
@@ -1709,6 +1718,7 @@ mod tests {
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
+    use std::num::NonZeroU16;
 
     #[test]
     fn managed_mouse_transport_uses_sgr_without_changing_application_mode() {
@@ -1729,9 +1739,17 @@ mod tests {
                 vt100::MouseProtocolEncoding::Sgr,
             ),
         ] {
-            let mut source = vt100::Parser::new(2, 8, 100);
+            let mut source = vt100::Parser::new(
+                NonZeroU16::new(2).unwrap(),
+                NonZeroU16::new(8).unwrap(),
+                100,
+            );
             source.process(sequence);
-            let mut managed = vt100::Parser::new(8, 12, 100);
+            let mut managed = vt100::Parser::new(
+                NonZeroU16::new(8).unwrap(),
+                NonZeroU16::new(12).unwrap(),
+                100,
+            );
             managed.process(&build_canonical_view(source.screen_mut(), 12, 8, None, 0));
             assert_eq!(managed.screen().mouse_protocol_mode(), mode);
             assert_eq!(
@@ -1739,8 +1757,12 @@ mod tests {
                 vt100::MouseProtocolEncoding::Sgr
             );
             assert_eq!(source.screen().mouse_protocol_encoding(), encoding);
-            let mut standalone = vt100::Parser::new(2, 8, 100);
-            standalone.process(&source.screen().state_formatted());
+            let mut standalone = vt100::Parser::new(
+                NonZeroU16::new(2).unwrap(),
+                NonZeroU16::new(8).unwrap(),
+                100,
+            );
+            standalone.process(source.screen().state_formatted().as_bytes());
             assert_eq!(standalone.screen().mouse_protocol_mode(), mode);
             assert_eq!(standalone.screen().mouse_protocol_encoding(), encoding);
         }
@@ -1748,7 +1770,11 @@ mod tests {
 
     #[test]
     fn canonical_history_byte_budget_does_not_discard_source_history() {
-        let mut source = vt100::Parser::new(2, 20, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            100,
+        );
         source.process(b"oldest\r\nmiddle\r\nnewest\r\nvisible\r\nlast");
         let original = build_full_text(source.screen_mut());
         let mut limited = String::new();
@@ -1767,7 +1793,12 @@ mod tests {
 
     #[test]
     fn canonical_queries_capture_cursor_once_and_are_filtered_for_legacy_clients() {
-        let mut parser = vt100::Parser::new_with_callbacks(4, 8, 100, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+            SessionCallbacks::default(),
+        );
         let input = b"\x1b[2;4H\x1b[006nHELLO\x1b[5n\x1b[?6n\x1b[18t";
         parser.process(input);
         let replies = std::mem::take(&mut parser.callbacks_mut().terminal_responses);
@@ -1786,7 +1817,12 @@ mod tests {
 
     #[test]
     fn canonical_bells_and_clipboard_are_one_shot_and_unknown_osc_is_not_forwarded() {
-        let mut parser = vt100::Parser::new_with_callbacks(4, 8, 100, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+            SessionCallbacks::default(),
+        );
         parser.process(
             b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]1337;Custom=1\x07",
         );
@@ -1821,26 +1857,42 @@ mod tests {
 
     #[test]
     fn canonical_width_one_uses_a_safe_placeholder_without_losing_wide_text() {
-        let mut source = vt100::Parser::new(2, 4, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(4).unwrap(),
+            100,
+        );
         source.process("界".as_bytes());
-        source.screen_mut().set_size(2, 1);
+        source
+            .screen_mut()
+            .set_size(NonZeroU16::new(2).unwrap(), NonZeroU16::new(1).unwrap());
         let view = build_canonical_view(source.screen_mut(), 8, 4, None, 0);
         assert!(String::from_utf8_lossy(&view).contains('\u{fffd}'));
         assert!(!String::from_utf8_lossy(&view).contains('界'));
-        source.screen_mut().set_size(2, 4);
+        source
+            .screen_mut()
+            .set_size(NonZeroU16::new(2).unwrap(), NonZeroU16::new(4).unwrap());
         let view = build_canonical_view(source.screen_mut(), 8, 4, None, 0);
         assert!(String::from_utf8_lossy(&view).contains('界'));
     }
 
     #[test]
     fn canonical_view_crops_and_pads_without_creating_history() {
-        let mut source = vt100::Parser::new(3, 8, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+        );
         source.process(b"abcdefgh\r\n12345678\r\nlast");
         for (rows, cols, expected) in [
             (2, 5, "abcde\n12345"),
             (5, 12, "\n\nabcdefgh\n12345678\nlast"),
         ] {
-            let mut client = vt100::Parser::new(rows, cols, 100);
+            let mut client = vt100::Parser::new(
+                NonZeroU16::new(rows).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
+                100,
+            );
             for row in 1..=rows {
                 client.process(
                     format!("\x1b[{};1H{}", row, "x".repeat(usize::from(cols))).as_bytes(),
@@ -1867,19 +1919,30 @@ mod tests {
     #[test]
     fn canonical_view_bottom_aligns_rows_and_cursor_for_short_active_window() {
         for alternate in [false, true] {
-            let mut source = vt100::Parser::new(3, 8, 100);
+            let mut source = vt100::Parser::new(
+                NonZeroU16::new(3).unwrap(),
+                NonZeroU16::new(8).unwrap(),
+                100,
+            );
             if alternate {
                 source.process(b"\x1b[?1049h");
             }
             source.process(b"top\x1b[2;1Hmiddle\x1b[3;1Hbottom\x1b[2;3H");
-            let mut client = vt100::Parser::new(7, 12, 100);
+            let mut client = vt100::Parser::new(
+                NonZeroU16::new(7).unwrap(),
+                NonZeroU16::new(12).unwrap(),
+                100,
+            );
             let mut previous_alternate = None;
 
             // The shared physical renderer stays tall while the active
             // horizontal split shrinks and grows. Neovim shows its last
             // source_rows lines, so those must exactly match the live grid.
             for source_rows in [3, 2, 5, 1, 3] {
-                source.screen_mut().set_size(source_rows, 8);
+                source.screen_mut().set_size(
+                    NonZeroU16::new(source_rows).unwrap(),
+                    NonZeroU16::new(8).unwrap(),
+                );
                 let offset = 7 - source_rows;
                 let mut expected = vec![String::new(); usize::from(offset)];
                 expected.extend(source.screen().rows(0, 8));
@@ -1906,9 +1969,17 @@ mod tests {
 
     #[test]
     fn canonical_view_smaller_physical_view_crops_top_left_and_hides_clipped_cursor() {
-        let mut source = vt100::Parser::new(4, 8, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+        );
         source.process(b"top-left\x1b[2;1Hsecond\x1b[3;1Hthird\x1b[4;1Hbottom");
-        let mut client = vt100::Parser::new(2, 5, 100);
+        let mut client = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(5).unwrap(),
+            100,
+        );
         for (cursor, visible, position) in [
             (b"\x1b[4;1H".as_slice(), false, (1, 0)),
             (b"\x1b[1;8H".as_slice(), false, (0, 4)),
@@ -1934,9 +2005,17 @@ mod tests {
 
     #[test]
     fn canonical_view_archives_only_requested_rows_at_physical_height() {
-        let mut source = vt100::Parser::new(2, 8, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+        );
         source.process(b"one\r\ntwo\r\nthree\r\nfour");
-        let mut client = vt100::Parser::new(5, 12, 100);
+        let mut client = vt100::Parser::new(
+            NonZeroU16::new(5).unwrap(),
+            NonZeroU16::new(12).unwrap(),
+            100,
+        );
         client.process(&build_canonical_view(
             source.screen_mut(),
             12,
@@ -1974,9 +2053,17 @@ mod tests {
 
     #[test]
     fn canonical_view_crops_wide_glyphs_and_preserves_styles() {
-        let mut source = vt100::Parser::new(2, 8, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+        );
         source.process("\x1b[31;44;1mabc界z\x1b[0m\r\nnext".as_bytes());
-        let mut client = vt100::Parser::new(2, 4, 100);
+        let mut client = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(4).unwrap(),
+            100,
+        );
         client.process(&build_canonical_view(source.screen_mut(), 4, 2, None, 0));
         assert_eq!(client.screen().contents(), "abc\nnext");
         let cell = client.screen().cell(0, 0).unwrap();
@@ -1989,9 +2076,17 @@ mod tests {
 
     #[test]
     fn canonical_view_alternate_transition_preserves_main_history() {
-        let mut source = vt100::Parser::new(2, 8, 100);
+        let mut source = vt100::Parser::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+        );
         source.process(b"one\r\ntwo\r\nthree");
-        let mut client = vt100::Parser::new(3, 10, 100);
+        let mut client = vt100::Parser::new(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(10).unwrap(),
+            100,
+        );
         client.process(&build_canonical_view(
             source.screen_mut(),
             10,
@@ -2029,7 +2124,11 @@ mod tests {
     /// Replay `bytes` into a fresh parser and return the visible plain text,
     /// so history streams are verified by their effect on a real terminal.
     fn replay_contents(bytes: &[u8], rows: u16, cols: u16) -> String {
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            10_000,
+        );
         parser.process(bytes);
         parser.screen().contents()
     }
@@ -2053,7 +2152,10 @@ mod tests {
             );
             assert_eq!(
                 session.parser.screen().size(),
-                (DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS)
+                (
+                    NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+                    NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap()
+                )
             );
             let mut size: nix::libc::winsize = unsafe { std::mem::zeroed() };
             assert_eq!(
@@ -2067,7 +2169,13 @@ mod tests {
         }
         for (cols, rows) in [(512, 128), (256, 256), (512, 1), (1, 256), (100, 30)] {
             session.resize(cols, rows).unwrap();
-            assert_eq!(session.parser.screen().size(), (rows, cols));
+            assert_eq!(
+                session.parser.screen().size(),
+                (
+                    NonZeroU16::new(rows).unwrap(),
+                    NonZeroU16::new(cols).unwrap()
+                )
+            );
             assert!(!session.snapshot().is_empty());
         }
     }
@@ -2108,7 +2216,11 @@ mod tests {
     fn history_contains_scrolled_off_lines_but_not_visible_screen() {
         let rows = 5u16;
         let cols = 20u16;
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            10_000,
+        );
         for i in 1..=30 {
             parser.process(format!("line-{}\r\n", i).as_bytes());
         }
@@ -2131,7 +2243,11 @@ mod tests {
     fn history_max_lines_keeps_only_newest_lines() {
         let rows = 5u16;
         let cols = 20u16;
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            10_000,
+        );
         for i in 1..=30 {
             parser.process(format!("line-{}\r\n", i).as_bytes());
         }
@@ -2149,7 +2265,11 @@ mod tests {
     fn history_rejoins_wrapped_lines_without_crlf() {
         let rows = 4u16;
         let cols = 10u16;
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            10_000,
+        );
         // One 25-char line wraps across three rows, then enough lines to
         // push it fully into the scrollback.
         parser.process(b"abcdefghijklmnopqrstuvwxy\r\n");
@@ -2167,13 +2287,23 @@ mod tests {
 
     #[test]
     fn history_preserves_lines_after_narrow_resize() {
-        let mut parser = vt100::Parser::new(4, 20, 100);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            100,
+        );
         let line = "abcdefghijklmnopqrstuvwx日本語";
         parser.process(format!("\x1b[31m{line}\x1b[0m\r\n\r\n\r\n\r\n\r\n").as_bytes());
         for cols in [10, 30, 8] {
-            parser.screen_mut().set_size(4, cols);
+            parser
+                .screen_mut()
+                .set_size(NonZeroU16::new(4).unwrap(), NonZeroU16::new(cols).unwrap());
             let history = build_history(parser.screen_mut(), usize::MAX);
-            let mut client = vt100::Parser::new(40, cols, 100);
+            let mut client = vt100::Parser::new(
+                NonZeroU16::new(40).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
+                100,
+            );
             client.process(&history);
             let replayed = build_full_text(client.screen_mut());
             assert!(replayed.contains(line), "cols={cols}: {replayed:?}");
@@ -2188,7 +2318,11 @@ mod tests {
 
     #[test]
     fn history_is_empty_on_alternate_screen_and_without_scrollback() {
-        let mut parser = vt100::Parser::new(5, 20, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(5).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            10_000,
+        );
         parser.process(b"just one line\r\n");
         assert!(build_history(parser.screen_mut(), usize::MAX).is_empty());
 
@@ -2205,7 +2339,11 @@ mod tests {
     fn full_text_contains_scrollback_and_visible_screen_once() {
         let rows = 5u16;
         let cols = 20u16;
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            10_000,
+        );
         for i in 1..=30 {
             parser.process(format!("line-{}\r\n", i).as_bytes());
         }
@@ -2237,7 +2375,11 @@ mod tests {
         // scrollback -> live-screen seam (last scrollback row -> live row 0).
         // Both exercise the `pending` handoff that a wrap contained in a
         // single window never reaches.
-        let mut parser = vt100::Parser::new(4, 10, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(10).unwrap(),
+            10_000,
+        );
         for i in 1..=3 {
             parser.process(format!("s{}\r\n", i).as_bytes());
         }
@@ -2266,7 +2408,11 @@ mod tests {
 
     #[test]
     fn full_text_on_alternate_screen_omits_scrollback() {
-        let mut parser = vt100::Parser::new(5, 20, 10_000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(5).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            10_000,
+        );
         for i in 1..=30 {
             parser.process(format!("line-{}\r\n", i).as_bytes());
         }
@@ -2281,7 +2427,11 @@ mod tests {
 
     #[test]
     fn dump_screen_includes_rows_cells_and_attributes() {
-        let mut parser = vt100::Parser::new(DEFAULT_TERMINAL_ROWS, DEFAULT_TERMINAL_COLS, 1000);
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
+            1000,
+        );
         parser.process(b"plain \x1b[31mred");
 
         let dump = dump_screen(parser.screen());
@@ -2309,8 +2459,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_unhandled_osc_sequences() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2328,8 +2478,8 @@ mod tests {
     #[test]
     fn snapshot_drops_osc_color_queries() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2346,8 +2496,8 @@ mod tests {
     #[test]
     fn osc_color_queries_do_not_queue_daemon_responses() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2420,8 +2570,8 @@ mod tests {
     #[test]
     fn handled_sgr_is_not_added_to_passthrough_sequences() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2435,15 +2585,18 @@ mod tests {
         // Vim emits DECSCUSR when switching modes (e.g. ESC[6 q for bar cursor
         // in insert mode, ESC[2 q for block in normal mode).
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
         parser.process(b"\x1b[6 q");
 
         assert!(parser.callbacks().passthrough_sequences.is_empty());
-        assert_eq!(parser.callbacks().cursor_shape, Some(6));
+        assert_eq!(
+            parser.screen().cursor_style(),
+            vt100::CursorStyle::SteadyVerticalBar
+        );
 
         let snapshot = build_snapshot(parser.screen(), parser.callbacks());
         let snapshot = String::from_utf8_lossy(&snapshot);
@@ -2455,11 +2608,48 @@ mod tests {
     }
 
     #[test]
+    fn upstream_cursor_style_survives_canonical_replay_and_reset() {
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            100,
+            SessionCallbacks::default(),
+        );
+        let mut replay = vt100::Parser::default();
+        for (input, style, shape) in [
+            (
+                b"\x1b[6 q".as_slice(),
+                vt100::CursorStyle::SteadyVerticalBar,
+                6,
+            ),
+            (b"\x1b[0 q".as_slice(), vt100::CursorStyle::Default, 0),
+            (
+                b"\x1b[3 q".as_slice(),
+                vt100::CursorStyle::BlinkUnderline,
+                3,
+            ),
+            (b"\x1bc".as_slice(), vt100::CursorStyle::Default, 0),
+        ] {
+            parser.process(input);
+            let mut view = build_canonical_view(parser.screen_mut(), 8, 3, None, 0);
+            append_canonical_tracked_state(&mut view, parser.screen(), parser.callbacks());
+            replay.process(&view);
+            assert_eq!(replay.screen().cursor_style(), style);
+            assert_eq!(
+                parser.callbacks().dump(parser.screen()).cursor_shape,
+                Some(shape)
+            );
+            replay.process(&build_snapshot(parser.screen(), parser.callbacks()));
+            assert_eq!(replay.screen().cursor_style(), style);
+        }
+    }
+
+    #[test]
     fn snapshot_preserves_cursor_blink_mode() {
         // AT&T 610: ESC[?12l disables cursor blink, ESC[?12h enables it.
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2478,8 +2668,8 @@ mod tests {
     fn snapshot_preserves_declrmm() {
         // DECLRMM: ESC[?69h enables left-right margin mode.
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2497,8 +2687,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_focus_tracking_and_synchronized_output() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2517,8 +2707,12 @@ mod tests {
 
     #[test]
     fn snapshot_relies_on_vt100_for_tracked_input_modes() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(
             b"\x1b[?25l\x1b[?2004h\x1b[?1002h\x1b[?1006h\
               tracked by vt100",
@@ -2541,8 +2735,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_kitty_keyboard_protocol_sequences() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2596,8 +2790,12 @@ mod tests {
 
     #[test]
     fn snapshot_replays_kitty_keyboard_stack_and_current_flags() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[=3u\x1b[>7u");
 
         assert_eq!(parser.callbacks().kitty_keyboard_states.main.flags, 7);
@@ -2616,8 +2814,12 @@ mod tests {
 
     #[test]
     fn kitty_keyboard_enhancement_modes_update_current_flags() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[=3u\x1b[=4;2u\x1b[=1;3u");
 
         assert_eq!(parser.callbacks().kitty_keyboard_states.main.flags, 6);
@@ -2636,8 +2838,12 @@ mod tests {
 
     #[test]
     fn kitty_keyboard_pop_restores_previous_flags() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[=3u\x1b[>7u\x1b[>0u\x1b[<u");
 
         assert_eq!(parser.callbacks().kitty_keyboard_states.main.flags, 7);
@@ -2656,8 +2862,12 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_distinct_main_and_alternate_kitty_keyboard_states() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[=3u");
         parser.process(b"\x1b[?1049h");
         parser.process(b"\x1b[=9u\x1b[>12u");
@@ -2678,8 +2888,12 @@ mod tests {
 
     #[test]
     fn kitty_keyboard_stack_depth_is_bounded() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
 
         for idx in 0..(KittyKeyboardState::MAX_STACK_DEPTH as u32 + 5) {
             let seq = format!("\x1b[>{}u", idx);
@@ -2694,8 +2908,12 @@ mod tests {
 
     #[test]
     fn snapshot_replays_open_hyperlink_only() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b]8;;https://example.com\x1b\\link");
 
         assert_eq!(
@@ -2712,8 +2930,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_unhandled_sgr_subparams() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2729,8 +2947,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_osc_52_clipboard_copy() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2745,8 +2963,8 @@ mod tests {
     #[test]
     fn snapshot_preserves_non_title_csi_t_sequences() {
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2773,8 +2991,8 @@ mod tests {
         // Vim saves the original title on entry with ESC[22;0t, then sets its
         // own title. On exit it restores with ESC[23;0t.
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2818,8 +3036,8 @@ mod tests {
     fn window_title_restore_pops_stack() {
         // ESC[23;0t restores the previously saved title.
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2846,8 +3064,8 @@ mod tests {
         // overwritten by the cursor-positioning sequences that state_formatted()
         // emits at the end.
         let mut parser = vt100::Parser::new_with_callbacks(
-            DEFAULT_TERMINAL_ROWS,
-            DEFAULT_TERMINAL_COLS,
+            NonZeroU16::new(DEFAULT_TERMINAL_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERMINAL_COLS).unwrap(),
             1000,
             SessionCallbacks::default(),
         );
@@ -2874,7 +3092,12 @@ mod tests {
 
     #[test]
     fn snapshot_text_rows_include_visible_screen_contents() {
-        let mut parser = vt100::Parser::new_with_callbacks(3, 8, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"hello\r\nworld");
 
         assert_eq!(build_snapshot_text(parser.screen()), "hello\nworld\n");
@@ -2882,7 +3105,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_plain_text_matches_plain_snapshot() {
-        let mut parser = vt100::Parser::new_with_callbacks(3, 8, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(8).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"hello\r\nworld");
 
         let ansi = build_snapshot_ansi(parser.screen());
@@ -2892,8 +3120,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_preserves_colors_and_attributes() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(4, 24, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(24).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
 
         parser.process(b"\x1b[31mred");
         parser.process(b"\x1b[1mbold");
@@ -2927,8 +3159,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_emits_diff_only_when_state_changes() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(2, 20, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         parser.process(b"\x1b[32maaaa\x1b[32mbbbb");
 
         let ansi = build_snapshot_ansi(parser.screen());
@@ -2940,10 +3176,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_preserves_intensity_transitions() {
-        let mut parser = vt100::Parser::new(1, 8, 0);
+        let mut parser =
+            vt100::Parser::new(NonZeroU16::new(1).unwrap(), NonZeroU16::new(8).unwrap(), 0);
         parser.process(b"\x1b[2md\x1b[1mb\x1b[2md");
 
-        let mut replay = vt100::Parser::new(1, 8, 0);
+        let mut replay =
+            vt100::Parser::new(NonZeroU16::new(1).unwrap(), NonZeroU16::new(8).unwrap(), 0);
         replay.process(build_snapshot_ansi(parser.screen()).as_bytes());
 
         for col in 0..3 {
@@ -2956,10 +3194,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_resets_attributes_before_padding_gaps() {
-        let mut parser = vt100::Parser::new(1, 8, 0);
+        let mut parser =
+            vt100::Parser::new(NonZeroU16::new(1).unwrap(), NonZeroU16::new(8).unwrap(), 0);
         parser.process(b"\x1b[41mA\x1b[0m\x1b[3CB");
 
-        let mut replay = vt100::Parser::new(1, 8, 0);
+        let mut replay =
+            vt100::Parser::new(NonZeroU16::new(1).unwrap(), NonZeroU16::new(8).unwrap(), 0);
         replay.process(build_snapshot_ansi(parser.screen()).as_bytes());
 
         assert_eq!(replay.screen().contents(), parser.screen().contents());
@@ -2974,7 +3214,12 @@ mod tests {
 
     #[test]
     fn snapshot_ansi_pads_to_styled_background_width() {
-        let mut parser = vt100::Parser::new_with_callbacks(2, 6, 1000, SessionCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(6).unwrap(),
+            1000,
+            SessionCallbacks::default(),
+        );
         // A background-colored region extending to the full row width.
         parser.process(b"\x1b[41m\x1b[K");
 

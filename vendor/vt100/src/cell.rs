@@ -1,4 +1,4 @@
-use unicode_width::UnicodeWidthChar as _;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 // chosen to make the size of the cell struct 32 bytes
 const CONTENT_BYTES: usize = 22;
@@ -14,7 +14,7 @@ pub struct Cell {
     len: u8,
     attrs: crate::attrs::Attrs,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 32);
+const _: () = assert!(core::mem::size_of::<Cell>() == 32);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -30,11 +30,13 @@ impl PartialEq<Self> for Cell {
 }
 
 impl Cell {
-    pub(crate) fn new() -> Self {
+    pub(crate) const DEFAULT: Self = Self::new();
+
+    pub(crate) const fn new() -> Self {
         Self {
-            contents: Default::default(),
+            contents: [0; CONTENT_BYTES],
             len: 0,
-            attrs: crate::attrs::Attrs::default(),
+            attrs: crate::attrs::Attrs::new(),
         }
     }
 
@@ -45,9 +47,8 @@ impl Cell {
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
         self.len = 0;
         self.append_char(0, c);
-        // strings in this context should always be an arbitrary character
-        // followed by zero or more zero-width characters, so we should only
-        // have to look at the first character
+        // if we're setting a single character, we can just look at that one
+        // character to determine the cell width
         self.set_wide(c.width().unwrap_or(1) > 1);
         self.attrs = a;
     }
@@ -66,11 +67,28 @@ impl Cell {
         self.append_char(self.len(), c);
     }
 
+    pub(crate) fn set_contents(&mut self, s: &str, a: crate::attrs::Attrs) {
+        let mut chars = s.chars();
+        let Some(c) = chars.next() else {
+            return;
+        };
+        self.set(c, a);
+        for c in chars {
+            self.append(c);
+        }
+    }
+
     // Writes bytes representing c at start
     // Requires caller to verify start <= CODEPOINTS_IN_CELL * 4
     fn append_char(&mut self, start: usize, c: char) {
         c.encode_utf8(&mut self.contents[start..]);
         self.len += u8::try_from(c.len_utf8()).unwrap();
+        // if we're appending characters, we have to account for emoji
+        // presentation being requested, which can turn a base character that
+        // is otherwise considered to be narrow into a wide character
+        if c == '\u{FE0F}' {
+            self.set_wide(self.contents().width() > 1);
+        }
     }
 
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
@@ -87,7 +105,7 @@ impl Cell {
     #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn contents(&self) -> &str {
-        std::str::from_utf8(&self.contents[..self.len()]).unwrap()
+        core::str::from_utf8(&self.contents[..self.len()]).unwrap()
     }
 
     /// Returns whether the cell contains any text data.
@@ -133,12 +151,7 @@ impl Cell {
     /// marks do not change the width of their leading character.
     #[must_use]
     pub fn natural_width(&self) -> u16 {
-        self.contents()
-            .chars()
-            .next()
-            .and_then(|c| c.width())
-            .unwrap_or(1)
-            .max(1) as u16
+        self.contents().width().clamp(1, 2) as u16
     }
 
     pub(crate) fn attrs(&self) -> &crate::attrs::Attrs {

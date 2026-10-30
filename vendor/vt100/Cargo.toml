@@ -1,9 +1,9 @@
 [package]
 name = "vt100"
-version = "0.16.2"
+version = "0.18.1"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
-edition = "2021"
-rust-version = "1.70"
+edition = "2024"
+rust-version = "1.85"
 
 description = "Library for parsing terminal data"
 homepage = "https://github.com/doy/vt100-rust"
@@ -15,6 +15,11 @@ license = "MIT"
 include = ["src/**/*", "LICENSE", "README.md", "CHANGELOG.md"]
 
 [dependencies]
-itoa = "1.0.15"
-unicode-width = "0.2.1"
-vte = "0.15.0"
+itoa = "1.0.18"
+unicode-width = "0.2.2"
+vte = { version = "0.15.0", default-features = false }
+embedded-io = { version = "0.7.1", optional = true }
+
+[features]
+default = ["std"]
+std = ["vte/std"]

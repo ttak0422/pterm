@@ -1,5 +1,5 @@
 // Compile the vendored parser regressions in the root workspace's test suite.
-use vt100::{Color, Parser, Screen};
+use vt100::{capture, Callbacks, Color, Parser, Screen};
 
 mod reflow_tests {
     include!(concat!(
