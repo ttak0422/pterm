@@ -89,6 +89,17 @@ sentinel line before the refreshed history. This also supports Neovim 0.11 and
 older, which cannot clear terminal history with CSI 3 J. Previous history content
 is replaced rather than duplicated, and the user's `scrollback` setting is restored.
 
+### TUI redraws
+
+Managed Neovim attachments keep the last complete view while an application
+uses synchronized output (DEC mode 2026), rather than displaying each partial
+PTY read. A missing end marker is released after a one-second safety timeout
+(on the next daemon poll), and child exit releases the final view immediately.
+Each generated view is also wrapped in synchronized output so native terminals
+that support it, including Neovim 0.12, can paint a whole frame together.
+Older Neovim versions still receive complete application updates, but do not
+provide atomic rendering of a view delivered across multiple terminal reads.
+
 ## Requirements
 
 - Neovim 0.10+

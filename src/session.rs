@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct SessionCallbacks {
@@ -18,6 +19,7 @@ struct SessionCallbacks {
     kitty_keyboard_states: ScreenKittyKeyboardStates,
     focus_tracking: bool,
     synchronized_output: bool,
+    synchronized_output_started: Option<Instant>,
     hyperlink_uri: Option<String>,
     passthrough_sequences: VecDeque<Vec<u8>>,
     passthrough_bytes: usize,
@@ -397,6 +399,12 @@ impl SessionCallbacks {
             }
             Some(2026) => {
                 self.synchronized_output = c == 'h';
+                self.synchronized_output_started = if c == 'h' {
+                    self.synchronized_output_started
+                        .or_else(|| Some(Instant::now()))
+                } else {
+                    None
+                };
                 true
             }
             _ => false,
@@ -957,7 +965,7 @@ fn build_canonical_view(
     history_lines: usize,
 ) -> Vec<u8> {
     let alternate = screen.alternate_screen();
-    let mut out = String::new();
+    let mut out = String::from("\x1b[?2026h");
     // None means queued views were replaced or this is a fresh attachment.
     // Establish the screen explicitly because a discarded frame might have
     // contained an alternate-screen transition that never reached the client.
@@ -978,7 +986,7 @@ fn build_canonical_view(
         Some(_) => {}
     }
     // Keep rendering independent of any application margins/origin modes.
-    out.push_str("\x1b[?2026l\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[0m\x1b]8;;\x1b\\");
+    out.push_str("\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[0m\x1b]8;;\x1b\\");
     let (rows, cols) = screen.size();
     let (rows, cols) = (rows.get(), cols.get());
     let cols = cols.min(view_cols);
@@ -1621,6 +1629,31 @@ impl Session {
         )
     }
 
+    /// Managed clients cannot rely on the native terminal honoring DEC 2026:
+    /// keep their last complete view until the application ends its update.
+    pub fn synchronized_output(&self) -> bool {
+        self.parser.callbacks().synchronized_output
+    }
+
+    /// A broken/exiting application must not freeze managed viewers forever.
+    /// Repeated begin markers do not extend this one-second safety deadline.
+    pub fn expire_synchronized_output(&mut self, now: Instant, force: bool) {
+        let callbacks = self.parser.callbacks_mut();
+        if force
+            || callbacks
+                .synchronized_output_started
+                .is_some_and(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
+        {
+            callbacks.synchronized_output = false;
+            callbacks.synchronized_output_started = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_test_output(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
     pub fn canonical_view(
         &mut self,
         cols: u16,
@@ -1636,6 +1669,7 @@ impl Session {
             history_lines,
         );
         append_canonical_tracked_state(&mut view, self.parser.screen(), self.parser.callbacks());
+        view.extend_from_slice(b"\x1b[?2026l");
         view
     }
 
@@ -1714,11 +1748,64 @@ mod tests {
     use super::{
         append_canonical_tracked_state, build_canonical_view, build_full_text, build_history,
         build_snapshot, build_snapshot_ansi, build_snapshot_text, dump_screen, push_view_history,
-        BytesDump, KittyKeyboardState, SessionCallbacks, TerminalOutputFilter,
+        BytesDump, KittyKeyboardState, Session, SessionCallbacks, TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn managed_frames_are_synchronized_and_application_sync_is_bounded() {
+        let mut session =
+            Session::new("sync-test".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        session.process_test_output(b"old");
+        let frame = session.canonical_view(80, 24, None, 0);
+        assert!(frame.starts_with(b"\x1b[?2026h"));
+        assert!(frame.ends_with(b"\x1b[?2026l"));
+        let mut rendered = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(24).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            100,
+            SessionCallbacks::default(),
+        );
+        // Native delivery may split anywhere, including in the final marker.
+        for byte in &frame[..frame.len() - 1] {
+            rendered.process(&[*byte]);
+        }
+        assert!(rendered.callbacks().synchronized_output);
+        rendered.process(&frame[frame.len() - 1..]);
+        assert!(!rendered.callbacks().synchronized_output);
+        assert_eq!(rendered.screen().contents(), "old");
+
+        session.process_test_output(b"\x1b[?202");
+        assert!(!session.synchronized_output());
+        session.process_test_output(b"6h\x1b[2J");
+        assert!(session.synchronized_output());
+        assert_eq!(session.snapshot_text().trim(), "");
+        let start = session
+            .parser
+            .callbacks()
+            .synchronized_output_started
+            .unwrap();
+        session.process_test_output(b"\x1b[Hnew\x1b[?2026h");
+        assert_eq!(
+            session.parser.callbacks().synchronized_output_started,
+            Some(start)
+        );
+        session.expire_synchronized_output(start + Duration::from_millis(999), false);
+        assert!(session.synchronized_output());
+        session.expire_synchronized_output(start + Duration::from_secs(1), false);
+        assert!(!session.synchronized_output());
+        assert_eq!(session.parser.callbacks().synchronized_output_started, None);
+        session.process_test_output(b"\x1b[?2026h");
+        assert!(session.synchronized_output());
+        session.process_test_output(b"\x1b[?2026l");
+        assert!(!session.synchronized_output());
+        session.process_test_output(b"\x1b[?2026h");
+        session.expire_synchronized_output(Instant::now(), true);
+        assert!(!session.synchronized_output());
+    }
 
     #[test]
     fn managed_mouse_transport_uses_sgr_without_changing_application_mode() {

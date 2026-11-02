@@ -53,6 +53,8 @@ struct Client {
     /// A reset requested while alternate-screen is active is deferred until
     /// the primary screen returns, preserving its native history meanwhile.
     view_history_reset: bool,
+    /// Pending managed repaint; the bool retains queue-replacement requests.
+    deferred_view: Option<bool>,
     /// HELLO received but HELLO_ACK not queued yet. The ACK is queued ahead
     /// of the first STATE_SYNC so the bridge can use STATE_SYNC arrival as
     /// the "no ACK means old daemon" anchor.
@@ -308,7 +310,11 @@ impl Server {
                 self.queue_pty_input(&expired_input)?;
             }
 
-            // No timer-based snapshot deferral. Snapshots are sent either:
+            self.session
+                .expire_synchronized_output(Instant::now(), false);
+            self.flush_deferred_views();
+
+            // Outside a synchronized update, snapshots are sent either:
             // 1. When the client sends RESIZE (handled in process_client_recv_buf)
             // 2. When PTY OUTPUT arrives for a client still awaiting snapshot
             //    (handled in flush_pty_output)
@@ -318,6 +324,9 @@ impl Server {
                     // The child may have written its final bytes after the
                     // readiness batch above. Drain them before sending EXIT.
                     self.handle_pty_output(&mut pty_buf)?;
+                    self.session
+                        .expire_synchronized_output(Instant::now(), true);
+                    self.flush_deferred_views();
                     log::info!("Child exited with code {}", exit_code);
 
                     let msg = proto::encode(proto::server::EXIT, &exit_code.to_le_bytes());
@@ -411,6 +420,7 @@ impl Server {
                             view_reset_generation: 0,
                             view_alternate: None,
                             view_history_reset: true,
+                            deferred_view: None,
                             hello_ack_pending: false,
                         },
                     );
@@ -525,8 +535,22 @@ impl Server {
         }
     }
 
+    fn flush_deferred_views(&mut self) {
+        if self.session.synchronized_output() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, client)| client.deferred_view.map(|_| id))
+            .collect();
+        for id in ids {
+            self.send_view_to_client(id, false);
+        }
+    }
+
     fn send_view_to_client(&mut self, client_id: usize, replace_send_buf: bool) {
-        let Some(client) = self.clients.get(&client_id) else {
+        let Some(client) = self.clients.get_mut(&client_id) else {
             return;
         };
         if client.diagnostic || !client.canonical_view {
@@ -535,6 +559,13 @@ impl Server {
         let Some((cols, rows)) = client.view_size else {
             // HELLO can arrive before VIEW_SIZE. Never guess physical size:
             // even a single wrongly sized frame can pollute native history.
+            return;
+        };
+        let Some(replace_send_buf) = ready_canonical_view(
+            &mut client.deferred_view,
+            self.session.synchronized_output(),
+            replace_send_buf,
+        ) else {
             return;
         };
         let (generation, reset_generation, alternate) = self.session.canonical_view_state();
@@ -1191,6 +1222,22 @@ impl Server {
     }
 }
 
+/// Coalesce paints without retaining PTY bytes or losing a reset request.
+fn ready_canonical_view(
+    deferred: &mut Option<bool>,
+    synchronized: bool,
+    replace: bool,
+) -> Option<bool> {
+    let replace = replace || deferred.unwrap_or(false);
+    if synchronized {
+        *deferred = Some(replace);
+        None
+    } else {
+        *deferred = None;
+        Some(replace)
+    }
+}
+
 fn hello_ack_message() -> Vec<u8> {
     proto::encode(
         proto::server::HELLO_ACK,
@@ -1217,6 +1264,163 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn synchronized_view_gate_coalesces_frames_and_preserves_resets() {
+        let mut deferred = None;
+        assert_eq!(
+            ready_canonical_view(&mut deferred, false, false),
+            Some(false)
+        );
+        assert_eq!(ready_canonical_view(&mut deferred, true, false), None);
+        assert_eq!(deferred, Some(false));
+        assert_eq!(ready_canonical_view(&mut deferred, true, true), None);
+        assert_eq!(ready_canonical_view(&mut deferred, true, false), None);
+        assert_eq!(deferred, Some(true));
+        assert_eq!(
+            ready_canonical_view(&mut deferred, false, false),
+            Some(true)
+        );
+        assert_eq!(deferred, None);
+        assert_eq!(
+            ready_canonical_view(&mut deferred, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn split_application_redraw_keeps_previous_render_until_complete() {
+        let mut session =
+            Session::new("split-redraw".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut deferred = None;
+        let mut frames = Vec::new();
+        for chunk in [
+            b"old".as_slice(),
+            b"\x1b[?2026h\x1b[2J",
+            b"\x1b[Hnew",
+            b"\x1b[?2026l",
+        ] {
+            session.process_test_output(chunk);
+            if ready_canonical_view(&mut deferred, session.synchronized_output(), false).is_some() {
+                frames.push(session.canonical_view(80, 24, Some(false), 0));
+            }
+        }
+        assert_eq!(
+            frames.len(),
+            2,
+            "never publish the erase or incomplete redraw"
+        );
+        let mut renderer = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(80).unwrap(),
+            100,
+        );
+        renderer.process(&frames[0]);
+        assert_eq!(renderer.screen().contents(), "old");
+        renderer.process(&frames[1]);
+        assert_eq!(renderer.screen().contents(), "new");
+        assert_eq!(renderer.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn managed_synchronized_redraw_never_publishes_partial_views() {
+        let dir = std::env::temp_dir().join(format!("pterm-sync-view-{}", std::process::id()));
+        let session =
+            Session::new("sync-view".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        server.accept_client().unwrap();
+        client
+            .write_all(&proto::encode(
+                proto::client::HELLO,
+                &proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::CANONICAL_VIEW),
+            ))
+            .unwrap();
+        client
+            .write_all(&proto::encode(
+                proto::client::VIEW_SIZE,
+                &proto::encode_resize(80, 24),
+            ))
+            .unwrap();
+        server.handle_client_data(0, &mut [0; 4096]).unwrap();
+        let mut received = Vec::new();
+        read_frames_until(&mut client, &mut received, |f| {
+            f.msg_type == proto::server::VIEW
+        });
+
+        // Model separate PTY readiness events, including a split mode marker.
+        // The old implementation publishes a blank view after the erase and
+        // a half-drawn view after the next write, despite the app's DEC 2026.
+        for chunk in [b"\x1b[?202".as_slice(), b"6h\x1b[2J", b"\x1b[Hcomplete"] {
+            server.session.process_test_output(chunk);
+            server.pending_pty_output.extend_from_slice(chunk);
+            server.flush_pty_output();
+            if server.session.synchronized_output() {
+                assert!(server.clients[&0].deferred_view.is_some());
+                client.set_nonblocking(true).unwrap();
+                assert_eq!(
+                    client.read(&mut [0; 4096]).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                client.set_nonblocking(false).unwrap();
+            } else {
+                read_frames_until(&mut client, &mut received, |f| {
+                    f.msg_type == proto::server::VIEW
+                });
+            }
+            assert!(
+                server.pending_pty_output.is_empty(),
+                "raw output must not accumulate"
+            );
+        }
+        // Explicit redraw/resize requests must retain their reset semantics,
+        // rather than exposing an in-progress frame or losing replacement.
+        server.send_view_to_client(0, true);
+        assert_eq!(server.clients[&0].deferred_view, Some(true));
+        server.session.process_test_output(b"\x1b[?2026l");
+        server.pending_pty_output.extend_from_slice(b"\x1b[?2026l");
+        server.flush_pty_output();
+        let frames = read_frames_until(&mut client, &mut received, |f| {
+            f.msg_type == proto::server::VIEW
+        });
+        let view = &frames.last().unwrap().payload;
+        assert_eq!(view[0], 1);
+        assert!(view[1..].starts_with(b"\x1b[?2026h"));
+        assert!(view.ends_with(b"\x1b[?2026l"));
+        assert!(String::from_utf8_lossy(view).contains("complete"));
+        assert_eq!(server.clients[&0].deferred_view, None);
+
+        // Missing end markers are released even with no further PTY output.
+        server
+            .session
+            .process_test_output(b"\x1b[?2026h\x1b[Htimeout");
+        server.pending_pty_output.extend_from_slice(b"output");
+        server.flush_pty_output();
+        server
+            .session
+            .expire_synchronized_output(Instant::now() + Duration::from_secs(2), false);
+        server.flush_deferred_views();
+        let frames = read_frames_until(&mut client, &mut received, |f| {
+            f.msg_type == proto::server::VIEW
+        });
+        assert!(String::from_utf8_lossy(&frames.last().unwrap().payload).contains("timeout"));
+        assert_eq!(server.clients[&0].deferred_view, None);
+
+        // Exit must release the final view before EXIT, without the timeout.
+        server.session.process_test_output(b"\x1b[?2026hfinal");
+        server.send_view_to_client(0, false);
+        server
+            .session
+            .expire_synchronized_output(Instant::now(), true);
+        server.flush_deferred_views();
+        read_frames_until(&mut client, &mut received, |f| {
+            f.msg_type == proto::server::VIEW
+        });
+        assert!(!server.session.synchronized_output());
+    }
 
     #[test]
     fn canonical_view_size_is_independent_and_managed_output_is_not_raw() {
