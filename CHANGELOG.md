@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.1] - 2026-11-03
+
+### Bug Fixes
+
+- Preserve synchronized TUI redraws in managed views (#102)
+
+### Miscellaneous Tasks
+
+- Modernize GitHub Actions runtimes
 ## [2.3.0] - 2026-10-30
 
 ### Bug Fixes
@@ -658,6 +667,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.3.1]: https://github.com/ttak0422/pterm/compare/v2.3.0..v2.3.1
 [2.3.0]: https://github.com/ttak0422/pterm/compare/v2.2.0..v2.3.0
 [2.2.0]: https://github.com/ttak0422/pterm/compare/v2.1.0..v2.2.0
 [2.1.0]: https://github.com/ttak0422/pterm/compare/v2.0.1..v2.1.0
