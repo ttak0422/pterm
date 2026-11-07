@@ -825,3 +825,66 @@ exec sleep 20
     }
     bridge.0.wait().unwrap();
 }
+
+#[test]
+fn bridge_flushes_unterminated_synchronized_output_without_blocking_input() {
+    use std::os::fd::AsRawFd;
+    let dir = TestDir::new();
+    let session = dir.0.join("sessions/sync-timeout");
+    std::fs::create_dir_all(&session).unwrap();
+    let listener = UnixListener::bind(session.join("socket")).unwrap();
+    let mut child = dir
+        .command()
+        .args(["attach", "sync-timeout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut handshake = [0; 22];
+    stream.read_exact(&mut handshake).unwrap();
+    let expected = b"\x1b[?2026h\x1b[2;3H\xff\x00unfinished";
+    for part in expected.chunks(3) {
+        stream
+            .write_all(&pterm_proto::encode(pterm_proto::server::OUTPUT, part))
+            .unwrap();
+    }
+    stdin.write_all(b"responsive").unwrap();
+    let mut input = vec![0; 5 + b"responsive".len()];
+    stream.read_exact(&mut input).unwrap();
+    assert_eq!(
+        input,
+        pterm_proto::encode(pterm_proto::client::INPUT, b"responsive")
+    );
+    let mut fd = nix::libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { nix::libc::poll(&mut fd, 1, 3000) },
+        1,
+        "unterminated update never flushed"
+    );
+    let mut actual = vec![0; expected.len()];
+    stdout.read_exact(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    // Still no END: subsequent bytes must pass through, and EOF/detach must
+    // drain them before the existing terminal cleanup sequences.
+    stream
+        .write_all(&pterm_proto::encode(
+            pterm_proto::server::OUTPUT,
+            b"tail\x1b[?",
+        ))
+        .unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut tail = Vec::new();
+    stdout.read_to_end(&mut tail).unwrap();
+    assert!(tail.starts_with(b"tail\x1b[?"));
+    assert!(child.wait().unwrap().success());
+}

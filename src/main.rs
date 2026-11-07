@@ -5,6 +5,7 @@ mod paths;
 mod pty;
 mod server;
 mod session;
+mod synchronized_output;
 
 use crate::paths::{
     find_sessions, session_dir, session_socket_path, socket_dir, CWD_FILENAME, SOCKET_FILENAME,
