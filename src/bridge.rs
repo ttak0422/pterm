@@ -7,6 +7,7 @@
 use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
 use crate::input::{InputEvent, ManagedInput};
 use crate::server::SendQueue;
+use crate::synchronized_output::SynchronizedOutput;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use nix::sys::termios;
@@ -96,7 +97,7 @@ impl HistoryReset {
     fn queue_view(
         &mut self,
         payload: &[u8],
-        output: &mut SendQueue,
+        output: &mut SynchronizedOutput,
         now: Instant,
     ) -> io::Result<()> {
         let (&flags, bytes) = payload
@@ -113,7 +114,7 @@ impl HistoryReset {
         Ok(())
     }
 
-    fn queue_bytes(&mut self, bytes: &[u8], output: &mut SendQueue) {
+    fn queue_bytes(&mut self, bytes: &[u8], output: &mut SynchronizedOutput) {
         if self.deadline.is_some() {
             self.pending.extend_from_slice(bytes);
         } else {
@@ -121,7 +122,7 @@ impl HistoryReset {
         }
     }
 
-    fn input(&mut self, input: &[u8], output: &mut SendQueue) -> Vec<u8> {
+    fn input(&mut self, input: &[u8], output: &mut SynchronizedOutput) -> Vec<u8> {
         if self.deadline.is_none() {
             return input.to_vec();
         }
@@ -150,7 +151,7 @@ impl HistoryReset {
 fn queue_managed_input(
     events: Vec<InputEvent>,
     reset: &mut HistoryReset,
-    output: &mut SendQueue,
+    output: &mut SynchronizedOutput,
     socket: &mut SendQueue,
 ) {
     for event in events {
@@ -358,7 +359,7 @@ pub fn run(
     let mut stdin_buf = [0u8; 8192];
     let mut sock_buf = [0u8; 65536];
     let mut recv_buf = Vec::new();
-    let mut output = SendQueue::default();
+    let mut output = SynchronizedOutput::default();
     let mut history_reset = HistoryReset::default();
     let mut managed_input = ManagedInput::new();
     let mut input_pending_since = None;
@@ -372,6 +373,7 @@ pub fn run(
     let mut socket_open = true;
     let mut cleanup_queued = false;
     loop {
+        output.expire(Instant::now());
         if !propagate_resize
             && daemon_proto.is_none()
             && running
@@ -397,7 +399,9 @@ pub fn run(
             ));
         }
         if !running && !history_reset.waiting() && !cleanup_queued {
+            output.flush();
             output.push(DETACH_CLEANUP_SEQUENCES);
+            output.flush();
             cleanup_queued = true;
         }
         if !running
@@ -452,6 +456,7 @@ pub fn run(
         } else {
             timeout
         };
+        let timeout = output.poll_timeout(timeout, Instant::now());
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -745,10 +750,17 @@ mod history_reset_tests {
     use super::{queue_managed_input, HistoryReset, HISTORY_RESET_ACK, HISTORY_RESET_REQUEST};
     use crate::input::{InputEvent, ManagedInput};
     use crate::server::SendQueue;
+    use crate::synchronized_output::SynchronizedOutput;
     use pterm_proto as proto;
     use std::time::{Duration, Instant};
 
-    fn drain(queue: &mut SendQueue) -> Vec<u8> {
+    fn drain_socket(queue: &mut SendQueue) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        queue.write_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn drain(queue: &mut SynchronizedOutput) -> Vec<u8> {
         let mut bytes = Vec::new();
         queue
             .write_with(|part| {
@@ -763,12 +775,13 @@ mod history_reset_tests {
     fn mouse_origin_is_ordered_before_native_reports_and_never_reaches_pty_text() {
         let mut decoder = ManagedInput::default();
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         let mut socket = SendQueue::default();
         let events = decoder.decode(b"key\x1b]51;pterm-input-origin;-40;3\x07\x1b[<4;5;31M");
         queue_managed_input(events, &mut reset, &mut output, &mut socket);
         let frames =
-            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+            proto::decode_frames(&mut drain_socket(&mut socket), proto::MAX_CLIENT_PAYLOAD)
+                .unwrap();
         assert_eq!(
             frames
                 .iter()
@@ -789,7 +802,7 @@ mod history_reset_tests {
     #[test]
     fn mouse_origin_during_blank_history_reset_is_invalidated() {
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         let mut socket = SendQueue::default();
         reset
             .queue_view(b"\x01screen", &mut output, Instant::now())
@@ -804,14 +817,15 @@ mod history_reset_tests {
             &mut socket,
         );
         let frames =
-            proto::decode_frames(&mut drain(&mut socket), proto::MAX_CLIENT_PAYLOAD).unwrap();
+            proto::decode_frames(&mut drain_socket(&mut socket), proto::MAX_CLIENT_PAYLOAD)
+                .unwrap();
         assert_eq!(&frames[0].payload[..4], &i32::MIN.to_le_bytes());
     }
 
     #[test]
     fn replacement_waits_for_split_ack_and_preserves_keyboard_input() {
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         reset
             .queue_view(b"\x01history", &mut output, Instant::now())
             .unwrap();
@@ -836,7 +850,7 @@ mod history_reset_tests {
     #[test]
     fn repeated_resizes_keep_only_latest_replacement_before_ack() {
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         reset
             .queue_view(b"\x01old", &mut output, Instant::now())
             .unwrap();
@@ -851,7 +865,7 @@ mod history_reset_tests {
     #[test]
     fn ordinary_escape_input_is_not_eaten_by_reset_handshake() {
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         reset
             .queue_view(b"\x01screen", &mut output, Instant::now())
             .unwrap();
@@ -863,7 +877,7 @@ mod history_reset_tests {
     fn reset_expires_at_the_original_deadline_after_replacement() {
         let start = Instant::now();
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         reset.queue_view(b"\x01old", &mut output, start).unwrap();
         reset
             .queue_view(b"\x01new", &mut output, start + Duration::from_secs(29))
@@ -880,7 +894,7 @@ mod history_reset_tests {
     fn completed_ack_clears_the_deadline_and_next_reset_gets_a_fresh_one() {
         let start = Instant::now();
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         reset
             .queue_view(b"\x01history", &mut output, start)
             .unwrap();
@@ -911,7 +925,7 @@ mod history_reset_tests {
     fn ordinary_or_invalid_views_do_not_start_reset_waiting() {
         let now = Instant::now();
         let mut reset = HistoryReset::default();
-        let mut output = SendQueue::default();
+        let mut output = SynchronizedOutput::default();
         assert!(reset.queue_view(&[], &mut output, now).is_err());
         reset.queue_view(b"\x00screen", &mut output, now).unwrap();
 
