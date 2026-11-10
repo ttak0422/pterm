@@ -954,6 +954,19 @@ fn push_view_history(
     }
 }
 
+/// Last queued canonical view for one managed client. Invalidated whenever
+/// queued predecessors can be discarded or the native screen needs recovery.
+#[derive(Default)]
+pub(crate) struct CanonicalViewCache {
+    geometry: (u16, u16, u16, u16),
+    alternate: bool,
+    rows: Vec<String>,
+    state: Vec<u8>,
+}
+
+// Retain the pre-incremental renderer as an independent regression/performance
+// oracle. Production only uses build_cached_canonical_view below.
+#[cfg(test)]
 /// Reconstruct a client-sized view of the daemon screen. History is pushed
 /// into the native terminal one physical row at a time; live rows use CUP,
 /// never LF or implicit autowrap, so passive viewers cannot create history.
@@ -1044,6 +1057,142 @@ fn build_canonical_view(
         .as_bytes(),
     );
     bytes
+}
+
+fn build_cached_canonical_view(
+    screen: &mut vt100::Screen,
+    view_cols: u16,
+    view_rows: u16,
+    previous_alternate: Option<bool>,
+    history_lines: usize,
+    cache: &mut Option<CanonicalViewCache>,
+    tracked_state: &[u8],
+) -> Vec<u8> {
+    let alternate = screen.alternate_screen();
+    let mut out = String::from("\x1b[?2026h");
+    // None means queued views were replaced or this is a fresh attachment.
+    // Establish the screen explicitly because a discarded frame might have
+    // contained an alternate-screen transition that never reached the client.
+    match previous_alternate {
+        None => {
+            out.push_str("\x1b[?1049l");
+            if alternate {
+                out.push_str("\x1b[?1049h");
+            }
+        }
+        Some(previous) if previous != alternate => {
+            out.push_str(if alternate {
+                "\x1b[?1049h"
+            } else {
+                "\x1b[?1049l"
+            });
+        }
+        Some(_) => {}
+    }
+    // Keep rendering independent of any application margins/origin modes.
+    out.push_str("\x1b[?25l\x1b[?6l\x1b[?69l\x1b[r\x1b[?7l\x1b[0m\x1b]8;;\x1b\\");
+    let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
+    let geometry = (view_cols, view_rows, cols, rows);
+    let full_repaint = previous_alternate != Some(alternate)
+        || history_lines > 0
+        || cache.as_ref().is_none_or(|previous| {
+            previous.geometry != geometry || previous.alternate != alternate
+        });
+    let cols = cols.min(view_cols);
+    if !alternate && history_lines > 0 {
+        // The bounded 65,536-cell screen needs < 8 MiB even with per-cell
+        // RGB/attribute changes and the maximum combining-character bytes.
+        const HISTORY_BYTE_BUDGET: usize = pterm_proto::MAX_SERVER_PAYLOAD - 8 * 1024 * 1024;
+        push_view_history(
+            &mut out,
+            screen,
+            cols,
+            view_rows,
+            history_lines,
+            HISTORY_BYTE_BUDGET,
+        );
+    }
+    // Neovim sizes its terminal renderer to the largest window showing the
+    // buffer, but a shorter active window follows the bottom of that buffer.
+    // Bottom-align the canonical screen so that window sees every live row,
+    // leaving blank padding above it in taller passive windows. A physically
+    // smaller viewer retains the top-left crop; it never reflows the screen.
+    let row_offset = view_rows.saturating_sub(rows);
+    if full_repaint {
+        out.push_str("\x1b[2J");
+    }
+    let mut rendered_rows = Vec::with_capacity(usize::from(rows.min(view_rows)));
+    let mut painted = full_repaint;
+    for row in 0..rows.min(view_rows) {
+        let mut rendered = String::new();
+        push_view_row(&mut rendered, screen, row, cols);
+        if full_repaint
+            || cache
+                .as_ref()
+                .and_then(|previous| previous.rows.get(usize::from(row)))
+                != Some(&rendered)
+        {
+            let _ = write!(out, "\x1b[{};1H\x1b[2K", row_offset + row + 1);
+            out.push_str(&rendered);
+            painted = true;
+        }
+        rendered_rows.push(rendered);
+    }
+    let paint = out.into_bytes();
+    let mut out = String::new();
+    // input_mode_formatted assumes defaults for mouse modes. Reset them
+    // first so disabling/changing a previously active mode works too.
+    out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(screen.input_mode_formatted().as_bytes());
+    // The renderer may be much taller than the application. Use SGR on this
+    // transport so its padded coordinates cannot overflow legacy X10 bytes.
+    // The daemon translates/re-encodes mouse reports for the application's
+    // original encoding; this does not enable mouse tracking by itself.
+    bytes.extend_from_slice(b"\x1b[?1005l\x1b[?1006h");
+    bytes.extend_from_slice(screen.attributes_formatted().as_bytes());
+    // cursor_state_formatted can repaint a cell to recreate pending wrap.
+    // A view cursor must only position, and must stay inside its viewport.
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_col = cursor_col.min(screen.size().1.get().saturating_sub(1));
+    let cursor_visible = !screen.hide_cursor() && cursor_row < view_rows && cursor_col < view_cols;
+    bytes.extend_from_slice(
+        format!(
+            "\x1b[{};{}H{}",
+            row_offset + cursor_row.min(rows - 1).min(view_rows - 1) + 1,
+            cursor_col.min(view_cols - 1) + 1,
+            if cursor_visible {
+                "\x1b[?25h"
+            } else {
+                "\x1b[?25l"
+            }
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(tracked_state);
+    let unchanged = !painted
+        && cache
+            .as_ref()
+            .is_some_and(|previous| previous.state == bytes);
+    *cache = Some(CanonicalViewCache {
+        geometry,
+        alternate,
+        rows: rendered_rows,
+        state: bytes.clone(),
+    });
+    if unchanged {
+        return Vec::new();
+    }
+    // Cursor/mode-only changes must not visit each row or toggle cursor
+    // visibility off and on through the paint preamble.
+    let mut frame = if painted {
+        paint
+    } else {
+        b"\x1b[?2026h".to_vec()
+    };
+    frame.extend_from_slice(&bytes);
+    frame
 }
 
 /// Replay state needed for input and presentation without replaying raw
@@ -1660,16 +1809,22 @@ impl Session {
         rows: u16,
         previous_alternate: Option<bool>,
         history_lines: usize,
+        cache: &mut Option<CanonicalViewCache>,
     ) -> Vec<u8> {
-        let mut view = build_canonical_view(
+        let mut tracked = Vec::new();
+        append_canonical_tracked_state(&mut tracked, self.parser.screen(), self.parser.callbacks());
+        let mut view = build_cached_canonical_view(
             self.parser.screen_mut(),
             cols,
             rows,
             previous_alternate,
             history_lines,
+            cache,
+            &tracked,
         );
-        append_canonical_tracked_state(&mut view, self.parser.screen(), self.parser.callbacks());
-        view.extend_from_slice(b"\x1b[?2026l");
+        if !view.is_empty() {
+            view.extend_from_slice(b"\x1b[?2026l");
+        }
         view
     }
 
@@ -1746,21 +1901,425 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_canonical_tracked_state, build_canonical_view, build_full_text, build_history,
-        build_snapshot, build_snapshot_ansi, build_snapshot_text, dump_screen, push_view_history,
-        BytesDump, KittyKeyboardState, Session, SessionCallbacks, TerminalOutputFilter,
+        append_canonical_tracked_state, build_cached_canonical_view, build_canonical_view,
+        build_full_text, build_history, build_snapshot, build_snapshot_ansi, build_snapshot_text,
+        dump_screen, push_view_history, BytesDump, KittyKeyboardState, Session, SessionCallbacks,
+        TerminalOutputFilter,
     };
     use crate::constants::{DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS};
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::time::{Duration, Instant};
 
+    fn parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            100,
+        )
+    }
+
+    fn count_sequence(bytes: &[u8], sequence: &[u8]) -> usize {
+        bytes
+            .windows(sequence.len())
+            .filter(|part| *part == sequence)
+            .count()
+    }
+
+    fn assert_same_view(actual: &vt100::Parser, expected: &vt100::Parser) {
+        assert_eq!(
+            actual.screen().state_formatted(),
+            expected.screen().state_formatted()
+        );
+        assert_eq!(
+            actual.screen().cursor_position(),
+            expected.screen().cursor_position()
+        );
+        assert_eq!(
+            actual.screen().hide_cursor(),
+            expected.screen().hide_cursor()
+        );
+    }
+
+    #[test]
+    fn incremental_view_skips_unchanged_rows_and_cursor_only_repaints() {
+        let mut source = parser(4, 12);
+        source.process(b"header\r\nlong old row\r\nfooter");
+        let mut cache = None;
+        let mut actual = parser(4, 12);
+        let first =
+            build_cached_canonical_view(source.screen_mut(), 12, 4, None, 0, &mut cache, &[]);
+        actual.process(&first);
+        assert_eq!(count_sequence(&first, b"\x1b[2J"), 1);
+        let unchanged = build_cached_canonical_view(
+            source.screen_mut(),
+            12,
+            4,
+            Some(false),
+            0,
+            &mut cache,
+            &[],
+        );
+        assert!(unchanged.is_empty());
+        source.process(b"\x1b[2;2H\x1b[?1h\x1b[?25l");
+        let cursor = build_cached_canonical_view(
+            source.screen_mut(),
+            12,
+            4,
+            Some(false),
+            0,
+            &mut cache,
+            &[],
+        );
+        assert_eq!(count_sequence(&cursor, b"\x1b[2J"), 0);
+        assert_eq!(count_sequence(&cursor, b"\x1b[2K"), 0);
+        actual.process(&cursor);
+        let mut expected = parser(4, 12);
+        expected.process(&build_canonical_view(source.screen_mut(), 12, 4, None, 0));
+        assert_same_view(&actual, &expected);
+        assert!(actual.screen().application_cursor());
+        // Tracked state changes must survive even with identical cells/cursor.
+        let title = build_cached_canonical_view(
+            source.screen_mut(),
+            12,
+            4,
+            Some(false),
+            0,
+            &mut cache,
+            b"\x1b]2;new title\x1b\\",
+        );
+        assert!(!title.is_empty());
+        assert_eq!(count_sequence(&title, b"\x1b[2K"), 0);
+    }
+
+    #[test]
+    fn incremental_view_erases_stale_wide_cells_and_styled_blanks_on_one_row() {
+        let mut source = parser(4, 12);
+        source.process("header\r\n\x1b[41m界wide tail\x1b[0m\r\nfooter".as_bytes());
+        let mut cache = None;
+        let mut actual = parser(4, 12);
+        actual.process(&build_cached_canonical_view(
+            source.screen_mut(),
+            12,
+            4,
+            None,
+            0,
+            &mut cache,
+            &[],
+        ));
+        for bytes in [
+            b"\x1b[2;1H\x1b[2Kx".as_slice(),
+            b"\x1b[2;1H\x1b[42m\x1b[2K\x1b[0m",
+        ] {
+            source.process(bytes);
+            let frame = build_cached_canonical_view(
+                source.screen_mut(),
+                12,
+                4,
+                Some(false),
+                0,
+                &mut cache,
+                &[],
+            );
+            assert_eq!(count_sequence(&frame, b"\x1b[2J"), 0);
+            assert_eq!(count_sequence(&frame, b"\x1b[2K"), 1);
+            actual.process(&frame);
+            let mut expected = parser(4, 12);
+            expected.process(&build_canonical_view(source.screen_mut(), 12, 4, None, 0));
+            assert_same_view(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn incremental_view_scroll_preserves_static_rows_and_native_history() {
+        let mut source = parser(5, 12);
+        source.process(b"\x1b[?1049hheader\r\nrow one\r\nrow two\r\nrow three\r\nfooter");
+        let mut cache = None;
+        let mut actual = parser(5, 12);
+        actual.process(&build_cached_canonical_view(
+            source.screen_mut(),
+            12,
+            5,
+            None,
+            0,
+            &mut cache,
+            &[],
+        ));
+        source.process(b"\x1b[2;4r\x1b[4;1H\nnew row");
+        let frame =
+            build_cached_canonical_view(source.screen_mut(), 12, 5, Some(true), 0, &mut cache, &[]);
+        assert_eq!(count_sequence(&frame, b"\x1b[2J"), 0);
+        assert_eq!(count_sequence(&frame, b"\x1b[2K"), 3);
+        actual.process(&frame);
+        let mut expected = parser(5, 12);
+        expected.process(&build_canonical_view(source.screen_mut(), 12, 5, None, 0));
+        assert_same_view(&actual, &expected);
+        actual.screen_mut().set_scrollback(100);
+        assert_eq!(actual.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn incremental_view_invalidates_geometry_alternate_history_and_recovery() {
+        let mut source = parser(4, 12);
+        source.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut cache = None;
+        let mut actual = parser(6, 16);
+        let mut expected = parser(6, 16);
+        for (bytes, cols, rows, previous, history, clear) in [
+            (b"".as_slice(), 16, 6, None, 1, false),
+            (b"\r\nsix", 16, 6, Some(false), 1, false),
+            (b"\x1b[?1049h\x1b[Htui", 16, 6, Some(false), 0, false),
+            (b"", 8, 3, Some(true), 0, false),
+            (b"", 16, 6, Some(true), 0, false),
+            (b"\x1b[?1049l", 16, 6, Some(true), 0, false),
+            (b"", 16, 6, Some(false), 0, true),
+        ] {
+            source.process(bytes);
+            actual.set_size(
+                NonZeroU16::new(rows).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
+            );
+            expected.set_size(
+                NonZeroU16::new(rows).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
+            );
+            if clear {
+                // Explicit redraw/reset, including zero replay lines.
+                cache = None;
+                actual.process(b"\x1b[Hcorrupt");
+            }
+            let frame = build_cached_canonical_view(
+                source.screen_mut(),
+                cols,
+                rows,
+                previous,
+                history,
+                &mut cache,
+                &[],
+            );
+            assert_eq!(count_sequence(&frame, b"\x1b[2J"), 1);
+            actual.process(&frame);
+            expected.process(&build_canonical_view(
+                source.screen_mut(),
+                cols,
+                rows,
+                previous,
+                history,
+            ));
+            assert_same_view(&actual, &expected);
+        }
+        actual.screen_mut().set_scrollback(100);
+        expected.screen_mut().set_scrollback(100);
+        assert_eq!(actual.screen().scrollback(), expected.screen().scrollback());
+        assert_eq!(actual.screen().contents(), expected.screen().contents());
+    }
+
+    #[test]
+    fn incremental_view_cache_is_independent_for_cropped_clients() {
+        let mut source = parser(4, 12);
+        source.process("header\r\n界 wide text\r\nfooter".as_bytes());
+        let mut caches = [None, None];
+        let mut clients = [parser(2, 5), parser(6, 16)];
+        for (iteration, data) in [b"".as_slice(), b"\x1b[2;8Hnew", b"\x1b[Hchanged"]
+            .into_iter()
+            .enumerate()
+        {
+            source.process(data);
+            for (index, (cols, rows)) in [(5, 2), (16, 6)].into_iter().enumerate() {
+                let frame = build_cached_canonical_view(
+                    source.screen_mut(),
+                    cols,
+                    rows,
+                    (iteration > 0).then_some(false),
+                    0,
+                    &mut caches[index],
+                    &[],
+                );
+                if iteration > 0 {
+                    assert_eq!(count_sequence(&frame, b"\x1b[2J"), 0);
+                }
+                clients[index].process(&frame);
+                let unchanged = build_cached_canonical_view(
+                    source.screen_mut(),
+                    cols,
+                    rows,
+                    Some(false),
+                    0,
+                    &mut caches[index],
+                    &[],
+                );
+                assert!(unchanged.is_empty());
+                let mut expected = parser(rows, cols);
+                expected.process(&build_canonical_view(
+                    source.screen_mut(),
+                    cols,
+                    rows,
+                    None,
+                    0,
+                ));
+                assert_same_view(&clients[index], &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_view_matches_full_renderer_across_terminal_operations() {
+        let mut source = parser(8, 20);
+        let mut actual = parser(10, 24);
+        let mut expected = parser(10, 24);
+        let mut cache = None;
+        let mut previous = None;
+        let mut seed = 7u64;
+        for iteration in 0..500 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let row = seed % 8 + 1;
+            let col = (seed >> 8) % 20 + 1;
+            let update = match (seed >> 16) % 12 {
+                0 => format!("\x1b[{row};{col}H"),
+                1 => format!("\x1b[{row};1H\x1b[2Kline {iteration}"),
+                2 => "\x1b[2;7r\x1b[7;1H\nscroll\x1b[r".into(),
+                3 => "\x1b[H\x1b[2J".into(),
+                4 => "\x1b[41m styled blank \x1b[0m".into(),
+                5 => "界e\u{301}🙂".into(),
+                6 => "\x1b[?25l\x1b[?1h".into(),
+                7 => "\x1b[?25h\x1b[?1l".into(),
+                8 => "\x1b[?1049h".into(),
+                9 => "\x1b[?1049l".into(),
+                10 => "\x1b[3;1H\x1b[M".into(),
+                _ => "\x1b[3;1H\x1b[L".into(),
+            };
+            source.process(update.as_bytes());
+            let frame = build_cached_canonical_view(
+                source.screen_mut(),
+                24,
+                10,
+                previous,
+                0,
+                &mut cache,
+                &[],
+            );
+            actual.process(&frame);
+            expected.process(&build_canonical_view(
+                source.screen_mut(),
+                24,
+                10,
+                previous,
+                0,
+            ));
+            assert_same_view(&actual, &expected);
+            previous = Some(source.screen().alternate_screen());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode wire/renderer measurement"]
+    fn measure_incremental_view_updates() {
+        for scenario in ["unchanged", "cursor", "row", "scroll"] {
+            for incremental in [false, true] {
+                let mut source = parser(40, 120);
+                source.process(b"\x1b[?1049h");
+                for row in 1..=40 {
+                    source.process(
+                        format!("\x1b[{row};1Hrow {row:02} {}", "x".repeat(100)).as_bytes(),
+                    );
+                }
+                let mut cache = None;
+                let mut renderer = parser(40, 120);
+                renderer.process(&build_cached_canonical_view(
+                    source.screen_mut(),
+                    120,
+                    40,
+                    None,
+                    0,
+                    &mut cache,
+                    &[],
+                ));
+                let start = Instant::now();
+                let (mut bytes, mut paints, mut clears, mut frames) = (0, 0, 0, 0);
+                let mut render_time = Duration::ZERO;
+                for iteration in 0..2000 {
+                    let update = match scenario {
+                        "cursor" => format!("\x1b[{};2H", iteration % 40 + 1),
+                        "row" => format!("\x1b[20;1Hitem {iteration:06}"),
+                        "scroll" => format!("\x1b[2;39r\x1b[39;1H\nitem {iteration:06}\x1b[r"),
+                        _ => String::new(),
+                    };
+                    source.process(update.as_bytes());
+                    let frame = if incremental {
+                        build_cached_canonical_view(
+                            source.screen_mut(),
+                            120,
+                            40,
+                            Some(true),
+                            0,
+                            &mut cache,
+                            &[],
+                        )
+                    } else {
+                        build_canonical_view(source.screen_mut(), 120, 40, Some(true), 0)
+                    };
+                    bytes += frame.len();
+                    paints += count_sequence(&frame, b"\x1b[2K");
+                    clears += count_sequence(&frame, b"\x1b[2J");
+                    frames += usize::from(!frame.is_empty());
+                    let render_start = Instant::now();
+                    renderer.process(&frame);
+                    render_time += render_start.elapsed();
+                }
+                println!("scenario={scenario} incremental={incremental} frames={frames} bytes={bytes} row_paints={paints} screen_clears={clears} total_us={} renderer_us={}", start.elapsed().as_micros(), render_time.as_micros());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PTERM_TUI_CAPTURE: little-endian u32 length-prefixed PTY chunks at 120x40"]
+    fn measure_captured_tui_updates() {
+        let input =
+            std::fs::read(std::env::var("PTERM_TUI_CAPTURE").expect("capture path")).unwrap();
+        let mut source = parser(40, 120);
+        let mut actual = parser(40, 120);
+        let mut expected = parser(40, 120);
+        let mut cache = None;
+        let mut previous = None;
+        let mut remaining = input.as_slice();
+        let mut totals = [[0usize; 4]; 2];
+        let mut chunks = 0;
+        while !remaining.is_empty() {
+            let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+            let chunk = &remaining[4..4 + len];
+            remaining = &remaining[4 + len..];
+            source.process(chunk);
+            let before = build_canonical_view(source.screen_mut(), 120, 40, previous, 0);
+            let after = build_cached_canonical_view(
+                source.screen_mut(),
+                120,
+                40,
+                previous,
+                0,
+                &mut cache,
+                &[],
+            );
+            for (index, frame) in [&before, &after].into_iter().enumerate() {
+                totals[index][0] += usize::from(!frame.is_empty());
+                totals[index][1] += frame.len();
+                totals[index][2] += count_sequence(frame, b"\x1b[2J");
+                totals[index][3] += count_sequence(frame, b"\x1b[2K");
+            }
+            expected.process(&before);
+            actual.process(&after);
+            assert_same_view(&actual, &expected);
+            previous = Some(source.screen().alternate_screen());
+            chunks += 1;
+        }
+        println!("capture_chunks={chunks} [frames, bytes, full_clears, row_paints] before={:?} after={:?}", totals[0], totals[1]);
+    }
+
     #[test]
     fn managed_frames_are_synchronized_and_application_sync_is_bounded() {
         let mut session =
             Session::new("sync-test".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
         session.process_test_output(b"old");
-        let frame = session.canonical_view(80, 24, None, 0);
+        let frame = session.canonical_view(80, 24, None, 0, &mut None);
         assert!(frame.starts_with(b"\x1b[?2026h"));
         assert!(frame.ends_with(b"\x1b[?2026l"));
         let mut rendered = vt100::Parser::new_with_callbacks(

@@ -1,5 +1,5 @@
 use crate::input::MouseInput;
-use crate::session::Session;
+use crate::session::{CanonicalViewCache, Session};
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
 use pterm_proto::{self as proto};
@@ -50,6 +50,7 @@ struct Client {
     view_history_generation: u64,
     view_reset_generation: u64,
     view_alternate: Option<bool>,
+    view_cache: Option<CanonicalViewCache>,
     /// A reset requested while alternate-screen is active is deferred until
     /// the primary screen returns, preserving its native history meanwhile.
     view_history_reset: bool,
@@ -419,6 +420,7 @@ impl Server {
                             view_history_generation: 0,
                             view_reset_generation: 0,
                             view_alternate: None,
+                            view_cache: None,
                             view_history_reset: true,
                             deferred_view: None,
                             hello_ack_pending: false,
@@ -592,13 +594,22 @@ impl Server {
         } else {
             client.view_alternate
         };
-        let mut payload = vec![u8::from(reset_history)];
-        payload.extend_from_slice(&self.session.canonical_view(
+        if replace_send_buf || reset_history || client.pending_snapshot || client.hello_ack_pending
+        {
+            client.view_cache = None;
+        }
+        let view = self.session.canonical_view(
             cols,
             rows,
             previous_alternate,
             history_lines,
-        ));
+            &mut client.view_cache,
+        );
+        if view.is_empty() {
+            return;
+        }
+        let mut payload = vec![u8::from(reset_history)];
+        payload.extend_from_slice(&view);
         if let Some(client) = self.clients.get_mut(&client_id) {
             if replace_send_buf {
                 client.send_buf.clear_unsent();
@@ -1119,6 +1130,9 @@ impl Server {
                         })
                         .collect();
                     for id in view_ids {
+                        // REDRAW is explicit native-screen recovery, even if
+                        // canonical content has not changed since the last VIEW.
+                        self.clients.get_mut(&id).unwrap().view_cache = None;
                         self.send_view_to_client(id, false);
                     }
                     flush_all = true;
@@ -1302,7 +1316,7 @@ mod tests {
         ] {
             session.process_test_output(chunk);
             if ready_canonical_view(&mut deferred, session.synchronized_output(), false).is_some() {
-                frames.push(session.canonical_view(80, 24, Some(false), 0));
+                frames.push(session.canonical_view(80, 24, Some(false), 0, &mut None));
             }
         }
         assert_eq!(
@@ -1360,17 +1374,15 @@ mod tests {
             server.flush_pty_output();
             if server.session.synchronized_output() {
                 assert!(server.clients[&0].deferred_view.is_some());
-                client.set_nonblocking(true).unwrap();
-                assert_eq!(
-                    client.read(&mut [0; 4096]).unwrap_err().kind(),
-                    io::ErrorKind::WouldBlock
-                );
-                client.set_nonblocking(false).unwrap();
-            } else {
-                read_frames_until(&mut client, &mut received, |f| {
-                    f.msg_type == proto::server::VIEW
-                });
             }
+            // A split marker does not change visible state. Neither that
+            // no-op nor an application-synchronized partial view is sent.
+            client.set_nonblocking(true).unwrap();
+            assert_eq!(
+                client.read(&mut [0; 4096]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            client.set_nonblocking(false).unwrap();
             assert!(
                 server.pending_pty_output.is_empty(),
                 "raw output must not accumulate"
@@ -1502,6 +1514,7 @@ mod tests {
         assert_eq!(size["screen"]["size"]["cols"], 70);
         assert_eq!(size["screen"]["size"]["rows"], 20);
 
+        server.session.process_test_output(b"canonical change");
         server
             .pending_pty_output
             .extend_from_slice(b"RAW-OUTPUT-MUST-NOT-LEAK");
@@ -1518,6 +1531,38 @@ mod tests {
             .unwrap();
         assert_eq!(view.payload[0], 0);
         assert!(!String::from_utf8_lossy(&view.payload).contains("RAW-OUTPUT-MUST-NOT-LEAK"));
+
+        // Ordinary no-op flushes produce no VIEW, but explicit recovery
+        // and re-negotiation still repaint and acknowledge their requests.
+        server.send_view_to_client(0, false);
+        client.set_nonblocking(true).unwrap();
+        assert_eq!(
+            client.read(&mut [0; 4096]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        client.set_nonblocking(false).unwrap();
+        client
+            .write_all(&proto::encode(proto::client::REDRAW, &[]))
+            .unwrap();
+        server.handle_client_data(0, &mut [0; 4096]).unwrap();
+        let redraw = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
+        let view = redraw.last().unwrap();
+        assert_eq!(view.payload[0], 0, "redraw must not replace history");
+        assert!(view.payload.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        client
+            .write_all(&proto::encode(
+                proto::client::HELLO,
+                &proto::encode_hello(proto::PROTO_VERSION, proto::hello_flags::CANONICAL_VIEW),
+            ))
+            .unwrap();
+        server.handle_client_data(0, &mut [0; 4096]).unwrap();
+        server.send_view_to_client(0, false);
+        let renegotiated = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::VIEW
+        });
+        assert_eq!(renegotiated[0].msg_type, proto::server::HELLO_ACK);
 
         // One-shot authority changes acknowledge only their own completed
         // SET_SIZE, never a previous unsolicited snapshot or PTY update.
