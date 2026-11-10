@@ -34,6 +34,53 @@ impl Drop for TestDir {
 }
 
 #[test]
+fn full_text_ansi_requests_styles_and_accepts_legacy_plain_responses() {
+    for (ansi, reply) in [
+        (false, "plain"),
+        (true, "\x1b[31mred\x1b[0m"),
+        (true, "legacy"),
+    ] {
+        let dir = TestDir::new();
+        let session = dir.0.join("sessions/grep");
+        std::fs::create_dir_all(&session).unwrap();
+        let listener = UnixListener::bind(session.join("socket")).unwrap();
+        let mut command = dir.command();
+        command.args(["full-text", "grep"]);
+        if ansi {
+            command.arg("--ansi");
+        }
+        let child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = vec![0; if ansi { 6 } else { 5 }];
+        stream.read_exact(&mut request).unwrap();
+        let flags = [pterm_proto::full_text_flags::ANSI];
+        assert_eq!(
+            request,
+            pterm_proto::encode(
+                pterm_proto::client::FULL_TEXT,
+                if ansi { &flags } else { &[] }
+            )
+        );
+        stream
+            .write_all(&pterm_proto::encode(
+                pterm_proto::server::FULL_TEXT,
+                reply.as_bytes(),
+            ))
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, format!("{reply}\n").as_bytes());
+    }
+}
+
+#[test]
 fn bridge_and_query_reject_oversized_response_headers_without_payload() {
     for command in ["attach", "dump"] {
         let dir = TestDir::new();

@@ -739,13 +739,15 @@ function M.redraw(session_name)
 end
 
 --- Run a pterm subcommand that prints text for a session.
-local function run_text_command(subcommand, session_name)
+local function run_text_command(subcommand, session_name, args)
 	if not session_name or session_name == "" then
 		return nil, "Session name required"
 	end
 
 	local bin = find_binary()
-	local result = vim.system({ bin, subcommand, session_name }, { text = true, env = command_env() }):wait()
+	local command = { bin, subcommand, session_name }
+	vim.list_extend(command, args or {})
+	local result = vim.system(command, { text = true, env = command_env() }):wait()
 	local output = (result.stdout or "") .. (result.stderr or "")
 	if result.code ~= 0 then
 		return nil, output
@@ -763,6 +765,12 @@ end
 --- (scrollback history + visible screen).
 function M.full_text(session_name)
 	return run_text_command("full-text", session_name)
+end
+
+--- Return full session contents with ANSI colors/attributes. Older daemons
+--- return plain text, keeping grep available until sessions are restarted.
+function M.full_text_ansi(session_name)
+	return run_text_command("full-text", session_name, { "--ansi" })
 end
 
 --- Return an ANSI-colored snapshot of the visible terminal screen.

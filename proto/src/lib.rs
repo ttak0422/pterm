@@ -46,8 +46,9 @@ pub mod client {
     /// Handshake. Payload: [proto_version: u32 LE] [flags: u32 LE]
     pub const HELLO: u8 = 0x07;
 
-    /// Request the full plain-text contents (scrollback + visible screen,
-    /// no payload)
+    /// Request full contents (scrollback + visible screen).
+    /// Payload: empty for plain text, or [full_text_flags::ANSI] for SGR.
+    /// Older daemons ignore the optional payload and return plain text.
     pub const FULL_TEXT: u8 = 0x08;
 
     /// Request an ANSI-colored snapshot of the visible terminal screen (no payload)
@@ -65,6 +66,11 @@ pub mod client {
     /// Payload: row_base:i32, leftcol:i32 (little endian). row_base=i32::MIN
     /// invalidates the origin while the native display is being reset.
     pub const INPUT_ORIGIN: u8 = 0x0c;
+}
+
+/// Optional flags carried in a FULL_TEXT request's single-byte payload.
+pub mod full_text_flags {
+    pub const ANSI: u8 = 1;
 }
 
 /// Flags carried in the client HELLO payload.
@@ -107,8 +113,9 @@ pub mod server {
     /// Payload: raw escape sequences, written to stdout like OUTPUT.
     pub const HISTORY: u8 = 0x84;
 
-    /// Full plain-text contents (scrollback + visible screen)
-    /// Payload: UTF-8 text lines separated by LF
+    /// Full contents (scrollback + visible screen).
+    /// Payload: UTF-8 logical lines separated by LF, optionally with SGR
+    /// when the FULL_TEXT request included full_text_flags::ANSI.
     pub const FULL_TEXT: u8 = 0x85;
 
     /// ANSI-colored snapshot of the visible terminal screen.

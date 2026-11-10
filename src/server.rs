@@ -1196,7 +1196,15 @@ impl Server {
                         self.flush_pty_output();
                     }
 
-                    let payload = self.session.full_text();
+                    let payload = if frame
+                        .payload
+                        .first()
+                        .is_some_and(|flags| flags & proto::full_text_flags::ANSI != 0)
+                    {
+                        self.session.full_text_ansi()
+                    } else {
+                        self.session.full_text()
+                    };
                     let msg = proto::encode(proto::server::FULL_TEXT, payload.as_bytes());
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.send_buf.clear_unsent();
@@ -1334,6 +1342,42 @@ mod tests {
         renderer.process(&frames[1]);
         assert_eq!(renderer.screen().contents(), "new");
         assert_eq!(renderer.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn full_text_optional_ansi_preserves_plain_requests_and_history() {
+        let dir = std::env::temp_dir().join(format!("pterm-grep-query-{}", std::process::id()));
+        let session =
+            Session::new("grep-query".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        for i in 1..=30 {
+            server
+                .session
+                .process_test_output(format!("\x1b[31mline-{i}\x1b[0m\r\n").as_bytes());
+        }
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        server.accept_client().unwrap();
+        let mut received = Vec::new();
+        for ansi in [false, true, false] {
+            let flags = [proto::full_text_flags::ANSI];
+            client
+                .write_all(&proto::encode(
+                    proto::client::FULL_TEXT,
+                    if ansi { &flags } else { &[] },
+                ))
+                .unwrap();
+            server.handle_client_data(0, &mut [0; 4096]).unwrap();
+            let frames = read_frames_until(&mut client, &mut received, |frame| {
+                frame.msg_type == proto::server::FULL_TEXT
+            });
+            let text = String::from_utf8(frames.last().unwrap().payload.clone()).unwrap();
+            assert!(text.contains("line-1") && text.contains("line-30"));
+            assert_eq!(text.contains("\x1b[31m"), ansi);
+            assert!(server.clients[&0].diagnostic);
+        }
     }
 
     #[test]

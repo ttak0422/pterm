@@ -21,6 +21,8 @@ globals:
     args: [{ type: number }, { type: number }, { type: number }, { type: number }]
   vim.api.nvim_buf_delete:
     args: [{ type: number }, { type: table }]
+  vim.api.nvim_buf_get_extmarks:
+    args: [{ type: number }, { type: number }, { type: any }, { type: any }, { type: table, required: false }]
   vim.api.nvim_buf_get_lines:
     args: [{ type: number }, { type: number }, { type: number }, { type: bool }]
   vim.api.nvim_buf_get_name:

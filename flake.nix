@@ -125,6 +125,7 @@
                   export NVIM_LOG_FILE="$TMPDIR/nvim.log"
                   cd ${./.}
                   nvim --headless -u NONE -l tests/neovim_regressions.lua
+                  nvim --headless -u NONE -l tests/neovim_grep_regressions.lua
                   touch "$out"
                 '';
           };

@@ -480,6 +480,32 @@ end)
 pterm.detach("history-reset")
 settle_resizes()
 
+check("full text ANSI query opts in without changing plain queries", function()
+	local old_system = vim.system
+	local command
+	-- selene: allow(incorrect_standard_library_use)
+	vim.system = function(cmd)
+		command = cmd
+		return {
+			wait = function()
+				return { code = 0, stdout = "\27[31mred\27[0m\n", stderr = "" }
+			end,
+		}
+	end
+	local ok, err = pcall(function()
+		assert(pterm.full_text_ansi("grep") == "\27[31mred\27[0m", "ANSI query lost terminal styles")
+		assert(
+			command[2] == "full-text" and command[3] == "grep" and command[4] == "--ansi",
+			"ANSI query did not pass the session name and ANSI flag"
+		)
+		pterm.full_text("grep")
+		assert(#command == 3 and command[2] == "full-text", "plain query gained an ANSI flag")
+	end)
+	-- selene: allow(incorrect_standard_library_use)
+	vim.system = old_system
+	assert(ok, err)
+end)
+
 check("ANSI preview uses the xterm 256-color cube", function()
 	local ansi = require("pterm.ansi")
 	for _, color in ipairs({ { 16, 0x000000 }, { 17, 0x00005f }, { 196, 0xff0000 }, { 231, 0xffffff } }) do
