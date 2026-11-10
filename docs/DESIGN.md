@@ -108,6 +108,13 @@ Notable behavior:
   history. These clients do not receive the raw PTY `OUTPUT` broadcast.
   One-shot events such as BEL and clipboard writes use `VIEW_EVENT` and are not
   replayed on refresh.
+  Ordinary managed updates compare per-client rendered rows and terminal
+  state, skip unchanged views, and repaint only changed rows without clearing
+  the entire screen. Cursor-only updates do not paint rows. Cache invalidation
+  preserves complete refreshes for attachment, geometry/screen changes,
+  history replay/reset, queue replacement and explicit REDRAW. See
+  [incremental-view validation](incremental-view-validation.md) for measurements
+  and remaining integration/visual checks.
 - **raw/snapshot delivery**: standalone clients receive `OUTPUT` after their
   initial snapshot, with `HISTORY` once before `STATE_SYNC` if requested. A
   resize replaces queued state; redraw does not append the same history again.
