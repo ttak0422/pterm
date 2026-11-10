@@ -493,8 +493,11 @@ check("full text ANSI query opts in without changing plain queries", function()
 		}
 	end
 	local ok, err = pcall(function()
-		assert(pterm.full_text_ansi("grep") == "\27[31mred\27[0m")
-		assert(command[2] == "full-text" and command[3] == "grep" and command[4] == "--ansi")
+		assert(pterm.full_text_ansi("grep") == "\27[31mred\27[0m", "ANSI query lost terminal styles")
+		assert(
+			command[2] == "full-text" and command[3] == "grep" and command[4] == "--ansi",
+			"ANSI query did not pass the session name and ANSI flag"
+		)
 		pterm.full_text("grep")
 		assert(#command == 3 and command[2] == "full-text", "plain query gained an ANSI flag")
 	end)

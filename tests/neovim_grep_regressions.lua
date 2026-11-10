@@ -116,7 +116,9 @@ local function render(selected)
 end
 local marks = render(entry)
 assert(
-	table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") == "before\nlead red plain\n\n日本 tail\nafter"
+	table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+		== "before\nlead red plain\n\n日本 tail\nafter",
+	"preview text changed while stripping ANSI styles"
 )
 local red, blue, match, selected
 for _, mark in ipairs(marks) do
@@ -165,7 +167,7 @@ assert(matches == 1, "updated prompt has wrong number of highlights")
 prompt = ""
 marks = render({ value = "legacy", lnum = 2 })
 assert(#marks == 1 and marks[1][4].hl_group == "Search", "stale ANSI highlights survived session switch")
-assert(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[2] == "second line")
+assert(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[2] == "second line", "legacy preview text changed")
 
 -- Context boundaries retain the logical line number and selected row.
 local many = {}
