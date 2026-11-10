@@ -34,6 +34,9 @@ pterm dump mysession
 # Print the visible screen as plain text
 pterm snapshot-text mysession
 
+# Print scrollback + visible screen with ANSI colors/attributes preserved
+pterm full-text mysession --ansi
+
 # Print the visible screen with ANSI colors/attributes preserved
 pterm snapshot-ansi mysession
 
@@ -182,7 +185,11 @@ are re-joined before matching, so text spanning a wrap point stays
 searchable. Sessions currently showing a full-screen TUI (the alternate
 screen, e.g. `less` or `htop`) contribute only their visible screen, not
 their shell scrollback. Matching words are highlighted in the result list and
-preview.
+preview. The preview also preserves the original terminal colors and attributes,
+including scrollback and re-joined wrapped lines. The selected line is marked
+underneath these styles, and matching words are highlighted on top.
+Existing sessions started by an older daemon remain searchable in plain text;
+restart them with the updated daemon to enable colored grep previews.
 
 ## Development
 

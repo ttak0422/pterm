@@ -1133,6 +1133,35 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
     out
 }
 
+/// Color exactly the text emitted by `Screen::rows`, without adding styled
+/// trailing blanks that would change search entries or terminal jump targets.
+fn full_text_row_ansi(screen: &vt100::Screen, row: u16, text: &str) -> String {
+    let mut out = String::new();
+    let mut current = SgrState::default();
+    let mut remaining = text.len();
+    let mut col = 0;
+    while remaining > 0 {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        let content = if cell.has_contents() {
+            cell.contents()
+        } else {
+            " "
+        };
+        let state = SgrState::from_cell(cell);
+        push_sgr_diff(&mut out, &current, &state);
+        current = state;
+        out.push_str(content);
+        remaining -= content.len();
+        col += if cell.is_wide() { 2 } else { 1 };
+    }
+    if current != SgrState::default() {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
 /// Render the full session contents (scrollback history + visible screen)
 /// as plain text, one logical line per LF. Rows that wrap are re-joined so
 /// text spanning a wrap point stays searchable.
@@ -1141,6 +1170,10 @@ fn build_history(screen: &mut vt100::Screen, max_lines: usize) -> Vec<u8> {
 /// scrollback offset at 0. While the alternate screen is active only the
 /// visible screen is rendered (vt100's scrollback belongs to the main screen).
 fn build_full_text(screen: &mut vt100::Screen) -> String {
+    build_full_text_with_ansi(screen, false)
+}
+
+fn build_full_text_with_ansi(screen: &mut vt100::Screen, ansi: bool) -> String {
     let (rows, cols) = screen.size();
     let (rows, cols) = (rows.get(), cols.get());
     let mut lines: Vec<String> = Vec::new();
@@ -1155,7 +1188,11 @@ fn build_full_text(screen: &mut vt100::Screen) -> String {
             let take = usize::from(rows).min(total - emitted);
             // Like history replay, search must include the original row width.
             for (i, row) in screen.rows(0, u16::MAX).take(take).enumerate() {
-                pending.push_str(&row);
+                pending.push_str(&if ansi {
+                    full_text_row_ansi(screen, i as u16, &row)
+                } else {
+                    row
+                });
                 if !screen.row_wrapped(i as u16) {
                     lines.push(std::mem::take(&mut pending));
                 }
@@ -1166,7 +1203,11 @@ fn build_full_text(screen: &mut vt100::Screen) -> String {
     }
 
     for (i, row) in screen.rows(0, cols).enumerate() {
-        pending.push_str(&row);
+        pending.push_str(&if ansi {
+            full_text_row_ansi(screen, i as u16, &row)
+        } else {
+            row
+        });
         if !screen.row_wrapped(i as u16) {
             lines.push(std::mem::take(&mut pending));
         }
@@ -1701,6 +1742,10 @@ impl Session {
     /// (scrollback history + visible screen).
     pub fn full_text(&mut self) -> String {
         build_full_text(self.parser.screen_mut())
+    }
+
+    pub fn full_text_ansi(&mut self) -> String {
+        build_full_text_with_ansi(self.parser.screen_mut(), true)
     }
 
     pub fn take_pending_da_queries(&mut self) -> (usize, usize) {
@@ -2284,6 +2329,7 @@ mod tests {
             let sizes = [
                 ("snapshot", session.snapshot().len()),
                 ("history", session.history_formatted(usize::MAX).len()),
+                ("full-text ANSI", session.full_text_ansi().len()),
                 (
                     "dump",
                     serde_json::to_vec_pretty(&session.dump()).unwrap().len(),
@@ -2510,6 +2556,117 @@ mod tests {
         assert!(text.contains("alt-content"));
         assert!(!text.contains("line-1"));
         assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn full_text_ansi_preserves_history_wraps_and_plain_search_text() {
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(4).unwrap(),
+            NonZeroU16::new(10).unwrap(),
+            100,
+        );
+        for i in 1..=3 {
+            parser.process(format!("s{i}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b[31mABCDEFGHIJKLMNO\x1b[0m\r\n");
+        for i in 1..=5 {
+            parser.process(format!("f{i}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b[1;38;2;10;20;30mPQRSTUVWXYZ1234\x1b[0m\r\ng1\r\ng2\r\n");
+        let plain = build_full_text(parser.screen_mut());
+        let ansi = super::build_full_text_with_ansi(parser.screen_mut(), true);
+        assert_eq!(strip_sgr(&ansi), plain);
+        assert_eq!(parser.screen().scrollback(), 0);
+        for (needle, color, bold) in [
+            ("ABCDEFGHIJKLMNO", vt100::Color::Idx(1), false),
+            ("PQRSTUVWXYZ1234", vt100::Color::Rgb(10, 20, 30), true),
+        ] {
+            let line = ansi.lines().find(|line| strip_sgr(line) == needle).unwrap();
+            let mut replay =
+                vt100::Parser::new(NonZeroU16::new(2).unwrap(), NonZeroU16::new(40).unwrap(), 0);
+            replay.process(line.as_bytes());
+            for col in 0..15 {
+                let cell = replay.screen().cell(0, col).unwrap();
+                assert_eq!(cell.fgcolor(), color);
+                assert_eq!(cell.bold(), bold);
+            }
+        }
+    }
+
+    #[test]
+    fn full_text_ansi_preserves_unicode_and_attributes_without_extra_blanks() {
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(24).unwrap(),
+            100,
+        );
+        parser
+            .process("\x1b[1;2;3;4;7;38;5;196;48;2;1;2;3m日e\u{301}\x1b[0m  plain\r\n".as_bytes());
+        // A styled empty gap followed by text must retain its background;
+        // styled trailing blanks must not change the plain search text.
+        parser.process(b"\x1b[44m\x1b[K\x1b[4GX\r\n\x1b[0mdefault");
+        let ansi = super::build_full_text_with_ansi(parser.screen_mut(), true);
+        assert_eq!(strip_sgr(&ansi), build_full_text(parser.screen_mut()));
+        let mut replay =
+            vt100::Parser::new(NonZeroU16::new(3).unwrap(), NonZeroU16::new(24).unwrap(), 0);
+        replay.process(ansi.replace('\n', "\r\n").as_bytes());
+        for (row, cols) in [(0, 10), (1, 4), (2, 7)] {
+            for col in 0..cols {
+                let original = parser.screen().cell(row, col).unwrap();
+                let actual = replay.screen().cell(row, col).unwrap();
+                assert_eq!(actual.contents().trim_end(), original.contents().trim_end());
+                assert!(super::SgrState::from_cell(actual) == super::SgrState::from_cell(original));
+            }
+        }
+    }
+
+    #[test]
+    fn full_text_ansi_keeps_resized_history_and_omits_it_in_alternate_screen() {
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(20).unwrap(),
+            100,
+        );
+        parser.process(b"\x1b[32moriginal-wide-line\x1b[0m\r\na\r\nb\r\nc\r\n");
+        parser
+            .screen_mut()
+            .set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(8).unwrap());
+        let ansi = super::build_full_text_with_ansi(parser.screen_mut(), true);
+        assert_eq!(strip_sgr(&ansi), build_full_text(parser.screen_mut()));
+        assert!(strip_sgr(&ansi).contains("original-wide-line"));
+        assert!(ansi.contains("\x1b[32m"));
+        parser.process(b"\x1b[?1049h\x1b[35malt");
+        let alternate = super::build_full_text_with_ansi(parser.screen_mut(), true);
+        assert_eq!(strip_sgr(&alternate), build_full_text(parser.screen_mut()));
+        assert!(alternate.contains("\x1b[35malt"));
+        assert!(!alternate.contains("original"));
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn full_text_ansi_matches_plain_text_through_wide_wraps_and_resizes() {
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(3).unwrap(),
+            NonZeroU16::new(5).unwrap(),
+            100,
+        );
+        for turn in 0..48 {
+            let cols = [5, 2, 9, 1, 7, 4][turn % 6];
+            parser
+                .screen_mut()
+                .set_size(NonZeroU16::new(3).unwrap(), NonZeroU16::new(cols).unwrap());
+            parser.process("\x1b[31mABCD日e\u{301}\x1b[0m終\r\n".as_bytes());
+            if turn % 5 == 0 {
+                parser.process(b"\x1b[44m\x1b[K\x1b[0m\r\n");
+            }
+            let ansi = super::build_full_text_with_ansi(parser.screen_mut(), true);
+            assert_eq!(
+                strip_sgr(&ansi),
+                build_full_text(parser.screen_mut()),
+                "turn {turn}, width {cols}"
+            );
+            assert_eq!(parser.screen().scrollback(), 0);
+        }
     }
 
     #[test]

@@ -71,6 +71,7 @@ local function apply_highlights(bufnr, ns, preview)
 				pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, i - 1, col, {
 					end_col = col + len,
 					hl_group = group,
+					priority = 100,
 				})
 			end
 			col = col + len
@@ -146,7 +147,7 @@ local function make_previewer(pterm)
 end
 
 --- Preview the matched line in context. `session_lines` is the same
---- `full_text` split that produced the entries, so no extra process runs here.
+--- ANSI snapshot that produced the entries, so no extra process runs here.
 local function make_grep_previewer(session_lines)
 	local ns = vim.api.nvim_create_namespace("pterm_grep_preview")
 	return previewers.new_buffer_previewer({
@@ -171,22 +172,31 @@ local function make_grep_previewer(session_lines)
 			local cursor_row = match_index - first + 1
 
 			local bufnr = self.state.bufnr
-			set_preview_lines(bufnr, vim.list_slice(all_lines, first, last))
+			local preview = vim.list_slice(all_lines, first, last)
+			local lines = {}
+			for _, item in ipairs(preview) do
+				-- Parse only the displayed context, not every line of every
+				-- session's potentially large, colorful scrollback.
+				item.runs = item.runs or ansi.parse(item.ansi)[1]
+				lines[#lines + 1] = item.text
+			end
+			set_preview_lines(bufnr, lines)
 			if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
 				return
 			end
 
-			vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+			apply_highlights(bufnr, ns, preview)
 			pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, cursor_row - 1, 0, {
 				end_row = cursor_row,
 				hl_group = "Search",
 				hl_eol = true,
+				priority = 90,
 			})
 			local prompt = ""
 			if status.picker then
 				prompt = status.picker:_get_prompt()
 			end
-			apply_grep_highlights(bufnr, ns, vim.list_slice(all_lines, first, last), prompt)
+			apply_grep_highlights(bufnr, ns, lines, prompt)
 			if status.preview_win and vim.api.nvim_win_is_valid(status.preview_win) then
 				pcall(vim.api.nvim_win_set_cursor, status.preview_win, { cursor_row, 0 })
 			end
@@ -334,11 +344,17 @@ local function grep(opts)
 	local results = {}
 	local session_lines = {}
 	for _, name in ipairs(pterm.list()) do
-		local text = pterm.full_text(name)
+		local text = pterm.full_text_ansi(name)
 		if text then
-			local lines = vim.split(text, "\n", { plain = true })
+			local lines = {}
+			for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
+				-- full-text --ansi emits only numeric SGR sequences, never
+				-- cursor movement or other terminal control sequences.
+				lines[#lines + 1] = { text = line:gsub("\27%[[%d;]*m", ""), ansi = line }
+			end
 			session_lines[name] = lines
-			for lnum, line in ipairs(lines) do
+			for lnum, item in ipairs(lines) do
+				local line = item.text
 				if vim.trim(line) ~= "" then
 					table.insert(results, { session = name, line = line, lnum = lnum })
 				end

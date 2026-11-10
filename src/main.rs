@@ -35,8 +35,8 @@ Usage:
   pterm dump   <session-name>   # print diagnostic state dump as JSON
   pterm snapshot-text <session-name>
                # print plain-text snapshot of current screen
-  pterm full-text <session-name>
-               # print plain-text scrollback + screen contents
+  pterm full-text <session-name> [--ansi]
+               # print scrollback + screen contents, optionally with ANSI styles
   pterm snapshot-ansi <session-name>
                # print snapshot of current screen with ANSI colors/attributes
   pterm socket <session-name>   # print socket path
@@ -469,7 +469,7 @@ fn read_single_response(
     }
 }
 
-/// Send a payload-less request to a session's daemon and print the single
+/// Send a diagnostic request to a session's daemon and print the single
 /// response payload to stdout. Shared by `dump`, `snapshot-text`, and
 /// `full-text`.
 fn cmd_query(args: &[String], request: u8, response: u8) -> io::Result<()> {
@@ -485,7 +485,15 @@ fn cmd_query(args: &[String], request: u8, response: u8) -> io::Result<()> {
     }
 
     let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-    let msg = pterm_proto::encode(request, &[]);
+    let flags = [pterm_proto::full_text_flags::ANSI];
+    let options = if request == pterm_proto::client::FULL_TEXT
+        && args.get(1).is_some_and(|arg| arg == "--ansi")
+    {
+        flags.as_slice()
+    } else {
+        &[]
+    };
+    let msg = pterm_proto::encode(request, options);
     stream.write_all(&msg)?;
 
     let payload = read_single_response(&mut stream, response, Duration::from_secs(3))?;
