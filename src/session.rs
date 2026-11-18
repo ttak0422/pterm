@@ -1758,8 +1758,8 @@ impl Session {
         Ok(termios.local_flags.contains(termios::LocalFlags::ECHO))
     }
 
-    /// Resize the pty and VT parser.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+    /// Resize the pty and VT parser. Return whether the dimensions changed.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<bool> {
         if cols == 0
             || rows == 0
             || cols > MAX_TERMINAL_COLS
@@ -1771,12 +1771,16 @@ impl Session {
                 "terminal size must be 1..512 columns, 1..256 rows, and at most 65536 cells",
             ));
         }
+        let (old_rows, old_cols) = self.parser.screen().size();
+        if old_cols.get() == cols && old_rows.get() == rows {
+            return Ok(false);
+        }
         self.pty.resize(cols, rows)?;
         self.parser.set_size(
             NonZeroU16::new(rows).unwrap(),
             NonZeroU16::new(cols).unwrap(),
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Generate escape sequences that reproduce the current terminal state.

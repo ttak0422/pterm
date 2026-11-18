@@ -77,6 +77,12 @@ or TUI to the newly active window's text area. Background mirrors do not acquire
 resize authority merely because their layout changes. Switching back to another
 Neovim instance reclaims authority when that editor reports `FocusGained`.
 
+Refocusing a window at the existing session size preserves its normal-mode
+cursor and scroll position. Reopening an already connected session also stays
+in normal mode instead of forcing terminal input; press `i` or `a` to resume
+input at the application's live cursor. New sessions still start in input mode.
+Actual size changes rebuild/reflow terminal history and may move reading positions.
+
 Other windows show the same canonical terminal screen: larger windows have
 padding, and smaller windows clip the view instead of rewrapping the application.
 The plugin sends explicit size-control requests and uses a `--no-resize` bridge

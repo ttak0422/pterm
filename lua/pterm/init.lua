@@ -671,7 +671,9 @@ function M.open(session_name, args)
 			vim.api.nvim_set_current_buf(conn.buf)
 			configure_views(conn.buf)
 			resize_active_window(session_name, true)
-			vim.cmd("startinsert")
+			-- Reopening a connected session is navigation, not a request to
+			-- enter terminal input. Preserve the normal-mode reading position;
+			-- users can explicitly press i/a to resume input at the PTY cursor.
 			return
 		else
 			-- Buffer was closed, clean up

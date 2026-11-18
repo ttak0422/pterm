@@ -1064,12 +1064,15 @@ impl Server {
                             client.send_buf.clear_unsent();
                         }
                     }
-                    self.session.resize(cols, rows)?;
+                    let changed = self.session.resize(cols, rows)?;
 
                     // The latest RESIZE is authoritative for every attached
                     // client. Replacing all outbound queues prevents stale-size
                     // frames from surviving ahead of the fresh snapshot.
-                    self.send_snapshot_to_all_clients(true);
+                    // A focus claim at the existing size must not reset native
+                    // scrollback: doing so discards every window's reading cursor.
+                    // Still deliver pending initial snapshots and SET_SIZE ACKs.
+                    self.send_snapshot_to_all_clients(changed);
                     if acknowledge {
                         if let Some(client) = self.clients.get_mut(&client_id) {
                             client.queue_frame(&proto::encode(
@@ -1608,6 +1611,22 @@ mod tests {
         });
         assert_eq!(renegotiated[0].msg_type, proto::server::HELLO_ACK);
 
+        // Reclaiming focus at the same dimensions must not reset history or
+        // emit a replacement VIEW. Normal-mode cursors live in that history.
+        client
+            .write_all(&proto::encode(
+                proto::client::RESIZE,
+                &proto::encode_resize(70, 20),
+            ))
+            .unwrap();
+        server.handle_client_data(0, &mut [0; 4096]).unwrap();
+        client.set_nonblocking(true).unwrap();
+        assert_eq!(
+            client.read(&mut [0; 4096]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        client.set_nonblocking(false).unwrap();
+
         // One-shot authority changes acknowledge only their own completed
         // SET_SIZE, never a previous unsolicited snapshot or PTY update.
         client
@@ -1623,6 +1642,19 @@ mod tests {
         assert_eq!(acknowledged.len(), 1);
         assert_eq!(acknowledged[0].msg_type, proto::server::RESIZE_ACK);
         assert_eq!(acknowledged[0].payload, proto::encode_resize(60, 15));
+        // A no-op SET_SIZE must still acknowledge completion to its caller.
+        client
+            .write_all(&proto::encode(
+                proto::client::SET_SIZE,
+                &proto::encode_resize(60, 15),
+            ))
+            .unwrap();
+        server.handle_client_data(0, &mut [0; 4096]).unwrap();
+        let repeated = read_frames_until(&mut client, &mut recv_buf, |frame| {
+            frame.msg_type == proto::server::RESIZE_ACK
+        });
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].payload, proto::encode_resize(60, 15));
         let size = serde_json::to_value(server.session.dump()).unwrap();
         assert_eq!(size["screen"]["size"]["cols"], 60);
         assert_eq!(size["screen"]["size"]["rows"], 15);
