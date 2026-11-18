@@ -2,7 +2,10 @@
 name = "pterm"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "pterm"
@@ -27,3 +30,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# Focused BeautifulRust baseline; broader review is opt-in.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
