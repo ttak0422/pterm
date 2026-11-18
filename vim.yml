@@ -176,3 +176,11 @@ globals:
     property: read-only
   vim.wait:
     args: [{ type: number }, { type: function, required: false }, { type: number, required: false }, { type: bool, required: false }]
+  vim.deepcopy:
+    args: [{ type: any }]
+  vim.fn.winrestview:
+    args: [{ type: table }]
+  vim.api.nvim_buf_attach:
+    args: [{ type: number }, { type: bool }, { type: table }]
+  vim.api.nvim_win_set_width:
+    args: [{ type: number }, { type: number }]

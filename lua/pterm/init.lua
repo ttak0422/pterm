@@ -81,6 +81,11 @@ local function initialize_mouse_listener()
 	-- Observe keys after user mappings, before Neovim forwards a native mouse
 	-- report. Never replace mappings, consume keys, or move the active window.
 	vim.on_key(function(key)
+		for _, conn in pairs(connections) do
+			if conn.reading_view then
+				conn.reading_view:cancel()
+			end
+		end
 		if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "t" then
 			return
 		end
@@ -552,6 +557,7 @@ local function start_terminal(session_name, cmd)
 		job_id = job_id,
 		session_name = session_name,
 		last_size = size,
+		reading_view = require("pterm.view").new(buf),
 	}
 
 	local augroup = vim.api.nvim_create_augroup(augroup_name(buf), { clear = true })
@@ -569,6 +575,14 @@ local function start_terminal(session_name, cmd)
 		buffer = buf,
 		callback = function(event)
 			local sequence = event.data and event.data.sequence or vim.v.termrequest
+			local connection = connections[session_name]
+			if connection and sequence == "\27]51;pterm-save-view" then
+				connection.reading_view:save()
+				return
+			elseif connection and sequence == "\27]51;pterm-view-ready" then
+				connection.reading_view:restore()
+				return
+			end
 			if sequence ~= "\27]51;pterm-reset-history" then
 				return
 			end
@@ -671,7 +685,9 @@ function M.open(session_name, args)
 			vim.api.nvim_set_current_buf(conn.buf)
 			configure_views(conn.buf)
 			resize_active_window(session_name, true)
-			vim.cmd("startinsert")
+			-- Reopening a connected session is navigation, not a request to
+			-- enter terminal input. Preserve the normal-mode reading position;
+			-- users can explicitly press i/a to resume input at the PTY cursor.
 			return
 		else
 			-- Buffer was closed, clean up
