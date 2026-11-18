@@ -2519,7 +2519,7 @@ mod tests {
             SessionCallbacks::default(),
         );
         parser.process(
-            b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]1337;Custom=1\x07",
+            b"\x07\x1bg\x1b]52;c;SGVsbG8=\x07\x1b]51;pterm-reset-history\x07\x1b]51;pterm-save-view\x07\x1b]51;pterm-view-ready\x07\x1b]1337;Custom=1\x07",
         );
         let events = std::mem::take(&mut parser.callbacks_mut().canonical_events);
         assert_eq!(events, b"\x07\x1bg\x1b]52;c;SGVsbG8=\x1b\\");

@@ -71,7 +71,7 @@ const STATE_SYNC_KEYBOARD_CLEANUP_SEQUENCES: &[u8] = b"\x1b[<u\x1b[=0u";
 // Neovim before 0.12 does not implement ED3's scrollback callback. The plugin
 // clears its native history, refreshes the terminal, then acknowledges this
 // request. Keep replay bytes behind the acknowledgement to avoid duplication.
-const HISTORY_RESET_REQUEST: &[u8] = b"\x1b[?1049l\x1b[?6l\x1b[?69l\x1b[r\x1b[0m\x1b[2J\x1b[999;1H\n\x1b[H\x1b]51;pterm-reset-history\x07";
+const HISTORY_RESET_REQUEST: &[u8] = b"\x1b]51;pterm-save-view\x07\x1b[?1049l\x1b[?6l\x1b[?69l\x1b[r\x1b[0m\x1b[2J\x1b[999;1H\n\x1b[H\x1b]51;pterm-reset-history\x07";
 const HISTORY_RESET_ACK: &[u8] = b"\x1b]51;pterm-history-ready\x07";
 
 #[derive(Default)]
@@ -141,6 +141,7 @@ impl HistoryReset {
                 self.deadline = None;
                 output.push(b"\x1b[3J");
                 output.push(&self.pending);
+                output.push(b"\x1b]51;pterm-view-ready\x07");
                 self.pending.clear();
             }
         }
@@ -842,7 +843,10 @@ mod history_reset_tests {
             forwarded.extend(reset.input(part, &mut output));
         }
         assert_eq!(forwarded, b"beforeafter");
-        assert_eq!(drain(&mut output), b"\x1b[3Jhistoryscreen");
+        assert_eq!(
+            drain(&mut output),
+            b"\x1b[3Jhistoryscreen\x1b]51;pterm-view-ready\x07"
+        );
         assert!(!reset.waiting());
         assert_eq!(reset.pending_bytes(), 0);
     }
@@ -859,7 +863,10 @@ mod history_reset_tests {
             .unwrap();
         assert_eq!(drain(&mut output), HISTORY_RESET_REQUEST);
         reset.input(HISTORY_RESET_ACK, &mut output);
-        assert_eq!(drain(&mut output), b"\x1b[3Jnew");
+        assert_eq!(
+            drain(&mut output),
+            b"\x1b[3Jnew\x1b]51;pterm-view-ready\x07"
+        );
     }
 
     #[test]
@@ -913,7 +920,10 @@ mod history_reset_tests {
         assert!(!reset.waiting());
         assert_eq!(reset.pending_bytes(), 0);
         assert!(!reset.expired(start + Duration::from_secs(60)));
-        assert_eq!(drain(&mut output), b"\x1b[3Jhistory");
+        assert_eq!(
+            drain(&mut output),
+            b"\x1b[3Jhistory\x1b]51;pterm-view-ready\x07"
+        );
 
         let next = start + Duration::from_secs(60);
         reset.queue_view(b"\x01next", &mut output, next).unwrap();

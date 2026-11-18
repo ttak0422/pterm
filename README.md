@@ -81,7 +81,13 @@ Refocusing a window at the existing session size preserves its normal-mode
 cursor and scroll position. Reopening an already connected session also stays
 in normal mode instead of forcing terminal input; press `i` or `a` to resume
 input at the application's live cursor. New sessions still start in input mode.
-Actual size changes rebuild/reflow terminal history and may move reading positions.
+When a different window size rebuilds history, normal-mode views are restored
+after replay using an exact, unique line-and-neighbor anchor. Existing windows
+keep their own positions. Recreated floating-window positions are not retained.
+Explicit input or buffer changes cancel stale restoration. If content was clipped,
+reflowed, evicted, or the anchor is ambiguous among repeated lines, pterm does not
+guess a new position. Both the plugin and bridge must be updated for replay-aware
+restoration; old bridges retain their previous behavior.
 
 Other windows show the same canonical terminal screen: larger windows have
 padding, and smaller windows clip the view instead of rewrapping the application.

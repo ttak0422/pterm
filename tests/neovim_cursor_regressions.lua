@@ -18,6 +18,7 @@ pterm.open("cursor-test", {
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
 local expected
+local mirror
 local function assert_view()
 	assert(vim.api.nvim_get_mode().mode ~= "t", "navigation unexpectedly entered terminal input")
 	local view = vim.fn.winsaveview()
@@ -57,6 +58,32 @@ local steps = {
 	end,
 	function()
 		vim.api.nvim_set_current_win(win)
+	end,
+	function()
+		assert_view()
+		-- An ordinary differently sized split mirrors the same session.
+		vim.api.nvim_win_set_buf(other, buf)
+		vim.api.nvim_win_set_width(other, 25)
+	end,
+	function()
+		assert_view()
+		vim.api.nvim_set_current_win(other)
+	end,
+	function()
+		vim.cmd("normal! 30Gzt")
+		vim.api.nvim_win_set_cursor(other, { 30, 5 })
+		mirror = vim.fn.winsaveview()
+		vim.api.nvim_set_current_win(win)
+	end,
+	function()
+		assert_view()
+		vim.api.nvim_win_call(other, function()
+			local view = vim.fn.winsaveview()
+			assert(
+				view.lnum == mirror.lnum and view.col == mirror.col,
+				"inactive normal split lost its independent reading cursor"
+			)
+		end)
 	end,
 	function()
 		assert_view()
