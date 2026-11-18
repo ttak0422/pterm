@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.5.1] - 2026-11-18
+
+### Miscellaneous Tasks
+
+- Adopt scoped BeautifulRust guidance and validate PTY arguments
 ## [2.5.0] - 2026-11-18
 
 ### Bug Fixes
@@ -684,6 +689,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.5.1]: https://github.com/ttak0422/pterm/compare/v2.5.0..v2.5.1
 [2.5.0]: https://github.com/ttak0422/pterm/compare/v2.4.0..v2.5.0
 [2.4.0]: https://github.com/ttak0422/pterm/compare/v2.3.1..v2.4.0
 [2.3.1]: https://github.com/ttak0422/pterm/compare/v2.3.0..v2.3.1
