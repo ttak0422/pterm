@@ -200,6 +200,13 @@ their shell scrollback. Matching words are highlighted in the result list and
 preview. The preview also preserves the original terminal colors and attributes,
 including scrollback and re-joined wrapped lines. The selected line is marked
 underneath these styles, and matching words are highlighted on top.
+
+Selecting a result navigates to the start of its logical line, including lines
+split across terminal rows. The complete search snapshot is checked to distinguish
+identical lines. If output has changed, native scrollback was truncated, or the
+snapshot has more than one possible location, reopen the picker; pterm does not
+guess a different occurrence. Navigation waits up to five seconds for managed
+replay and stops if you type, leave/close the window, or replace its buffer.
 Existing sessions started by an older daemon remain searchable in plain text;
 restart them with the updated daemon to enable colored grep previews.
 
@@ -219,6 +226,16 @@ The Rust checks include session/server and CLI integration tests using Unix
 sockets. The real Neovim/PTY and tig fixtures in
 `tests/neovim_resize_regressions.lua` and `tests/neovim_tig_regressions.lua`
 are opt-in development tests and are not run by `nix flake check`.
+
+The grep jump regression tests use native terminal buffers with a mocked picker
+and daemon. `nix flake check` also runs `neovim-grep-live` with real Telescope,
+Plenary, and disposable daemon sessions. To run that integration test manually,
+build `target/release/pterm`, set `PTERM_TELESCOPE_RTP` and `PTERM_PLENARY_RTP` to
+plugin checkouts, then run:
+
+```sh
+nvim --headless -u NONE -i NONE -l tests/neovim_grep_live_regressions.lua
+```
 
 ## License
 
