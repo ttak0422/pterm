@@ -81,10 +81,19 @@ local function check(name, output, wanted, occurrence, native_target)
 	vim.api.nvim_win_set_cursor(win, { endrow, 0 })
 	require("telescope").extensions.pterm.grep({ default_text = "needle" })
 	local prompt = vim.api.nvim_get_current_buf()
-	assert(vim.wait(3000, function()
-		return state.get_selected_entry() ~= nil
-	end, 10))
-	local picker = state.get_current_picker(prompt)
+	local picker
+	assert(
+		vim.wait(3000, function()
+			picker = state.get_current_picker(prompt)
+			local entry = state.get_selected_entry()
+			return picker
+				and type(picker.manager) == "table"
+				and picker.manager:num_results() > 0
+				and entry
+				and entry.value == name
+		end, 10),
+		"new picker did not finish populating"
+	)
 	local found = false
 	for i = 0, picker.manager:num_results() - 1 do
 		picker:set_selection(i)
