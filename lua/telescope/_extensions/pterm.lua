@@ -6,6 +6,7 @@ local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
 local previewers = require("telescope.previewers")
 local ansi = require("pterm.ansi")
+local grep_target = require("pterm.grep")
 
 local function grep_highlighter(_, prompt, display)
 	local highlights = {}
@@ -204,37 +205,6 @@ local function make_grep_previewer(session_lines)
 	})
 end
 
---- Move the cursor onto the matched line inside the session's terminal buffer.
---- The buffer is filled by an asynchronous history replay, so the lookup is
---- retried for a short while before giving up.
-local function jump_to_grep_line(session_name, match_line, attempts)
-	if not match_line or match_line == "" then
-		return
-	end
-
-	attempts = attempts or 10
-	vim.defer_fn(function()
-		local bufnr = vim.api.nvim_get_current_buf()
-		if not vim.api.nvim_buf_is_valid(bufnr) or vim.api.nvim_buf_get_name(bufnr) ~= "pterm://" .. session_name then
-			return
-		end
-
-		for i, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
-			if line == match_line or line:find(match_line, 1, true) then
-				-- terminal-mode pins the cursor to the PTY: normal mode is the only
-				-- mode where the window cursor can be moved into the scrollback.
-				vim.cmd("stopinsert")
-				pcall(vim.api.nvim_win_set_cursor, 0, { i, 0 })
-				return
-			end
-		end
-
-		if attempts > 1 then
-			jump_to_grep_line(session_name, match_line, attempts - 1)
-		end
-	end, 50)
-end
-
 local function session_exists(pterm, session_name)
 	for _, name in ipairs(pterm.list()) do
 		if name == session_name then
@@ -389,15 +359,25 @@ local function grep(opts)
 			previewer = previewer,
 			attach_mappings = function(prompt_bufnr)
 				actions.select_default:replace(function()
-					actions.close(prompt_bufnr)
-
 					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
 					if not selection or not selection.value then
 						return
 					end
 
 					local session_name = selection.value
-					local match_line = selection.grep_line
+					local snapshot = grep_target.snapshot(session_lines[session_name])
+					local current = pterm.full_text_ansi(session_name)
+					if
+						not current
+						or not vim.deep_equal(
+							snapshot,
+							grep_target.snapshot(vim.split(current:gsub("\27%[[%d;]*m", ""), "\n", { plain = true }))
+						)
+					then
+						vim.notify("pterm grep: session output changed; reopen grep", vim.log.levels.WARN)
+						return
+					end
 					if not session_exists(pterm, session_name) then
 						vim.notify("Session '" .. session_name .. "' not found", vim.log.levels.ERROR)
 						return
@@ -410,7 +390,15 @@ local function grep(opts)
 							vim.log.levels.ERROR
 						)
 					else
-						jump_to_grep_line(session_name, match_line)
+						grep_target.jump(
+							vim.api.nvim_get_current_win(),
+							vim.api.nvim_get_current_buf(),
+							snapshot,
+							selection.lnum,
+							function()
+								return pterm._grep_ready(session_name)
+							end
+						)
 					end
 				end)
 				return true

@@ -733,6 +733,17 @@ function M.attach(session_name)
 	start_terminal(session_name, { bin, "attach", session_name, "--no-resize" })
 end
 
+-- Internal grep navigation waits for managed replay and supersedes an old
+-- reading-view restoration, so it cannot later overwrite the selected target.
+function M._grep_ready(session_name)
+	local conn = connections[session_name]
+	if not conn or not conn.reading_view.ready then
+		return false
+	end
+	conn.reading_view:cancel()
+	return true
+end
+
 --- Detach from a session (does not kill the daemon).
 function M.detach(session_name)
 	teardown_connection(session_name)
