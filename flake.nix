@@ -114,6 +114,26 @@
               cargoTestOptions = opts: opts ++ [ "--workspace" ];
             };
             clippy = buildPackage { mode = "clippy"; };
+            neovim-grep-live =
+              pkgs.runCommand "pterm-neovim-grep-live"
+                {
+                  nativeBuildInputs = [
+                    neovimPackage
+                    pterm-daemon
+                  ];
+                }
+                ''
+                  export XDG_CONFIG_HOME="$TMPDIR/config"
+                  export XDG_DATA_HOME="$TMPDIR/data"
+                  export XDG_STATE_HOME="$TMPDIR/state"
+                  export XDG_CACHE_HOME="$TMPDIR/cache"
+                  export NVIM_LOG_FILE="$TMPDIR/nvim.log"
+                  export PTERM_TELESCOPE_RTP=${pkgs.vimPlugins.telescope-nvim}
+                  export PTERM_PLENARY_RTP=${pkgs.vimPlugins.plenary-nvim}
+                  cd ${./.}
+                  nvim --headless -u NONE -i NONE -l tests/neovim_grep_live_regressions.lua
+                  touch "$out"
+                '';
             neovim =
               pkgs.runCommand "pterm-neovim-regressions"
                 {
@@ -127,6 +147,7 @@
                   nvim --headless -u NONE -l tests/neovim_context_regressions.lua
                   nvim --headless -u NONE -l tests/neovim_regressions.lua
                   nvim --headless -u NONE -l tests/neovim_grep_regressions.lua
+                  nvim --headless -u NONE -l tests/neovim_grep_jump_regressions.lua
                   nvim --headless -u NONE -l tests/neovim_view_regressions.lua
                   touch "$out"
                 '';

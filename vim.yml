@@ -26,7 +26,7 @@ globals:
   vim.fn.winsaveview:
     args: []
   vim.on_key:
-    args: [{ type: function }, { type: number, required: false }]
+    args: [{ type: any }, { type: number, required: false }]
   vim.api.nvim_buf_clear_namespace:
     args: [{ type: number }, { type: number }, { type: number }, { type: number }]
   vim.api.nvim_buf_delete:
@@ -194,3 +194,30 @@ globals:
     args: [{ type: number }, { type: bool }, { type: table }]
   vim.api.nvim_win_set_width:
     args: [{ type: number }, { type: number }]
+
+  vim.api.nvim_del_augroup_by_id:
+    args: [{ type: number }]
+  vim.api.nvim_win_get_cursor:
+    args: [{ type: number }]
+  vim.api.nvim_win_close:
+    args: [{ type: number }, { type: bool }]
+  vim.api.nvim_open_win:
+    args: [{ type: number }, { type: bool }, { type: table }]
+  vim.api.nvim_open_term:
+    args: [{ type: number }, { type: table }]
+  vim.api.nvim_chan_send:
+    args: [{ type: number }, { type: string }]
+  vim.api.nvim_feedkeys:
+    args: [{ type: string }, { type: string }, { type: bool }]
+  vim.uv.fs_mkdtemp:
+    args: [{ type: string }]
+  vim.deep_equal:
+    args: [{ type: any }, { type: any }]
+  vim.api.nvim_buf_get_changedtick:
+    args: [{ type: number }]
+  vim.log.levels.WARN:
+    property: read-only
+  vim.o.columns:
+    property: full-write
+  vim.o.lines:
+    property: full-write
