@@ -80,6 +80,10 @@ pub mod hello_flags {
 
     /// Request canonical, cropped view frames instead of raw terminal output.
     pub const CANONICAL_VIEW: u32 = 1 << 1;
+
+    /// Managed renderer reads daemon-observed shell/foreground metadata.
+    /// Older daemons ignore this optional bit.
+    pub const SESSION_CONTEXT: u32 = 1 << 2;
 }
 
 /// Daemon → Client message types

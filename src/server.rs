@@ -24,6 +24,7 @@ const MAX_PENDING_PTY_INPUT_BYTES: usize = 1024 * 1024;
 /// How often the daemon re-reads the child shell's working directory and
 /// refreshes the `cwd` file so session lists can follow `cd`.
 const CWD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 struct Client {
     stream: UnixStream,
@@ -43,6 +44,7 @@ struct Client {
     wants_history: bool,
     /// Managed renderers receive canonical rows instead of raw PTY output.
     canonical_view: bool,
+    session_context: bool,
     /// Physical renderer dimensions, independent of the authoritative PTY.
     view_size: Option<(u16, u16)>,
     mouse_input: MouseInput,
@@ -172,6 +174,9 @@ pub struct Server {
     last_cwd: Option<String>,
     /// When the cwd was last refreshed from the child process.
     last_cwd_refresh: Instant,
+    context_path: PathBuf,
+    last_context: Option<Vec<u8>>,
+    last_context_refresh: Option<Instant>,
 }
 
 impl Server {
@@ -185,7 +190,6 @@ impl Server {
         let cwd_path = session_dir.join(crate::paths::CWD_FILENAME);
         let last_cwd = std::fs::read_to_string(&cwd_path)
             .ok()
-            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
         let mut listener = UnixListener::bind(&socket_path)?;
@@ -219,7 +223,10 @@ impl Server {
             exit_sent: false,
             cwd_path,
             last_cwd,
-            last_cwd_refresh: Instant::now(),
+            last_cwd_refresh: Instant::now() - CWD_REFRESH_INTERVAL,
+            context_path: session_dir.join(crate::paths::CONTEXT_FILENAME),
+            last_context: None,
+            last_context_refresh: None,
         })
     }
 
@@ -254,8 +261,6 @@ impl Server {
                 &mut events,
                 Some(Duration::from_millis(if mouse_pending { 25 } else { 100 })),
             )?;
-
-            self.refresh_cwd();
 
             for event in events.iter() {
                 match event.token() {
@@ -343,6 +348,8 @@ impl Server {
                 }
             }
 
+            self.refresh_context();
+
             if self.session.exited.is_some() && self.clients.is_empty() {
                 break;
             }
@@ -361,29 +368,75 @@ impl Server {
 
     fn remove_socket(&self) {
         if self.owns_socket() {
+            let _ = std::fs::remove_file(&self.context_path);
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
-    /// Re-read the child shell's working directory and update the `cwd` file
-    /// when it changes, so session lists reflect `cd` inside the session.
-    /// Throttled to `CWD_REFRESH_INTERVAL`.
-    fn refresh_cwd(&mut self) {
-        if self.last_cwd_refresh.elapsed() < CWD_REFRESH_INTERVAL {
+    /// Keep picker CWD refresh for detached sessions. Faster kernel queries are
+    /// useful only while a managed Neovim bridge is attached. They share the
+    /// daemon poll wakeups and never run on each key or each PTY read.
+    fn refresh_context(&mut self) {
+        let attached = self.clients.values().any(|c| c.session_context && !c.diagnostic);
+        let context_due = attached
+            && self.last_context_refresh.is_none_or(|t| t.elapsed() >= CONTEXT_REFRESH_INTERVAL);
+        let cwd_due = self.last_cwd_refresh.elapsed() >= CWD_REFRESH_INTERVAL;
+        if !attached && self.last_context.take().is_some() {
+            self.last_context_refresh = None;
+            if self.owns_socket() {
+                let _ = std::fs::remove_file(&self.context_path);
+            }
+        }
+        if !context_due && !cwd_due {
             return;
         }
-        self.last_cwd_refresh = Instant::now();
-
         let pid = self.session.pty.child_pid.as_raw();
-        let cwd = match crate::paths::process_cwd(pid) {
-            Some(p) => p.to_string_lossy().into_owned(),
-            None => return,
-        };
-        if self.last_cwd.as_deref() == Some(cwd.as_str()) {
+        let cwd =
+            crate::paths::process_cwd(pid).and_then(|path| path.into_os_string().into_string().ok());
+        if cwd_due {
+            self.last_cwd_refresh = Instant::now();
+            if let Some(cwd) = &cwd {
+                if self.last_cwd.as_ref() != Some(cwd)
+                    && std::fs::write(&self.cwd_path, cwd.as_bytes()).is_ok()
+                {
+                    self.last_cwd = Some(cwd.clone());
+                }
+            }
+        }
+        if !context_due {
             return;
         }
-        if std::fs::write(&self.cwd_path, cwd.as_bytes()).is_ok() {
-            self.last_cwd = Some(cwd);
+        self.last_context_refresh = Some(Instant::now());
+        let foreground = self.session.pty.foreground_executable();
+        let (dev, ino) = self.socket_identity;
+        let payload = serde_json::json!({
+            "dev": dev.to_string(),
+            "ino": ino.to_string(),
+            "cwd": cwd,
+            "foreground": foreground,
+        })
+        .to_string()
+        .into_bytes();
+        if self.last_context.as_ref() == Some(&payload) || !self.owns_socket() {
+            return;
+        }
+        // An atomic replace keeps successful reads self-consistent. The socket
+        // identity in the payload prevents accepting an old daemon's snapshot.
+        let mut staged = self.context_path.clone();
+        staged.set_extension(format!("tmp.{}", std::process::id()));
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            let updated = file.write_all(&payload).is_ok()
+                && self.owns_socket()
+                && std::fs::rename(&staged, &self.context_path).is_ok();
+            if updated {
+                self.last_context = Some(payload);
+            } else {
+                let _ = std::fs::remove_file(&staged);
+            }
         }
     }
 
@@ -414,6 +467,7 @@ impl Server {
                             proto: 0,
                             wants_history: false,
                             canonical_view: false,
+                            session_context: false,
                             view_size: None,
                             mouse_input: MouseInput::new(),
                             mouse_pending_since: None,
@@ -989,6 +1043,8 @@ impl Server {
                             client.proto = version;
                             client.wants_history = flags & proto::hello_flags::REQUEST_HISTORY != 0;
                             client.canonical_view = flags & proto::hello_flags::CANONICAL_VIEW != 0;
+                            client.session_context = client.canonical_view
+                                && flags & proto::hello_flags::SESSION_CONTEXT != 0;
                             client.hello_ack_pending = true;
                         }
                     }
@@ -1289,6 +1345,36 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn foreground_context_requires_an_opted_in_bridge() {
+        let dir = std::env::temp_dir().join(format!("pterm-context-{}", std::process::id()));
+        let session =
+            Session::new("context".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        server.accept_client().unwrap();
+
+        for (flags, saves_context) in [
+            (proto::hello_flags::CANONICAL_VIEW, false),
+            (proto::hello_flags::SESSION_CONTEXT, false),
+            (
+                proto::hello_flags::CANONICAL_VIEW | proto::hello_flags::SESSION_CONTEXT,
+                true,
+            ),
+        ] {
+            let hello = proto::encode_hello(proto::PROTO_VERSION, flags);
+            server.clients.get_mut(&0).unwrap().recv_buf = proto::encode(proto::client::HELLO, &hello);
+            server.process_client_recv_buf(0).unwrap();
+            server.refresh_context();
+            assert_eq!(server.context_path.exists(), saves_context);
+        }
+
+        let path = server.context_path.clone();
+        drop(server);
+        assert!(!path.exists(), "socket cleanup must also remove stale context");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn synchronized_view_gate_coalesces_frames_and_preserves_resets() {

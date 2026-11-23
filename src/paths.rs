@@ -8,6 +8,35 @@ pub const SOCKET_FILENAME: &str = "socket";
 /// File name within a session directory recording the session shell's current
 /// working directory. Written at creation and refreshed by the daemon.
 pub const CWD_FILENAME: &str = "cwd";
+/// Daemon-observed state; unlike terminal output this cannot be forged by OSC.
+pub const CONTEXT_FILENAME: &str = ".pterm-context";
+
+/// Obtain the executable basename from the OS, not argv or the terminal title.
+pub fn process_executable(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    #[cfg(target_os = "macos")]
+    let path = {
+        use nix::libc;
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: proc_pidpath receives a writable buffer of the specified size.
+        let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return None;
+        }
+        let bytes = buf.get(..n as usize)?;
+        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return path.file_name()?.to_str().map(str::to_owned);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
 
 /// Look up the current working directory of a running process by pid.
 /// Returns `None` if the process is gone or the lookup is unsupported.
@@ -77,11 +106,16 @@ pub fn session_dir(session_name: &str) -> io::Result<PathBuf> {
     if session_name.contains('\0')
         || session_name
             .split('/')
-            .any(|part| matches!(part, "" | "." | ".." | SOCKET_FILENAME | CWD_FILENAME))
+            .any(|part| {
+            matches!(
+                part,
+                "" | "." | ".." | SOCKET_FILENAME | CWD_FILENAME | CONTEXT_FILENAME
+            )
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session name must contain nonempty relative components other than '.', '..', 'socket', or 'cwd'",
+            "session name must contain nonempty relative components other than '.', '..', 'socket', 'cwd', or '.pterm-context'",
         ));
     }
 

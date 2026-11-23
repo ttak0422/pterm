@@ -45,7 +45,7 @@ pterm kill mysession
 ```
 
 Session names may contain `/` for hierarchical sessions. Killing a parent session also kills all children.
-Names must be relative, with no empty, `.`, `..`, `socket`, or `cwd` components.
+Names must be relative, with no empty, `.`, `..`, `socket`, `cwd`, or `.pterm-context` components.
 Session directories below the socket root must not be symbolic links.
 
 ```sh
@@ -160,6 +160,32 @@ require("pterm").setup({
   auto_redraw_delay_ms = 1000,
 })
 ```
+
+### Shell directory and foreground filetype
+
+```lua
+require("pterm").setup({
+  sync_cwd = true,
+  foreground_filetypes = { tig = "pterm-tig", [".tig-wrapped"] = "pterm-tig" },
+})
+```
+
+Both options are off by default. `sync_cwd` follows the pterm session shell's
+directory in the focused terminal window via `:lcd`; it does not change the tab,
+global directory, or other windows. `foreground_filetypes` associates an
+OS-reported foreground executable basename with a buffer filetype and restores
+the earlier filetype when the foreground changes. No terminal output or input
+is used to infer process identity. A process with no resolvable group leader
+(e.g. some pipelines) is unknown.
+
+Subscribed Neovim bridges opt in to daemon-observed snapshots. Changes are sampled
+up to ten times per second using existing daemon wakeups; idle unobserved
+sessions retain their slower directory refresh and are not probed for the
+foreground executable. Old daemons simply do not provide this opt-in data.
+`require("pterm").buffer_context(bufnr)` returns the last observed
+`{ cwd, foreground }` for a connected buffer, or `nil` if unavailable.
+Use the observed foreground for key policies that should not apply to other
+terminals, bearing in mind that updates are sampled rather than instantaneous.
 
 ## Telescope Extension
 

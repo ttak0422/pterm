@@ -330,7 +330,14 @@ pub fn run(
     {
         // HELLO must precede RESIZE in a single write so the daemon records
         // the handshake before queueing the initial snapshot.
-        let flags = proto::hello_flags::REQUEST_HISTORY
+        let context_flag = if !propagate_resize
+            && std::env::var_os("PTERM_SESSION_CONTEXT").is_some_and(|value| value == "1")
+        {
+            proto::hello_flags::SESSION_CONTEXT
+        } else {
+            0
+        };
+        let flags = context_flag | proto::hello_flags::REQUEST_HISTORY
             | if propagate_resize {
                 0
             } else {
