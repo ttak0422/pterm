@@ -9,7 +9,7 @@ M.config = {
 	auto_redraw = true,
 	auto_redraw_delay_ms = 1000,
 	sync_cwd = false,
-	foreground_filetypes = {},
+	track_foreground = false,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
@@ -19,7 +19,7 @@ local cached_binary = nil
 local editor_focused = true
 local focus_autocmds_initialized = false
 local mouse_listener_initialized = false
-local context_timer_running = false
+local apply_context_cwd
 
 --- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
@@ -55,11 +55,7 @@ local function find_binary()
 end
 
 local function command_env()
-	return {
-		PTERM_SOCKET_DIR = M.config.socket_dir,
-		SHELL = M.config.shell,
-		PTERM_SESSION_CONTEXT = (M.config.sync_cwd or next(M.config.foreground_filetypes)) and "1" or "",
-	}
+	return { PTERM_SOCKET_DIR = M.config.socket_dir, SHELL = M.config.shell }
 end
 
 local function trigger_redraw(session_name)
@@ -271,6 +267,7 @@ local function initialize_focus_autocmds()
 			editor_focused = true
 			for session_name in pairs(connections) do
 				resize_active_window(session_name, true)
+				apply_context_cwd(connections[session_name])
 			end
 		end,
 	})
@@ -357,39 +354,8 @@ function M.session_cwd(session_name)
 	return content
 end
 
-local function read_context(conn)
-	local path = socket_path(conn.session_name)
-	local stat = vim.uv.fs_lstat(path)
-	if not stat or stat.type ~= "socket" then
-		return nil
-	end
-	local dev, ino = tostring(stat.dev), tostring(stat.ino)
-	if conn.context_socket and conn.context_socket ~= dev .. ":" .. ino then
-		return nil
-	end
-	local fd = io.open(path:sub(1, -7) .. ".pterm-context", "rb")
-	if not fd then
-		return nil
-	end
-	local bytes = fd:read(16 * 1024 + 1)
-	fd:close()
-	if not bytes or #bytes > 16 * 1024 then
-		return nil
-	end
-	local ok, data = pcall(vim.json.decode, bytes)
-	if not ok or type(data) ~= "table" or data.dev ~= dev or data.ino ~= ino then
-		return nil
-	end
-	conn.context_socket = dev .. ":" .. ino
-	local cwd = data.cwd
-	if type(cwd) ~= "string" or cwd:sub(1, 1) ~= "/" or cwd:find("\0", 1, true) then
-		cwd = nil
-	end
-	return { cwd = cwd, foreground = type(data.foreground) == "string" and data.foreground or nil }
-end
-
---- Read daemon-observed context for a connected pterm buffer, or nil if unknown.
---- The foreground is a process-group leader's executable basename, not a title.
+--- Latest live context from the daemon, or nil for an unknown/disconnected buffer.
+--- This is a cache lookup, with no external process or I/O on the key path.
 function M.buffer_context(buf)
 	for _, conn in pairs(connections) do
 		if conn.buf == buf then
@@ -398,67 +364,64 @@ function M.buffer_context(buf)
 	end
 end
 
-local function update_filetype(conn, foreground)
-	local current = vim.api.nvim_get_option_value("filetype", { buf = conn.buf })
-	local desired = foreground and M.config.foreground_filetypes[foreground]
-	if conn.context_ft and current ~= conn.context_ft then
-		-- Respect an intervening manual filetype until the foreground changes.
-		conn.original_ft = nil
-		conn.context_ft = nil
-		conn.ignored_foreground = foreground
-	end
-	if conn.ignored_foreground and conn.ignored_foreground == foreground then
+apply_context_cwd = function(conn)
+	if not conn or not M.config.sync_cwd or not editor_focused then
 		return
 	end
-	conn.ignored_foreground = nil
-	if desired and current ~= desired then
-		conn.original_ft = conn.original_ft or current
-		conn.context_ft = desired
-		vim.api.nvim_set_option_value("filetype", desired, { buf = conn.buf })
-	elseif not desired and conn.context_ft then
-		local original = conn.original_ft
-		conn.context_ft = nil
-		conn.original_ft = nil
-		vim.api.nvim_set_option_value("filetype", original, { buf = conn.buf })
+	local cwd = conn.context and conn.context.cwd
+	if
+		vim.api.nvim_get_current_buf() == conn.buf
+		and cwd
+		and vim.fn.getcwd() ~= cwd
+		and vim.fn.isdirectory(cwd) == 1
+	then
+		pcall(vim.api.nvim_cmd, { cmd = "lcd", args = { cwd }, magic = { file = false, bar = false } }, {})
 	end
 end
 
-local function update_context()
-	local active = editor_focused and vim.api.nvim_get_current_win()
-	for _, conn in pairs(connections) do
-		if vim.api.nvim_buf_is_valid(conn.buf) then
-			local owns_cwd = M.config.sync_cwd and active and vim.api.nvim_win_get_buf(active) == conn.buf
-			if owns_cwd or next(M.config.foreground_filetypes) or conn.context_ft then
-				local context = read_context(conn)
-				conn.context = context
-				update_filetype(conn, context and context.foreground)
-				if owns_cwd and context and context.cwd
-					and active == vim.api.nvim_get_current_win() and vim.api.nvim_win_get_buf(active) == conn.buf
-					and vim.fn.getcwd() ~= context.cwd
-					and vim.fn.isdirectory(context.cwd) == 1
-				then
-					-- No filename expansion for #, %, wildcards or command separators.
-					pcall(vim.api.nvim_cmd, { cmd = "lcd", args = { context.cwd }, magic = { file = false, bar = false } }, {})
-				end
+local function subscribe_context(session_name, conn)
+	local fields = (M.config.sync_cwd and 1 or 0) + (M.config.track_foreground and 2 or 0)
+	if fields == 0 then
+		return
+	end
+	local path = socket_path(session_name)
+	local function connect(identity)
+		conn.close_context = require("pterm.context").subscribe(path, fields, function(data)
+			if connections[session_name] ~= conn then
+				return
 			end
-		end
+			local current = data and vim.uv.fs_stat(path)
+			if data and (not current or current.dev ~= identity.dev or current.ino ~= identity.ino) then
+				conn.close_context()
+				data = nil
+			end
+			local cwd = data and data.cwd
+			if type(cwd) ~= "string" or cwd:sub(1, 1) ~= "/" or cwd:find("\0", 1, true) then
+				cwd = nil
+			end
+			conn.context = data and {
+				cwd = cwd,
+				foreground = type(data.foreground) == "string" and data.foreground or nil,
+			} or nil
+			apply_context_cwd(conn)
+		end)
 	end
-end
-
-local function schedule_context()
-	if context_timer_running or not (M.config.sync_cwd or next(M.config.foreground_filetypes)) then
-		return
-	end
-	context_timer_running = true
-	local function tick()
-		context_timer_running = false
-		if not next(connections) then
+	-- For :Pterm new, the bridge creates the socket asynchronously. Wait for
+	-- that one connection, not a repeated poll on behalf of an old daemon.
+	local attempts = 0
+	local function wait_socket()
+		if connections[session_name] ~= conn then
 			return
 		end
-		update_context()
-		schedule_context()
+		local stat = vim.uv.fs_stat(path)
+		if stat and stat.type == "socket" then
+			connect(stat)
+		elseif attempts < 20 then
+			attempts = attempts + 1
+			vim.defer_fn(wait_socket, 50)
+		end
 	end
-	vim.defer_fn(tick, 100)
+	wait_socket()
 end
 
 --- Format a session name with its directory basename appended, e.g.
@@ -523,6 +486,9 @@ local function teardown_connection(session_name, opts)
 	end
 
 	connections[session_name] = nil
+	if conn.close_context then
+		conn.close_context()
+	end
 
 	if conn.resize_job then
 		pcall(vim.fn.jobstop, conn.resize_job)
@@ -765,13 +731,11 @@ local function start_terminal(session_name, cmd)
 		callback = function()
 			resize_active_window(session_name, true)
 			schedule_redraw(session_name)
-			if M.config.sync_cwd or next(M.config.foreground_filetypes) then
-				update_context()
-			end
+			apply_context_cwd(connections[session_name])
 		end,
 	})
 
-	schedule_context()
+	subscribe_context(session_name, connections[session_name])
 
 	-- Explicit control requests are the only source of managed size authority,
 	-- including first attach. The bridge must never race this with stale sizes.

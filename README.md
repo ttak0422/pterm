@@ -45,7 +45,7 @@ pterm kill mysession
 ```
 
 Session names may contain `/` for hierarchical sessions. Killing a parent session also kills all children.
-Names must be relative, with no empty, `.`, `..`, `socket`, `cwd`, or `.pterm-context` components.
+Names must be relative, with no empty, `.`, `..`, `socket`, or `cwd` components.
 Session directories below the socket root must not be symbolic links.
 
 ```sh
@@ -161,31 +161,29 @@ require("pterm").setup({
 })
 ```
 
-### Shell directory and foreground filetype
+### Live shell and foreground context
 
 ```lua
 require("pterm").setup({
   sync_cwd = true,
-  foreground_filetypes = { tig = "pterm-tig", [".tig-wrapped"] = "pterm-tig" },
+  track_foreground = true,
 })
 ```
 
-Both options are off by default. `sync_cwd` follows the pterm session shell's
-directory in the focused terminal window via `:lcd`; it does not change the tab,
-global directory, or other windows. `foreground_filetypes` associates an
-OS-reported foreground executable basename with a buffer filetype and restores
-the earlier filetype when the foreground changes. No terminal output or input
-is used to infer process identity. A process with no resolvable group leader
-(e.g. some pipelines) is unknown.
+Both options default to false. `sync_cwd` follows the shell's directory with
+`:lcd` only in the focused pterm window. `track_foreground` makes the exact
+basename of the foreground process-group leader's executable available to
+consumers; wrapped or interpreter-based programs may report the wrapper's real
+executable. Unknown foregrounds have no value.
 
-Subscribed Neovim bridges opt in to daemon-observed snapshots. Changes are sampled
-up to ten times per second using existing daemon wakeups; idle unobserved
-sessions retain their slower directory refresh and are not probed for the
-foreground executable. Old daemons simply do not provide this opt-in data.
-`require("pterm").buffer_context(bufnr)` returns the last observed
-`{ cwd, foreground }` for a connected buffer, or `nil` if unavailable.
-Use the observed foreground for key policies that should not apply to other
-terminals, bearing in mind that updates are sampled rather than instantaneous.
+`require("pterm").buffer_context(bufnr)` is an in-memory lookup returning
+`{ cwd, foreground }` (opt-in fields only) or `nil` if unavailable. It applies
+only to pterm buffers, not ordinary `:terminal` buffers. No foreground metadata
+is written to disk, interpreted from PTY output, or queried by key mappings.
+The optional control socket subscription reuses existing daemon wakeups and
+sends only changes; old daemons leave the API unavailable without affecting the
+terminal bridge. Live context is sampled, not instantaneous. pterm does not
+set filetypes or apply application-specific policies.
 
 ## Telescope Extension
 

@@ -36,6 +36,8 @@ struct Client {
     pending_snapshot: bool,
     /// One-shot diagnostic clients should not receive normal terminal output.
     diagnostic: bool,
+    context_fields: u8,
+    last_context: Option<Vec<u8>>,
     /// Protocol version from the client HELLO. 0 = no HELLO received
     /// (pre-handshake client), which keeps the legacy behavior.
     proto: u32,
@@ -44,7 +46,6 @@ struct Client {
     wants_history: bool,
     /// Managed renderers receive canonical rows instead of raw PTY output.
     canonical_view: bool,
-    session_context: bool,
     /// Physical renderer dimensions, independent of the authoritative PTY.
     view_size: Option<(u16, u16)>,
     mouse_input: MouseInput,
@@ -174,8 +175,6 @@ pub struct Server {
     last_cwd: Option<String>,
     /// When the cwd was last refreshed from the child process.
     last_cwd_refresh: Instant,
-    context_path: PathBuf,
-    last_context: Option<Vec<u8>>,
     last_context_refresh: Option<Instant>,
 }
 
@@ -223,9 +222,7 @@ impl Server {
             exit_sent: false,
             cwd_path,
             last_cwd,
-            last_cwd_refresh: Instant::now() - CWD_REFRESH_INTERVAL,
-            context_path: session_dir.join(crate::paths::CONTEXT_FILENAME),
-            last_context: None,
+            last_cwd_refresh: Instant::now(),
             last_context_refresh: None,
         })
     }
@@ -368,31 +365,32 @@ impl Server {
 
     fn remove_socket(&self) {
         if self.owns_socket() {
-            let _ = std::fs::remove_file(&self.context_path);
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
-    /// Keep picker CWD refresh for detached sessions. Faster kernel queries are
-    /// useful only while a managed Neovim bridge is attached. They share the
-    /// daemon poll wakeups and never run on each key or each PTY read.
+    /// Reuse the original child CWD sample for the picker and live subscribers.
+    /// Use existing daemon ticks; without subscribers no extra sampling occurs.
     fn refresh_context(&mut self) {
-        let attached = self.clients.values().any(|c| c.session_context && !c.diagnostic);
-        let context_due = attached
-            && self.last_context_refresh.is_none_or(|t| t.elapsed() >= CONTEXT_REFRESH_INTERVAL);
+        let fields = self
+            .clients
+            .values()
+            .fold(0, |fields, c| fields | c.context_fields);
+        let context_due = !self.exit_sent
+            && fields != 0
+            && self
+                .last_context_refresh
+                .is_none_or(|t| t.elapsed() >= CONTEXT_REFRESH_INTERVAL);
         let cwd_due = self.last_cwd_refresh.elapsed() >= CWD_REFRESH_INTERVAL;
-        if !attached && self.last_context.take().is_some() {
-            self.last_context_refresh = None;
-            if self.owns_socket() {
-                let _ = std::fs::remove_file(&self.context_path);
-            }
-        }
         if !context_due && !cwd_due {
             return;
         }
+
         let pid = self.session.pty.child_pid.as_raw();
-        let cwd =
-            crate::paths::process_cwd(pid).and_then(|path| path.into_os_string().into_string().ok());
+        let cwd = (cwd_due || fields & proto::context_fields::CWD != 0)
+            .then(|| crate::paths::process_cwd(pid))
+            .flatten()
+            .and_then(|path| path.into_os_string().into_string().ok());
         if cwd_due {
             self.last_cwd_refresh = Instant::now();
             if let Some(cwd) = &cwd {
@@ -407,36 +405,31 @@ impl Server {
             return;
         }
         self.last_context_refresh = Some(Instant::now());
-        let foreground = self.session.pty.foreground_executable();
-        let (dev, ino) = self.socket_identity;
-        let payload = serde_json::json!({
-            "dev": dev.to_string(),
-            "ino": ino.to_string(),
-            "cwd": cwd,
-            "foreground": foreground,
-        })
-        .to_string()
-        .into_bytes();
-        if self.last_context.as_ref() == Some(&payload) || !self.owns_socket() {
-            return;
-        }
-        // An atomic replace keeps successful reads self-consistent. The socket
-        // identity in the payload prevents accepting an old daemon's snapshot.
-        let mut staged = self.context_path.clone();
-        staged.set_extension(format!("tmp.{}", std::process::id()));
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)
-        {
-            let updated = file.write_all(&payload).is_ok()
-                && self.owns_socket()
-                && std::fs::rename(&staged, &self.context_path).is_ok();
-            if updated {
-                self.last_context = Some(payload);
-            } else {
-                let _ = std::fs::remove_file(&staged);
+        let foreground = (fields & proto::context_fields::FOREGROUND != 0)
+            .then(|| self.session.pty.foreground_executable())
+            .flatten();
+        let mut pending = false;
+        for client in self.clients.values_mut().filter(|c| c.context_fields != 0) {
+            let mut payload = serde_json::json!({
+                "cwd": (client.context_fields & proto::context_fields::CWD != 0)
+                    .then_some(cwd.as_deref()).flatten(),
+                "foreground": (client.context_fields & proto::context_fields::FOREGROUND != 0)
+                    .then_some(foreground.as_deref()).flatten(),
+            })
+            .to_string()
+            .into_bytes();
+            if payload.len() > proto::MAX_CONTEXT_PAYLOAD {
+                payload = b"{}".to_vec();
             }
+            if client.last_context.as_ref() != Some(&payload) {
+                client.send_buf.clear_unsent();
+                client.queue_frame(&proto::encode(proto::server::CONTEXT, &payload));
+                client.last_context = Some(payload);
+                pending = true;
+            }
+        }
+        if pending {
+            self.flush_all_clients();
         }
     }
 
@@ -464,10 +457,11 @@ impl Server {
                             send_overflowed: false,
                             pending_snapshot: true,
                             diagnostic: false,
+                            context_fields: 0,
+                            last_context: None,
                             proto: 0,
                             wants_history: false,
                             canonical_view: false,
-                            session_context: false,
                             view_size: None,
                             mouse_input: MouseInput::new(),
                             mouse_pending_since: None,
@@ -1022,7 +1016,30 @@ impl Server {
         for frame in proto::decode_frames(&mut recv_buf, proto::MAX_CLIENT_PAYLOAD)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         {
+            if self
+                .clients
+                .get(&client_id)
+                .is_some_and(|c| c.context_fields != 0)
+            {
+                // A metadata connection cannot send terminal input or resize.
+                break;
+            }
             match frame.msg_type {
+                proto::client::SUBSCRIBE_CONTEXT => {
+                    let [fields] = frame.payload.as_slice() else {
+                        continue;
+                    };
+                    if *fields == 0 || *fields & !proto::context_fields::ALL != 0 {
+                        continue;
+                    }
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.diagnostic = true;
+                        client.pending_snapshot = false;
+                        client.send_buf.clear_unsent();
+                        client.context_fields = *fields;
+                    }
+                    self.last_context_refresh = None;
+                }
                 proto::client::HELLO => match proto::parse_hello(&frame.payload) {
                     Ok((version, flags)) => {
                         log::info!(
@@ -1043,8 +1060,6 @@ impl Server {
                             client.proto = version;
                             client.wants_history = flags & proto::hello_flags::REQUEST_HISTORY != 0;
                             client.canonical_view = flags & proto::hello_flags::CANONICAL_VIEW != 0;
-                            client.session_context = client.canonical_view
-                                && flags & proto::hello_flags::SESSION_CONTEXT != 0;
                             client.hello_ack_pending = true;
                         }
                     }
@@ -1347,32 +1362,37 @@ mod tests {
     use crate::session::Session;
 
     #[test]
-    fn foreground_context_requires_an_opted_in_bridge() {
+    fn context_is_opt_in_and_does_not_send_terminal_data() {
         let dir = std::env::temp_dir().join(format!("pterm-context-{}", std::process::id()));
         let session =
             Session::new("context".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
         let mut server = Server::new(&dir, session).unwrap();
-        let _client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         server.accept_client().unwrap();
+        server.refresh_context();
+        assert!(server.last_context_refresh.is_none());
 
-        for (flags, saves_context) in [
-            (proto::hello_flags::CANONICAL_VIEW, false),
-            (proto::hello_flags::SESSION_CONTEXT, false),
-            (
-                proto::hello_flags::CANONICAL_VIEW | proto::hello_flags::SESSION_CONTEXT,
-                true,
-            ),
-        ] {
-            let hello = proto::encode_hello(proto::PROTO_VERSION, flags);
-            server.clients.get_mut(&0).unwrap().recv_buf = proto::encode(proto::client::HELLO, &hello);
-            server.process_client_recv_buf(0).unwrap();
-            server.refresh_context();
-            assert_eq!(server.context_path.exists(), saves_context);
-        }
+        server.clients.get_mut(&0).unwrap().recv_buf = proto::encode(
+            proto::client::SUBSCRIBE_CONTEXT,
+            &[proto::context_fields::CWD],
+        );
+        server.process_client_recv_buf(0).unwrap();
+        assert!(server.clients[&0].diagnostic);
+        assert!(!server.clients[&0].pending_snapshot);
+        server.refresh_context();
+        let mut bytes = vec![0; 16 * 1024 + proto::HEADER_SIZE];
+        let size = client.read(&mut bytes).unwrap();
+        bytes.truncate(size);
+        let frames = proto::decode_frames(&mut bytes, proto::MAX_CONTEXT_PAYLOAD).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].msg_type, proto::server::CONTEXT);
+        let value: serde_json::Value = serde_json::from_slice(&frames[0].payload).unwrap();
+        assert!(value["foreground"].is_null());
 
-        let path = server.context_path.clone();
         drop(server);
-        assert!(!path.exists(), "socket cleanup must also remove stale context");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

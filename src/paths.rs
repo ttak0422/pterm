@@ -8,8 +8,6 @@ pub const SOCKET_FILENAME: &str = "socket";
 /// File name within a session directory recording the session shell's current
 /// working directory. Written at creation and refreshed by the daemon.
 pub const CWD_FILENAME: &str = "cwd";
-/// Daemon-observed state; unlike terminal output this cannot be forged by OSC.
-pub const CONTEXT_FILENAME: &str = ".pterm-context";
 
 /// Obtain the executable basename from the OS, not argv or the terminal title.
 pub fn process_executable(pid: i32) -> Option<String> {
@@ -106,16 +104,11 @@ pub fn session_dir(session_name: &str) -> io::Result<PathBuf> {
     if session_name.contains('\0')
         || session_name
             .split('/')
-            .any(|part| {
-            matches!(
-                part,
-                "" | "." | ".." | SOCKET_FILENAME | CWD_FILENAME | CONTEXT_FILENAME
-            )
-        })
+            .any(|part| matches!(part, "" | "." | ".." | SOCKET_FILENAME | CWD_FILENAME))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session name must contain nonempty relative components other than '.', '..', 'socket', 'cwd', or '.pterm-context'",
+            "session name must contain nonempty relative components other than '.', '..', 'socket', or 'cwd'",
         ));
     }
 
