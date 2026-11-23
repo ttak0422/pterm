@@ -26,6 +26,35 @@ const MAX_PENDING_PTY_INPUT_BYTES: usize = 1024 * 1024;
 const CWD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, serde::Serialize)]
+struct ContextSnapshot {
+    cwd: Option<String>,
+    foreground: Option<String>,
+}
+
+impl ContextSnapshot {
+    fn same_fields(&self, next: &Self, fields: u8) -> bool {
+        (fields & proto::context_fields::CWD == 0 || self.cwd == next.cwd)
+            && (fields & proto::context_fields::FOREGROUND == 0
+                || self.foreground == next.foreground)
+    }
+
+    fn for_fields(&self, fields: u8) -> Self {
+        Self {
+            cwd: if fields & proto::context_fields::CWD != 0 {
+                self.cwd.clone()
+            } else {
+                None
+            },
+            foreground: if fields & proto::context_fields::FOREGROUND != 0 {
+                self.foreground.clone()
+            } else {
+                None
+            },
+        }
+    }
+}
+
 struct Client {
     stream: UnixStream,
     recv_buf: Vec<u8>,
@@ -37,7 +66,7 @@ struct Client {
     /// One-shot diagnostic clients should not receive normal terminal output.
     diagnostic: bool,
     context_fields: u8,
-    last_context: Option<Vec<u8>>,
+    last_context: Option<ContextSnapshot>,
     /// Protocol version from the client HELLO. 0 = no HELLO received
     /// (pre-handshake client), which keeps the legacy behavior.
     proto: u32,
@@ -408,29 +437,47 @@ impl Server {
         let foreground = (fields & proto::context_fields::FOREGROUND != 0)
             .then(|| self.session.pty.foreground_executable())
             .flatten();
+        if self.publish_context(&ContextSnapshot { cwd, foreground }) {
+            self.flush_all_clients();
+        }
+    }
+
+    /// Compare the requested fields before encoding, and encode at most once
+    /// for each field mask. A subscriber without a snapshot always gets one.
+    fn publish_context(&mut self, snapshot: &ContextSnapshot) -> bool {
         let mut pending = false;
-        for client in self.clients.values_mut().filter(|c| c.context_fields != 0) {
-            let mut payload = serde_json::json!({
-                "cwd": (client.context_fields & proto::context_fields::CWD != 0)
-                    .then_some(cwd.as_deref()).flatten(),
-                "foreground": (client.context_fields & proto::context_fields::FOREGROUND != 0)
-                    .then_some(foreground.as_deref()).flatten(),
-            })
-            .to_string()
-            .into_bytes();
-            if payload.len() > proto::MAX_CONTEXT_PAYLOAD {
-                payload = b"{}".to_vec();
-            }
-            if client.last_context.as_ref() != Some(&payload) {
+        for fields in 1..=proto::context_fields::ALL {
+            let mut next = None;
+            for client in self
+                .clients
+                .values_mut()
+                .filter(|c| c.context_fields == fields)
+            {
+                if client
+                    .last_context
+                    .as_ref()
+                    .is_some_and(|last| last.same_fields(snapshot, fields))
+                {
+                    continue;
+                }
+                let (scoped, frame) = next.get_or_insert_with(|| {
+                    let scoped = snapshot.for_fields(fields);
+                    let payload = serde_json::to_vec(&scoped).unwrap_or_default();
+                    let payload =
+                        if payload.is_empty() || payload.len() > proto::MAX_CONTEXT_PAYLOAD {
+                            b"{}".as_slice()
+                        } else {
+                            &payload
+                        };
+                    (scoped, proto::encode(proto::server::CONTEXT, payload))
+                });
                 client.send_buf.clear_unsent();
-                client.queue_frame(&proto::encode(proto::server::CONTEXT, &payload));
-                client.last_context = Some(payload);
+                client.queue_frame(frame);
+                client.last_context = Some(scoped.clone());
                 pending = true;
             }
         }
-        if pending {
-            self.flush_all_clients();
-        }
+        pending
     }
 
     fn accept_client(&mut self) -> io::Result<()> {
@@ -1390,6 +1437,64 @@ mod tests {
         assert_eq!(frames[0].msg_type, proto::server::CONTEXT);
         let value: serde_json::Value = serde_json::from_slice(&frames[0].payload).unwrap();
         assert!(value["foreground"].is_null());
+
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn context_queues_only_changed_subscribed_fields_and_initial_state() {
+        let dir = std::env::temp_dir().join(format!("pterm-context-diffs-{}", std::process::id()));
+        let session =
+            Session::new("context-diffs".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let mut server = Server::new(&dir, session).unwrap();
+        let subscribe = |server: &mut Server, id, mask| {
+            let socket = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
+            server.accept_client().unwrap();
+            let client: &mut Client = server.clients.get_mut(&id).unwrap();
+            client.context_fields = mask;
+            socket
+        };
+        let _cwd = subscribe(&mut server, 0, proto::context_fields::CWD);
+        let _fg = subscribe(&mut server, 1, proto::context_fields::FOREGROUND);
+        let _both = subscribe(&mut server, 2, proto::context_fields::ALL);
+
+        let mut state = ContextSnapshot {
+            cwd: Some("/a".into()),
+            foreground: Some("tig".into()),
+        };
+        assert!(server.publish_context(&state));
+        for client in server.clients.values_mut() {
+            assert_eq!(client.send_buf.frames.len(), 1);
+            client.send_buf.clear_unsent();
+        }
+        assert!(!server.publish_context(&state));
+        let _new = subscribe(&mut server, 3, proto::context_fields::ALL);
+        assert!(server.publish_context(&state));
+        assert!(server.clients[&0].send_buf.is_empty());
+        assert!(server.clients[&1].send_buf.is_empty());
+        assert!(server.clients[&2].send_buf.is_empty());
+        assert_eq!(server.clients[&3].send_buf.frames.len(), 1);
+
+        state.foreground = None;
+        assert!(server.publish_context(&state));
+        assert!(server.clients[&0].send_buf.is_empty());
+        assert_eq!(server.clients[&1].send_buf.frames.len(), 1);
+        assert_eq!(server.clients[&2].send_buf.frames.len(), 1);
+        assert_eq!(
+            server.clients[&3].send_buf.frames.len(),
+            1,
+            "stale frame was not replaced"
+        );
+
+        for client in server.clients.values_mut() {
+            client.send_buf.clear_unsent();
+        }
+        state.cwd = Some("/b".into());
+        assert!(server.publish_context(&state));
+        assert_eq!(server.clients[&0].send_buf.frames.len(), 1);
+        assert!(server.clients[&1].send_buf.is_empty());
+        assert_eq!(server.clients[&2].send_buf.frames.len(), 1);
 
         drop(server);
         std::fs::remove_dir_all(dir).unwrap();

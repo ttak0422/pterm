@@ -123,14 +123,20 @@ local payload = '{"cwd":"/synthetic","foreground":"tig"}'
 read(nil, string.char(0x80, 3, 0, 0, 0) .. "a")
 read(nil, "bc" .. string.char(0x8a, #payload, 0))
 read(nil, string.char(0, 0) .. payload)
-assert(vim.wait(500, function()
-	return received ~= nil
-end), "fragmented context response was not received")
+assert(
+	vim.wait(500, function()
+		return received ~= nil
+	end),
+	"fragmented context response was not received"
+)
 assert(received.foreground == "tig", "unexpected context data")
 read("fixture EOF")
-assert(vim.wait(500, function()
-	return closed_pipe and received == nil
-end), "EOF must clear metadata")
+assert(
+	vim.wait(500, function()
+		return closed_pipe and received == nil
+	end),
+	"EOF must clear metadata"
+)
 
 for _, invalid in ipairs({
 	string.char(0x8a, 1, 64, 0, 0), -- > 16 KiB: fail without waiting for more data
@@ -141,7 +147,10 @@ for _, invalid in ipairs({
 		received = data
 	end)
 	read(nil, invalid)
-	assert(vim.wait(500, function()
-		return closed_pipe and received == nil
-	end), "invalid IPC response was accepted")
+	assert(
+		vim.wait(500, function()
+			return closed_pipe and received == nil
+		end),
+		"invalid IPC response was accepted"
+	)
 end
