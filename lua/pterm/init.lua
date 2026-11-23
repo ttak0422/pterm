@@ -8,6 +8,8 @@ M.config = {
 	socket_dir = nil,
 	auto_redraw = true,
 	auto_redraw_delay_ms = 1000,
+	sync_cwd = false,
+	track_foreground = false,
 }
 
 --- Active connections: session_name -> { buf, job_id, session_name }
@@ -17,6 +19,7 @@ local cached_binary = nil
 local editor_focused = true
 local focus_autocmds_initialized = false
 local mouse_listener_initialized = false
+local apply_context_cwd
 
 --- Find the pterm binary (result is cached after the first successful lookup).
 local function find_binary()
@@ -264,6 +267,7 @@ local function initialize_focus_autocmds()
 			editor_focused = true
 			for session_name in pairs(connections) do
 				resize_active_window(session_name, true)
+				apply_context_cwd(connections[session_name])
 			end
 		end,
 	})
@@ -344,11 +348,82 @@ function M.session_cwd(session_name)
 	if not content then
 		return nil
 	end
-	content = vim.trim(content)
-	if content == "" then
+	if content:sub(1, 1) ~= "/" or content:find("\0", 1, true) then
 		return nil
 	end
 	return content
+end
+
+--- Latest live context from the daemon, or nil for an unknown/disconnected buffer.
+--- This is a cache lookup, with no external process or I/O on the key path.
+function M.buffer_context(buf)
+	for _, conn in pairs(connections) do
+		if conn.buf == buf then
+			return conn.context
+		end
+	end
+end
+
+apply_context_cwd = function(conn)
+	if not conn or not M.config.sync_cwd or not editor_focused then
+		return
+	end
+	local cwd = conn.context and conn.context.cwd
+	if
+		vim.api.nvim_get_current_buf() == conn.buf
+		and cwd
+		and vim.fn.getcwd() ~= cwd
+		and vim.fn.isdirectory(cwd) == 1
+	then
+		pcall(vim.api.nvim_cmd, { cmd = "lcd", args = { cwd }, magic = { file = false, bar = false } }, {})
+	end
+end
+
+local function subscribe_context(session_name, conn)
+	local fields = (M.config.sync_cwd and 1 or 0) + (M.config.track_foreground and 2 or 0)
+	if fields == 0 then
+		return
+	end
+	local path = socket_path(session_name)
+	local function connect(identity)
+		conn.close_context = require("pterm.context").subscribe(path, fields, function(data)
+			if connections[session_name] ~= conn then
+				return
+			end
+			local current = data and vim.uv.fs_stat(path)
+			if data and (not current or current.dev ~= identity.dev or current.ino ~= identity.ino) then
+				conn.close_context()
+				data = nil
+			end
+			local cwd = data and data.cwd
+			if type(cwd) ~= "string" or cwd:sub(1, 1) ~= "/" or cwd:find("\0", 1, true) then
+				cwd = nil
+			end
+			conn.context = data
+					and {
+						cwd = cwd,
+						foreground = type(data.foreground) == "string" and data.foreground or nil,
+					}
+				or nil
+			apply_context_cwd(conn)
+		end)
+	end
+	-- For :Pterm new, the bridge creates the socket asynchronously. Wait for
+	-- that one connection, not a repeated poll on behalf of an old daemon.
+	local attempts = 0
+	local function wait_socket()
+		if connections[session_name] ~= conn then
+			return
+		end
+		local stat = vim.uv.fs_stat(path)
+		if stat and stat.type == "socket" then
+			connect(stat)
+		elseif attempts < 20 then
+			attempts = attempts + 1
+			vim.defer_fn(wait_socket, 50)
+		end
+	end
+	wait_socket()
 end
 
 --- Format a session name with its directory basename appended, e.g.
@@ -413,6 +488,9 @@ local function teardown_connection(session_name, opts)
 	end
 
 	connections[session_name] = nil
+	if conn.close_context then
+		conn.close_context()
+	end
 
 	if conn.resize_job then
 		pcall(vim.fn.jobstop, conn.resize_job)
@@ -655,8 +733,11 @@ local function start_terminal(session_name, cmd)
 		callback = function()
 			resize_active_window(session_name, true)
 			schedule_redraw(session_name)
+			apply_context_cwd(connections[session_name])
 		end,
 	})
+
+	subscribe_context(session_name, connections[session_name])
 
 	-- Explicit control requests are the only source of managed size authority,
 	-- including first attach. The bridge must never race this with stale sizes.

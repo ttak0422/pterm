@@ -161,6 +161,30 @@ require("pterm").setup({
 })
 ```
 
+### Live shell and foreground context
+
+```lua
+require("pterm").setup({
+  sync_cwd = true,
+  track_foreground = true,
+})
+```
+
+Both options default to false. `sync_cwd` follows the shell's directory with
+`:lcd` only in the focused pterm window. `track_foreground` makes the exact
+basename of the foreground process-group leader's executable available to
+consumers; wrapped or interpreter-based programs may report the wrapper's real
+executable. Unknown foregrounds have no value.
+
+`require("pterm").buffer_context(bufnr)` is an in-memory lookup returning
+`{ cwd, foreground }` (opt-in fields only) or `nil` if unavailable. It applies
+only to pterm buffers, not ordinary `:terminal` buffers. No foreground metadata
+is written to disk, interpreted from PTY output, or queried by key mappings.
+The optional control socket subscription reuses existing daemon wakeups and
+sends only changes; old daemons leave the API unavailable without affecting the
+terminal bridge. Live context is sampled, not instantaneous. pterm does not
+set filetypes or apply application-specific policies.
+
 ## Telescope Extension
 
 pterm provides an optional [Telescope](https://github.com/nvim-telescope/telescope.nvim) extension for fuzzy-finding sessions.

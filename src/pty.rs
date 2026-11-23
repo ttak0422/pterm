@@ -93,6 +93,21 @@ impl Pty {
         }
     }
 
+    /// Return the executable of the foreground process-group leader, if verified.
+    /// A gone leader or unresolvable pipeline is unknown, never guessed.
+    pub fn foreground_executable(&self) -> Option<String> {
+        // SAFETY: the fd belongs to this PTY; these calls only query kernel metadata.
+        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if foreground <= 0
+            || unsafe { libc::getpgid(foreground) } != foreground
+            || unsafe { libc::getsid(foreground) } != self.child_pid.as_raw()
+        {
+            return None;
+        }
+        let executable = crate::paths::process_executable(foreground)?;
+        (unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) } == foreground).then_some(executable)
+    }
+
     /// Resize the pty.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         set_winsize(self.master.as_raw_fd(), cols, rows)

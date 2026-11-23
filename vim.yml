@@ -1,6 +1,16 @@
 # Neovim API subset used by this repository; extend when adding API calls.
 # Format: https://kampfkarren.github.io/selene/usage/std.html
 globals:
+  vim.json.decode:
+    args: [{ type: string }]
+  vim.api.nvim_cmd:
+    args: [{ type: table }, { type: table }]
+  vim.api.nvim_win_get_number:
+    args: [{ type: number }]
+  vim.fn.isdirectory:
+    args: [{ type: string }]
+  vim.uv.new_pipe:
+    args: [{ type: bool }]
   vim.api.nvim_buf_line_count:
     args: [{ type: number }]
   vim.api.nvim_get_mode:

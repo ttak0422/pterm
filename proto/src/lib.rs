@@ -66,7 +66,20 @@ pub mod client {
     /// Payload: row_base:i32, leftcol:i32 (little endian). row_base=i32::MIN
     /// invalidates the origin while the native display is being reset.
     pub const INPUT_ORIGIN: u8 = 0x0c;
+
+    /// Subscribe on a dedicated, non-rendering connection to live context changes.
+    /// A one-byte mask requests shell cwd (bit 0) and/or foreground executable (bit 1).
+    pub const SUBSCRIBE_CONTEXT: u8 = 0x0d;
 }
+
+pub mod context_fields {
+    pub const CWD: u8 = 1;
+    pub const FOREGROUND: u8 = 2;
+    pub const ALL: u8 = CWD | FOREGROUND;
+}
+
+/// Bound the context payload independently of terminal frames.
+pub const MAX_CONTEXT_PAYLOAD: usize = 16 * 1024;
 
 /// Optional flags carried in a FULL_TEXT request's single-byte payload.
 pub mod full_text_flags {
@@ -132,6 +145,9 @@ pub mod server {
 
     /// Successful SET_SIZE acknowledgement, echoing cols:u16, rows:u16.
     pub const RESIZE_ACK: u8 = 0x89;
+
+    /// Live context as UTF-8 JSON, with nullable cwd and foreground.
+    pub const CONTEXT: u8 = 0x8a;
 }
 
 /// Encode a framed message into a Vec<u8>.
