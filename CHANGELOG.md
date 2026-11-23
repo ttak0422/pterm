@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.1] - 2026-11-23
+
+### Bug Fixes
+
+- *(telescope)* Preserve grep result row identity
+
+### Testing
+
+- Wait for each new grep picker to finish populating
 ## [2.6.0] - 2026-11-23
 
 ### Features
@@ -706,6 +715,7 @@ Scrollback may contain stale SGR attributes or cursor-hide sequences
 - *(core)* Set up cachix action for read-only and push modes
 - *(core)* Update flake configuration
 - Add git-cliff config and generate v0.1.0 changelog
+[2.6.1]: https://github.com/ttak0422/pterm/compare/v2.6.0..v2.6.1
 [2.6.0]: https://github.com/ttak0422/pterm/compare/v2.5.1..v2.6.0
 [2.5.1]: https://github.com/ttak0422/pterm/compare/v2.5.0..v2.5.1
 [2.5.0]: https://github.com/ttak0422/pterm/compare/v2.4.0..v2.5.0
