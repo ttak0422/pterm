@@ -1364,8 +1364,7 @@ mod tests {
     #[test]
     fn context_is_opt_in_and_does_not_send_terminal_data() {
         let dir = std::env::temp_dir().join(format!("pterm-context-{}", std::process::id()));
-        let session =
-            Session::new("context".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
+        let session = Session::new("context".into(), "sh", &["sh", "-c", "exec sleep 30"]).unwrap();
         let mut server = Server::new(&dir, session).unwrap();
         let mut client = std::os::unix::net::UnixStream::connect(dir.join("socket")).unwrap();
         client

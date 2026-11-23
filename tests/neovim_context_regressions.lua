@@ -39,6 +39,7 @@ vim.uv.fs_stat = function(path)
 	return fs_stat(path)
 end
 
+local real_context = require("pterm.context")
 local on_context, closed
 package.loaded["pterm.context"] = {
 	subscribe = function(path, fields, callback)
@@ -87,3 +88,60 @@ end
 local ok, err = pcall(check)
 vim.fn.delete(root, "rf")
 assert(ok, err)
+
+local read, closed_pipe
+local pipe = {
+	connect = function(_, path, callback)
+		assert(path == socket, "IPC did not use the dedicated socket")
+		callback()
+	end,
+	read_start = function(_, callback)
+		read = callback
+	end,
+	write = function(_, data, callback)
+		assert(data == string.char(0x0d, 1, 0, 0, 0, 3), "incorrect subscription frame")
+		callback()
+	end,
+	is_closing = function()
+		return closed_pipe
+	end,
+	close = function()
+		closed_pipe = true
+	end,
+}
+-- selene: allow(incorrect_standard_library_use)
+vim.uv.new_pipe = function()
+	return pipe
+end
+local received
+real_context.subscribe(socket, 3, function(data)
+	received = data
+end)
+local payload = '{"cwd":"/synthetic","foreground":"tig"}'
+-- Discard one initial snapshot in pieces, then decode a fragmented context
+-- frame on the same connection without interpreting snapshot bytes.
+read(nil, string.char(0x80, 3, 0, 0, 0) .. "a")
+read(nil, "bc" .. string.char(0x8a, #payload, 0))
+read(nil, string.char(0, 0) .. payload)
+assert(vim.wait(500, function()
+	return received ~= nil
+end), "fragmented context response was not received")
+assert(received.foreground == "tig", "unexpected context data")
+read("fixture EOF")
+assert(vim.wait(500, function()
+	return closed_pipe and received == nil
+end), "EOF must clear metadata")
+
+for _, invalid in ipairs({
+	string.char(0x8a, 1, 64, 0, 0), -- > 16 KiB: fail without waiting for more data
+	string.char(0x8a, 1, 0, 0, 0) .. "{",
+}) do
+	closed_pipe = false
+	real_context.subscribe(socket, 3, function(data)
+		received = data
+	end)
+	read(nil, invalid)
+	assert(vim.wait(500, function()
+		return closed_pipe and received == nil
+	end), "invalid IPC response was accepted")
+end

@@ -399,10 +399,12 @@ local function subscribe_context(session_name, conn)
 			if type(cwd) ~= "string" or cwd:sub(1, 1) ~= "/" or cwd:find("\0", 1, true) then
 				cwd = nil
 			end
-			conn.context = data and {
-				cwd = cwd,
-				foreground = type(data.foreground) == "string" and data.foreground or nil,
-			} or nil
+			conn.context = data
+					and {
+						cwd = cwd,
+						foreground = type(data.foreground) == "string" and data.foreground or nil,
+					}
+				or nil
 			apply_context_cwd(conn)
 		end)
 	end

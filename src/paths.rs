@@ -24,7 +24,10 @@ pub fn process_executable(pid: i32) -> Option<String> {
             return None;
         }
         let bytes = buf.get(..n as usize)?;
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
